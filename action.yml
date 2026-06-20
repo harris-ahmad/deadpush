@@ -1,0 +1,34 @@
+name: "deadpush"
+description: "Run deadpush to detect dead code and semantic debris (AI-generated files, context leaks, etc.)"
+author: "Harris Ahmad"
+
+inputs:
+  entry:
+    description: "Comma-separated list of entry points"
+    required: false
+    default: ""
+  format:
+    description: "Output format (markdown, json, summary)"
+    required: false
+    default: "markdown"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Install deadpush
+      shell: bash
+      run: |
+        pip install deadpush[rich]
+
+    - name: Run deadpush scan
+      shell: bash
+      run: |
+        deadpush scan --format ${{ inputs.format }} ${{ inputs.entry && '--entry ' || '' }}${{ inputs.entry }}
+      continue-on-error: true
+
+    - name: Upload report
+      uses: actions/upload-artifact@v4
+      with:
+        name: deadpush-report
+        path: deadpush-report.md
+        if-no-files-found: ignore
