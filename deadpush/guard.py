@@ -33,6 +33,7 @@ except ImportError:
 
 from .config import load_config
 from .debris import DebrisDetector
+from .intercept import FEEDBACK_DIR
 from .session import SessionManager
 
 # For Local Control Interface (AGENT priority 4 - for automatic interaction by Claude/Cursor/etc agents)
@@ -350,11 +351,79 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
 
 
+DASHBOARD_HTML = """\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>deadpush Dashboard</title>
+<style>
+  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+          background: #0d1117; color: #c9d1d9; padding: 20px; }}
+  h1 {{ color: #58a6ff; margin-bottom: 8px; }}
+  h2 {{ color: #8b949e; font-size: 16px; margin: 24px 0 12px;
+        border-bottom: 1px solid #30363d; padding-bottom: 6px; }}
+  .summary {{ display: flex; gap: 16px; flex-wrap: wrap; margin: 16px 0; }}
+  .card {{ background: #161b22; border: 1px solid #30363d; border-radius: 8px;
+           padding: 16px; flex: 1; min-width: 200px; }}
+  .card h3 {{ color: #8b949e; font-size: 12px; text-transform: uppercase; letter-spacing: 1px; }}
+  .card .value {{ font-size: 28px; font-weight: 600; margin: 8px 0 0; }}
+  .card .value.green {{ color: #3fb950; }}
+  .card .value.red {{ color: #f85149; }}
+  .card .value.yellow {{ color: #d29922; }}
+  table {{ width: 100%; border-collapse: collapse; margin: 8px 0; }}
+  th, td {{ text-align: left; padding: 8px 12px; border-bottom: 1px solid #21262d; font-size: 13px; }}
+  th {{ color: #8b949e; font-weight: 600; }}
+  tr:hover td {{ background: #1c2128; }}
+  .badge {{ display: inline-block; padding: 2px 8px; border-radius: 12px;
+            font-size: 11px; font-weight: 600; }}
+  .badge.blocked {{ background: #f8514920; color: #f85149; }}
+  .badge.approved {{ background: #3fb95020; color: #3fb950; }}
+  .nav {{ display: flex; gap: 12px; margin: 16px 0; }}
+  .nav a {{ color: #58a6ff; text-decoration: none; font-size: 14px; }}
+  .nav a:hover {{ text-decoration: underline; }}
+  .empty {{ color: #484f58; font-style: italic; padding: 12px; }}
+  .actions button {{ background: #21262d; border: 1px solid #30363d; color: #c9d1d9;
+                     padding: 6px 14px; border-radius: 6px; cursor: pointer; font-size: 12px; }}
+  .actions button:hover {{ background: #30363d; }}
+  pre {{ background: #0d1117; padding: 12px; border-radius: 6px; overflow-x: auto;
+         font-size: 12px; border: 1px solid #30363d; }}
+  .meta {{ color: #484f58; font-size: 12px; }}
+  form {{ margin: 8px 0; }}
+  input {{ background: #0d1117; border: 1px solid #30363d; color: #c9d1d9;
+           padding: 6px 10px; border-radius: 6px; }}
+  .violations {{ margin: 8px 0 0 12px; font-size: 12px; color: #f85149; }}
+</style>
+</head>
+<body>
+<h1>deadpush Dashboard</h1>
+<p class="meta">Repo: {repo} &middot; Updated: {ts}</p>
+<div class="nav">
+  <a href="/dashboard">Overview</a>
+  <a href="/dashboard/blocks">Blocks</a>
+  <a href="/dashboard/quarantine">Quarantine</a>
+  <a href="/dashboard/allowlist">Allowlist</a>
+  <a href="/dashboard">&#x21bb; Refresh</a>
+</div>
+{content}
+</body>
+</html>"""
+
+
 class GuardianControlHandler(BaseHTTPRequestHandler):
     """Simple JSON API handler for the guardian control interface."""
 
     # Reference to the running GuardianControlServer (set by server)
     control_server = None
+
+    def _send_html(self, html: str):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(html.encode("utf-8"))
 
     def _send_json(self, obj, status=200):
         self.send_response(status)
@@ -369,6 +438,178 @@ class GuardianControlHandler(BaseHTTPRequestHandler):
 
     def _get_handler(self):
         return self.control_server.guardian_handler if self.control_server else None
+
+    # ------------------------------------------------------------------
+    # Dashboard helpers
+    # ------------------------------------------------------------------
+    def _read_feedback(self, limit: int = 20) -> list[dict]:
+        handler = self._get_handler()
+        if not handler:
+            return []
+        feedback_dir = handler.config.repo_root / FEEDBACK_DIR
+        entries = []
+        if feedback_dir.exists():
+            for f in sorted(feedback_dir.glob("*.json"), reverse=True)[:limit]:
+                try:
+                    entries.append(json.loads(f.read_text(encoding="utf-8")))
+                except Exception:
+                    pass
+        return entries
+
+    def _read_runtime_config(self) -> dict:
+        try:
+            from .rules import RuntimeConfig
+            handler = self._get_handler()
+            if not handler:
+                return {}
+            rc = RuntimeConfig(handler.config.repo_root)
+            return rc.to_dict()
+        except Exception:
+            return {}
+
+    def _dashboard_page(self, content: str) -> str:
+        handler = self._get_handler()
+        repo = str(handler.config.repo_root) if handler else "?"
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S UTC")
+        return DASHBOARD_HTML.format(repo=repo, ts=ts, content=content)
+
+    def _handle_dashboard(self, subpath: str):
+        handler = self._get_handler()
+        if not handler:
+            return self._send_html("<h1>Guardian not ready</h1>", 503)
+
+        if subpath == "" or subpath == "/":
+            feedback = self._read_feedback(limit=5)
+            blocks = [e for e in feedback if e.get("status") == "blocked"]
+            approvals = [e for e in feedback if e.get("status") == "approved"]
+            quarantine = handler.quarantine.list_quarantined()
+            score = handler.safety_score
+
+            cards = f"""
+<div class="summary">
+  <div class="card"><h3>Recent Blocks</h3><div class="value red">{len(blocks)}</div></div>
+  <div class="card"><h3>Recent Approvals</h3><div class="value green">{len(approvals)}</div></div>
+  <div class="card"><h3>Quarantined</h3><div class="value yellow">{len(quarantine)}</div></div>
+  <div class="card"><h3>Safety Score</h3><div class="value">{score.get_summary()}</div></div>
+</div>"""
+
+            config = self._read_runtime_config()
+            allowed = config.get("allowed_patterns", [])
+            levels = config.get("guardrail_levels", {})
+            config_section = f"""
+<h2>Runtime Configuration</h2>
+<table>
+  <tr><th>Setting</th><th>Value</th></tr>
+  <tr><td>Allowed Patterns</td><td>{len(allowed)} pattern(s)</td></tr>
+  <tr><td>Ignored Paths</td><td>{len(config.get('ignored_paths', []))} path(s)</td></tr>
+  <tr><td>Guardrail Levels</td><td>{', '.join(f'{k}={v}' for k, v in levels.items()) if levels else 'all defaults'}</td></tr>
+  <tr><td>Activity Level</td><td>{score.get_activity_level()}</td></tr>
+</table>"""
+
+            recent_rows = ""
+            for e in feedback:
+                recent_rows += f"""<tr>
+  <td>{e.get('file', '?')}</td>
+  <td><span class="badge {e.get('status', 'approved')}">{e.get('status', '?')}</span></td>
+  <td>{len(e.get('violations', []))}</td>
+  <td class="meta">{e.get('timestamp', '').replace('T', ' ')[:19]} UTC</td>
+</tr>"""
+            recent_section = f"""
+<h2>Recent Activity</h2>
+<table>
+  <tr><th>File</th><th>Status</th><th>Violations</th><th>Time</th></tr>
+  {recent_rows}
+</table>""" if feedback else ""
+
+            self._send_html(self._dashboard_page(cards + recent_section + config_section))
+
+        elif subpath == "/blocks":
+            feedback = self._read_feedback(limit=50)
+            blocks = [e for e in feedback if e.get("status") == "blocked"]
+            if not blocks:
+                content = '<p class="empty">No blocked files yet.</p>'
+            else:
+                rows = ""
+                for e in blocks:
+                    violations_html = "".join(
+                        f'<div class="violations">\\u2022 {v.get("category")}: {v.get("description")} (line {v.get("line")}, {v.get("severity")})</div>'
+                        for v in e.get("violations", [])
+                    )
+                    diff = e.get("diff", "(no diff)")
+                    rows += f"""<tr>
+  <td>{e.get('file', '?')}</td>
+  <td>{violations_html}<details><summary class="meta">Show diff</summary><pre>{diff}</pre></details></td>
+  <td class="meta">{e.get('timestamp', '').replace('T', ' ')[:19]} UTC</td>
+</tr>"""
+                content = f"""<h2>Blocked Files</h2>
+<p class="meta">{len(blocks)} block(s)</p>
+<table><tr><th>File</th><th>Violations / Diff</th><th>Time</th></tr>{rows}</table>"""
+            self._send_html(self._dashboard_page(content))
+
+        elif subpath == "/quarantine":
+            entries = handler.quarantine.list_quarantined()
+            if not entries:
+                content = '<p class="empty">No quarantined files.</p>'
+            else:
+                rows = ""
+                for e in entries:
+                    rows += f"""<tr>
+  <td>{e.get('name', '?')}</td>
+  <td>{e.get('original_path', '?')}</td>
+  <td>{e.get('reason', e.get('violations', 'N/A'))}</td>
+  <td class="actions">
+    <form action="/dashboard/quarantine/restore" method="post" style="display:inline">
+      <input type="hidden" name="name" value="{e.get('name', '')}">
+      <button type="submit">Restore</button>
+    </form>
+  </td>
+</tr>"""
+                content = f"""<h2>Quarantine Manager</h2>
+<p class="meta">{len(entries)} quarantined file(s)</p>
+<table><tr><th>Name</th><th>Original Path</th><th>Reason</th><th>Action</th></tr>{rows}</table>"""
+            self._send_html(self._dashboard_page(content))
+
+        elif subpath == "/allowlist":
+            config = self._read_runtime_config()
+            patterns = config.get("allowed_patterns", [])
+            levels = config.get("guardrail_levels", {})
+
+            if patterns:
+                rows = ""
+                for p in patterns:
+                    rows += f"""<tr>
+  <td>{p.get('pattern', '?')}</td>
+  <td>{p.get('description', '')}</td>
+  <td class="actions"><form action="/dashboard/allowlist/remove" method="post" style="display:inline">
+    <input type="hidden" name="pattern" value="{p.get('pattern', '')}">
+    <button type="submit">Remove</button>
+  </form></td>
+</tr>"""
+                patterns_html = f"""<h3>Allowed Patterns ({len(patterns)})</h3>
+<table><tr><th>Pattern</th><th>Description</th><th>Action</th></tr>{rows}</table>"""
+            else:
+                patterns_html = '<p class="empty">No allowed patterns.</p>'
+
+            level_rows = "".join(
+                f"<tr><td>{cat}</td><td>{lvl}</td></tr>"
+                for cat, lvl in sorted(levels.items())
+            ) if levels else '<tr><td colspan="2"><span class="empty">All defaults</span></td></tr>'
+
+            content = f"""{patterns_html}
+<form action="/dashboard/allowlist/add" method="post">
+  <input type="text" name="pattern" placeholder="regex pattern" required>
+  <input type="text" name="description" placeholder="description (optional)">
+  <button type="submit">Add Pattern</button>
+</form>
+<h3>Guardrail Levels</h3>
+<table><tr><th>Category</th><th>Level</th></tr>{level_rows}</table>
+<form action="/dashboard/allowlist/reset" method="post">
+  <button type="submit" style="background:#f8514920;border:1px solid #f85149;color:#f85149;padding:6px 14px;border-radius:6px;cursor:pointer">Reset All Config</button>
+</form>"""
+            self._send_html(self._dashboard_page(content))
+
+        else:
+            self._send_json({"error": "unknown dashboard page"}, 404)
 
     def do_GET(self):
         parsed = urlparse(self.path)
@@ -405,14 +646,80 @@ class GuardianControlHandler(BaseHTTPRequestHandler):
                 self._send_json({"quarantined": qlist, "dir": str(handler.quarantine.quarantine_dir)})
             elif path == "/health":
                 self._send_json({"status": "ok", "guardian": "alive"})
+            elif path.startswith("/dashboard"):
+                subpath = path[len("/dashboard"):]
+                self._handle_dashboard(subpath)
             else:
-                self._send_json({"error": "unknown endpoint", "available": ["/status", "/safety-score", "/recent-incidents", "/quarantine-list", "/health"]}, 404)
+                self._send_json({"error": "unknown endpoint", "available": ["/status", "/safety-score", "/recent-incidents", "/quarantine-list", "/health", "/dashboard"]}, 404)
         except Exception as e:
             self._send_json({"error": str(e)}, 500)
+
+    def _handle_dashboard_post(self, path: str, params: dict[str, str]):
+        handler = self._get_handler()
+        if not handler:
+            return self._send_json({"error": "guardian not ready"}, 503)
+
+        try:
+            from .rules import RuntimeConfig
+            rc = RuntimeConfig(handler.config.repo_root)
+
+            if path == "/quarantine/restore":
+                name = params.get("name", "")
+                if name:
+                    handler.quarantine.restore(name)
+                self._redirect("/dashboard/quarantine")
+                return
+
+            elif path == "/allowlist/add":
+                pattern = params.get("pattern", "")
+                description = params.get("description", "")
+                if pattern:
+                    import re
+                    rc.add_allowed_pattern(pattern, description)
+                self._redirect("/dashboard/allowlist")
+                return
+
+            elif path == "/allowlist/remove":
+                pattern = params.get("pattern", "")
+                if pattern:
+                    rc.remove_allowed_pattern(pattern)
+                self._redirect("/dashboard/allowlist")
+                return
+
+            elif path == "/allowlist/reset":
+                rc.reset()
+                self._redirect("/dashboard/allowlist")
+                return
+
+        except Exception as e:
+            self._send_json({"error": str(e)}, 500)
+            return
+
+        self._redirect("/dashboard")
+
+    def _redirect(self, path: str):
+        self.send_response(302)
+        self.send_header("Location", path)
+        self.send_header("Connection", "close")
+        self.end_headers()
 
     def do_POST(self):
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/")
+
+        # Handle dashboard form posts
+        if path.startswith("/dashboard"):
+            length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(length).decode("utf-8") if length else ""
+            params = {}
+            if body:
+                for pair in body.split("&"):
+                    if "=" in pair:
+                        k, v = pair.split("=", 1)
+                        from urllib.parse import unquote_plus
+                        params[unquote_plus(k)] = unquote_plus(v)
+            self._handle_dashboard_post(path[len("/dashboard"):], params)
+            return
 
         handler = self._get_handler()
         if not handler:

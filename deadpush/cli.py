@@ -16,7 +16,7 @@ from typing import Any
 
 import click
 
-from .config import load_config
+from .config import load_config, SUPPORTED_LANGUAGES
 from .crawler import iter_source_files
 from .debris import DebrisDetector
 from .graph import (
@@ -1386,6 +1386,121 @@ def cmd_intercept(daemon, http):
     """
     from .intercept import run_intercept
     run_intercept(daemon=daemon, http=http)
+
+
+@main.command("init")
+@click.option("--force", is_flag=True, help="Overwrite existing deadpush.toml")
+@click.option("-i", "--interactive", is_flag=True, help="Interactive setup with prompts")
+def cmd_init(force, interactive):
+    """Initialize deadpush configuration in this repository.
+
+    Creates a deadpush.toml with sensible defaults. Use -i for interactive prompts.
+    Run this once per project, then use `deadpush protect` for full guardian setup.
+    """
+    from .config import _load_deadpush_toml, Config
+    config = load_config()
+
+    # Check for existing config
+    existing = _load_deadpush_toml(config.repo_root)
+    if existing and not force:
+        if not interactive:
+            print("deadpush.toml already exists. Use --force to overwrite.")
+            return
+        print_warning("deadpush.toml already exists. Use --force to overwrite.")
+        if not click.confirm("Overwrite existing configuration?", default=False):
+            print("Init cancelled.")
+            return
+
+    print_header("deadpush Init", "Configure guardrails for this repository")
+
+    # --- Interactive prompts ---
+    if interactive:
+        block_agent_files = click.confirm(
+            "Block agent context files? (claude.md, .cursorrules, etc.)",
+            default=True,
+        )
+        enable_http = click.confirm(
+            "Enable agent HTTP control server? (lets agents query status via http://localhost:14242)",
+            default=True,
+        )
+    else:
+        block_agent_files = True
+        enable_http = True
+
+    # --- Build and write config ---
+    blocked_files = [
+        "claude.md", ".cursorrules", ".claude_instructions",
+        ".copilot-instructions.md", "windsurf_rules.md",
+    ] if block_agent_files else []
+
+    init_config = {
+        "languages": list(SUPPORTED_LANGUAGES),
+        "block": {
+            "blocked_files": blocked_files,
+        },
+    }
+
+    if enable_http:
+        init_config["control_port"] = 14242
+
+    # Merge with any existing pyproject.toml settings (keep existing preferences)
+    pyproject_config = {}
+    pyproject_path = config.repo_root / "pyproject.toml"
+    if pyproject_path.exists():
+        try:
+            import tomllib
+            pyproject_data = tomllib.loads(pyproject_path.read_text(encoding="utf-8"))
+            pyproject_config = pyproject_data.get("tool", {}).get("deadpush", {})
+        except Exception:
+            pass
+
+    for key in ("entrypoints", "debris", "dead_code"):
+        if key in pyproject_config:
+            init_config[key] = pyproject_config[key]
+
+    # Write deadpush.toml
+    _write_toml(config.repo_root / "deadpush.toml", init_config)
+    print_success("deadpush.toml created!")
+
+    # --- Next steps ---
+    print("\n" + "=" * 50)
+    print("Next steps:")
+    print("  Run analysis:  deadpush scan")
+    print("  Full setup:    deadpush protect")
+    print("  For AI agents: deadpush mcp")
+    print("=" * 50)
+
+
+def _write_toml(path: Path, data: dict) -> None:
+    """Write a dict as TOML. Uses tomli-w if available, else manual formatting."""
+    try:
+        import tomli_w
+        path.write_text(tomli_w.dumps(data), encoding="utf-8")
+        return
+    except ImportError:
+        pass
+    # Manual fallback for simple structures
+    lines = []
+    for key, value in data.items():
+        if isinstance(value, dict):
+            lines.append(f"[{key}]")
+            for k, v in value.items():
+                if isinstance(v, list):
+                    items = ", ".join(f'"{item}"' for item in v)
+                    lines.append(f'{k} = [{items}]')
+                elif isinstance(v, bool):
+                    lines.append(f'{k} = {"true" if v else "false"}')
+                else:
+                    lines.append(f'{k} = {v}')
+            lines.append("")
+        elif isinstance(value, list):
+            items = ", ".join(f'"{item}"' for item in value)
+            lines.append(f'{key} = [{items}]')
+        elif isinstance(value, bool):
+            lines.append(f'{key} = {"true" if value else "false"}')
+        else:
+            lines.append(f'{key} = {value}')
+    path.write_text("\n".join(lines), encoding="utf-8")
 
 
 @main.command("mcp")
