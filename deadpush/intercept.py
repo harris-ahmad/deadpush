@@ -457,8 +457,62 @@ def _clean_empty_dirs(path: Path):
 # Watcher thread
 # ---------------------------------------------------------------------------
 
+try:
+    from watchdog.observers import Observer
+    from watchdog.events import FileSystemEventHandler
+
+    class _StagingHandler(FileSystemEventHandler):
+        """Watchdog event handler that marks files as pending."""
+
+        def __init__(self, on_file_event):
+            self.on_file_event = on_file_event
+            self._debounce: dict[Path, float] = {}
+            self._lock = threading.Lock()
+
+        def on_created(self, event):
+            if not event.is_directory:
+                self._note(Path(event.src_path))
+
+        def on_modified(self, event):
+            if not event.is_directory:
+                self._note(Path(event.src_path))
+
+        def on_moved(self, event):
+            if not event.is_directory:
+                self._note(Path(event.dest_path))
+
+        def _note(self, path: Path):
+            with self._lock:
+                self._debounce[path] = time.time()
+
+        def pop_stable(self, min_age: float = 0.3) -> list[Path]:
+            """Return paths whose mtime has been stable for min_age seconds."""
+            now = time.time()
+            ready: list[Path] = []
+            with self._lock:
+                for p, t in list(self._debounce.items()):
+                    try:
+                        mtime = p.stat().st_mtime
+                        if now - mtime >= min_age and now - t >= min_age:
+                            ready.append(p)
+                            del self._debounce[p]
+                    except OSError:
+                        del self._debounce[p]
+            return ready
+
+    WATCHDOG_AVAILABLE = True
+except ImportError:
+    WATCHDOG_AVAILABLE = False
+
+
 class StagingWatcher(threading.Thread):
-    """Watches .deadpush/staging/ for new files and processes them."""
+    """Watches .deadpush/staging/ for new files and processes them.
+
+    Uses watchdog file system notifications when available, with a polling
+    fallback. File stability is verified via mtime (not the old size-poll hack).
+    """
+
+    STABILITY_SECONDS = 0.3
 
     def __init__(self, repo_root: Path, config: DeadpushConfig, poll_interval: float = 0.5):
         super().__init__(daemon=True)
@@ -469,52 +523,88 @@ class StagingWatcher(threading.Thread):
         self.poll_interval = poll_interval
         self._stop_event = threading.Event()
         self._processed: set[Path] = set()
+        self._handler: Any = None
 
     def run(self):
         self.staging_dir.mkdir(parents=True, exist_ok=True)
-        while not self._stop_event.is_set():
-            self._process_pending()
-            time.sleep(self.poll_interval)
+        if WATCHDOG_AVAILABLE:
+            self._run_with_watchdog()
+        else:
+            self._run_polling()
 
     def stop(self):
         self._stop_event.set()
 
-    def _process_pending(self):
-        """Process all files currently in staging."""
+    # ---- watchdog path ----
+
+    def _run_with_watchdog(self):
+        """Use watchdog Observer for instant file notifications."""
+        self._handler = _StagingHandler(self._on_watchdog_event)
+        observer = Observer()
+        observer.schedule(self._handler, str(self.staging_dir), recursive=True)
+        observer.start()
+        try:
+            while not self._stop_event.is_set():
+                for p in self._handler.pop_stable(self.STABILITY_SECONDS):
+                    self._process_file(p)
+                if not self._stop_event.is_set():
+                    self._stop_event.wait(0.1)
+        finally:
+            observer.stop()
+            observer.join()
+
+    def _on_watchdog_event(self, path: Path):
+        """Called when watchdog detects a file event (already handled by _StagingHandler)."""
+
+    # ---- polling fallback ----
+
+    def _run_polling(self):
+        """Fallback: poll staging directory periodically."""
+        while not self._stop_event.is_set():
+            self._scan_staging()
+            if not self._stop_event.is_set():
+                self._stop_event.wait(self.poll_interval)
+
+    def _scan_staging(self):
+        """Find unprocessed files in staging that pass mtime stability."""
         if not self.staging_dir.exists():
             return
+        now = time.time()
         for staged_path in sorted(self.staging_dir.rglob("*")):
             if not staged_path.is_file():
                 continue
             if staged_path in self._processed:
                 continue
-
-            # Ensure the file is fully written (size stable)
             try:
-                size = staged_path.stat().st_size
-                time.sleep(0.1)
-                if staged_path.stat().st_size != size:
-                    continue  # still being written
+                if now - staged_path.stat().st_mtime < self.STABILITY_SECONDS:
+                    continue
             except OSError:
                 continue
+            self._process_file(staged_path)
 
-            self._processed.add(staged_path)
-            rel = _get_file_rel(staged_path, self.staging_dir)
+    # ---- shared processing logic ----
 
-            # Skip hidden files — write feedback explaining why
-            if staged_path.name.startswith("."):
-                staged_path.unlink(missing_ok=True)
-                result = GuardrailResult()
-                result.reject(Violation("debris", "Hidden/dot-file written to staging was removed (not allowed)", 0, "low"))
-                _write_feedback(self.feedback_dir, rel, result)
-                continue
+    def _process_file(self, staged_path: Path):
+        """Run guardrails and approve/block a single staged file."""
+        if staged_path in self._processed or not staged_path.is_file():
+            return
+        self._processed.add(staged_path)
+        rel = _get_file_rel(staged_path, self.staging_dir)
 
-            result = _run_guardrails(staged_path, self.staging_dir, self.config)
+        # Skip hidden files — write feedback explaining why
+        if staged_path.name.startswith("."):
+            staged_path.unlink(missing_ok=True)
+            result = GuardrailResult()
+            result.reject(Violation("debris", "Hidden/dot-file written to staging was removed (not allowed)", 0, "low"))
+            _write_feedback(self.feedback_dir, rel, result)
+            return
 
-            if result.allowed:
-                _approve(staged_path, self.staging_dir, self.repo_root, self.feedback_dir)
-            else:
-                _block(staged_path, self.staging_dir, self.repo_root, self.feedback_dir, result)
+        result = _run_guardrails(staged_path, self.staging_dir, self.config)
+
+        if result.allowed:
+            _approve(staged_path, self.staging_dir, self.repo_root, self.feedback_dir)
+        else:
+            _block(staged_path, self.staging_dir, self.repo_root, self.feedback_dir, result)
 
 
 # ---------------------------------------------------------------------------
