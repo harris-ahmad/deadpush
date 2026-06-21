@@ -538,10 +538,14 @@ class GuardianControlServer:
 # =============================================================================
 # Enhanced Guardian Handler with Stronger Intervention
 # =============================================================================
-# Note: base class may be None if optional 'watchdog' extra not installed.
-# run_guardian() guards runtime usage and gives a clear error.
 class GuardianHandler(FileSystemEventHandler or object):
-    """Production-grade real-time guardian with strong intervention logic."""
+    """Real-time guardian with unified guardrail pipeline.
+
+    Uses the full 7-category guardrails from intercept.py:
+    - Watches the entire repo root via watchdog
+    - Every file write goes through _run_guardrails
+    - Block-level violations → quarantine + git restore + structured feedback
+    """
 
     def __init__(self, config, intervention: bool = True, strict_mode: bool = False, logger=None):
         self.config = config
@@ -553,18 +557,9 @@ class GuardianHandler(FileSystemEventHandler or object):
         self.safety_score = SessionSafetyScore()
         self.session_mgr = SessionManager()
 
-        self.critical_llm_files = {
-            "claude.md", ".cursorrules", ".claude_instructions",
-            ".copilot-instructions.md", "windsurf_rules.md", "agents.md"
-        }
-
         # Rate limiting for multi-agent scenarios
         self.last_intervention_ts = 0.0
-        self.cooldown_seconds = 2.0  # Prevent rapid interventions from multiple agents
-
-        # Sensitive config backup directory
-        self._config_backup_dir = config.repo_root / ".deadpush-config-backups"
-        self._config_backup_dir.mkdir(parents=True, exist_ok=True)
+        self.cooldown_seconds = 0.5  # Aggressive but not spammy
 
     def on_created(self, event):
         if event.is_directory:
@@ -576,231 +571,233 @@ class GuardianHandler(FileSystemEventHandler or object):
             return
         self._evaluate(Path(event.src_path), event_type="modified")
 
+    # ------------------------------------------------------------------
+    # Git helpers for old-source retrieval and file restoration
+    # ------------------------------------------------------------------
+    def _git_show(self, rel: str) -> str:
+        """Get file content from git HEAD. Returns empty string if missing."""
+        try:
+            result = subprocess.run(
+                ["git", "show", f"HEAD:{rel}"],
+                capture_output=True, text=True, timeout=5,
+                cwd=self.config.repo_root,
+            )
+            if result.returncode == 0:
+                return result.stdout
+        except Exception:
+            pass
+        return ""
+
+    def _restore_from_git(self, rel: str) -> bool:
+        """Restore a file from git HEAD. Returns True on success."""
+        old = self._git_show(rel)
+        if not old:
+            return False
+        try:
+            dest = self.config.repo_root / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_text(old, encoding="utf-8")
+            self.logger.info(f"Restored {rel} from git HEAD (reverted agent write)")
+            return True
+        except Exception as e:
+            self.logger.error(f"Failed to restore {rel} from git: {e}")
+            return False
+
+    # ------------------------------------------------------------------
+    # Main evaluation pipeline (called on every file create/modify)
+    # ------------------------------------------------------------------
     def _evaluate(self, path: Path, event_type: str):
         try:
             if not path.exists():
                 return
-            # Skip common dirs and our own quarantine/archive dirs.
-            # Use exact dir name match on path parts so that test sandboxes like
-            # .deadpush-e2e-sandbox are still processed (for E2E testing).
-            skip_names = {"__pycache__", ".git", "node_modules", ".deadpush-quarantine", ".deadpush-archive", ".deadpush"}
+            # Skip internal dirs
+            skip_names = {"__pycache__", ".git", "node_modules",
+                          ".deadpush-quarantine", ".deadpush-archive",
+                          ".deadpush-config-backups"}
             if any(part in skip_names for part in path.parts):
                 return
 
             # Rate limiting for multi-agent
             now = time.time()
             if now - self.last_intervention_ts < self.cooldown_seconds:
-                return  # Skip to avoid spam
+                return
+
+            try:
+                rel = path.relative_to(self.config.repo_root).as_posix()
+            except (ValueError, Exception):
+                return
 
             filename = path.name.lower()
 
-            # === Critical LLM Context Files ===
-            if filename in self.critical_llm_files:
-                self._intervene_critical_file(path, "LLM Context File", event_type)
+            # === STEP 1: Check blocked files (deadpush.toml blocked_files/blocked_patterns) ===
+            if self.config.is_blocked(rel):
+                self._intervene_blocked(path, rel, event_type)
                 return
 
-            # === Sensitive Configuration Files ===
-            try:
-                rel = path.relative_to(self.config.repo_root).as_posix()
-                if self.config.is_sensitive_config(rel):
-                    self._intervene_config_change(path, rel, event_type)
-                    # Continue analysis even for config files (they may also have secrets)
-            except (ValueError, Exception):
-                pass
+            # === STEP 2: Run full guardrail pipeline ===
+            from .intercept import _run_guardrails, _write_feedback, GuardrailResult, FEEDBACK_DIR
 
-            # === Diff Analysis (what changed, not just that it changed) ===
+            old_source = self._git_show(rel)
             try:
-                rel = path.relative_to(self.config.repo_root).as_posix()
-                diff_findings = self._analyze_diff(path, rel)
-                for finding in diff_findings:
-                    severity = finding.get("severity", "medium")
-                    penalty = 15 if severity == "high" else 8
-                    score = self.safety_score.report_incident(penalty, f"Diff: {finding['detail']}", str(path))
-                    self.logger.warning(
-                        f"DIFF [{finding['type'].upper()}] {rel} | "
-                        f"{finding['detail']} | Safety: {score}/100"
-                    )
+                source = path.read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                return
+
+            result = _run_guardrails(
+                path, self.config.repo_root, self.config,
+                _old_source=old_source, _rel_path_override=rel,
+            )
+
+            # === STEP 3: Enforce guardrail results ===
+            if not result.allowed:
+                self._intervene_guardrails(path, rel, result, event_type, old_source=old_source)
+                return  # File was quarantined; don't continue evaluation
+
+            if result.violations:
+                # Warn-level violations — log + write feedback + safety score hit
+                for v in result.violations:
+                    penalty = 8 if v.severity == "high" else 4
+                    self.safety_score.report_incident(penalty, f"Warn: {v.description}", str(path))
+                self.logger.warning(
+                    f"WARN [{event_type.upper()}] {rel} | "
+                    f"{len(result.violations)} warn-level violation(s) | "
+                    f"Safety: {self.safety_score.score}/100"
+                )
+                try:
+                    _write_feedback(self.config.repo_root / FEEDBACK_DIR, rel, result)
+                except Exception:
+                    pass
+                self.session_mgr.record_incident({
+                    "type": "guardrail_warn", "file": rel,
+                    "count": len(result.violations),
+                })
+
+            # === STEP 4: Debris scan (secondary, in addition to guardrails) ===
+            try:
+                from .crawler import FileInfo
+                fi = FileInfo(
+                    path=path,
+                    rel_path=path.relative_to(self.config.repo_root),
+                    size=path.stat().st_size,
+                    is_text=True,
+                    mtime=time.time(),
+                )
+                debris = self.detector.scan([fi])
+                blocking = [d for d in debris if d.block_push]
+                if blocking:
+                    self._intervene_blocking_debris(path, blocking, event_type)
             except Exception:
                 pass
 
-            # === Record file change in active session ===
+            # === STEP 5: Record in session ===
             try:
-                rel = path.relative_to(self.config.repo_root).as_posix()
                 self.session_mgr.record_file_change(rel)
                 self.session_mgr.update_safety_score(self.safety_score.score)
             except Exception:
                 pass
 
-            # === Full Analysis ===
-            from .crawler import FileInfo
-            fi = FileInfo(
-                path=path,
-                rel_path=path.relative_to(self.config.repo_root),
-                size=path.stat().st_size,
-                is_text=True,
-                mtime=time.time()
-            )
-            debris = self.detector.scan([fi])
-            blocking = [d for d in debris if d.block_push]
-
-            if blocking:
-                self._intervene_blocking_debris(path, blocking, event_type)
-
         except Exception as e:
             self.logger.debug(f"Evaluation error on {path}: {e}")
 
-    def _intervene_critical_file(self, path: Path, reason: str, event_type: str):
+    # ------------------------------------------------------------------
+    # Intervention actions
+    # ------------------------------------------------------------------
+    def _intervene_blocked(self, path: Path, rel: str, event_type: str):
+        """Intervene when a blocked file is written (claude.md, etc.)."""
+        from .intercept import GuardrailResult, Violation, _write_feedback, FEEDBACK_DIR
+
         self.last_intervention_ts = time.time()
-        score = self.safety_score.report_incident(20, reason, str(path))
-        self.session_mgr.record_incident({"type": "critical_file", "reason": reason, "file": str(path), "score": score})
-        self.session_mgr.update_safety_score(score)
+        score = self.safety_score.report_incident(25, f"Blocked file written: {rel}", str(path))
+
+        result = GuardrailResult()
+        result.reject(Violation("blocked_file", f"File {rel} is in the blocked list and cannot be written", 0, "critical"))
+
+        old_source = self._git_show(rel)
+        self._quarantine_and_restore(path, rel, result, old_source)
+
         self.logger.warning(
-            f"INTERVENTION [{event_type.upper()}] Critical file: {path.name} | "
-            f"Reason: {reason} | Safety: {score}/100 ({self.safety_score.get_status()}) | "
-            f"Activity: {self.safety_score.get_activity_level()}"
+            f"INTERVENTION [{event_type.upper()}] BLOCKED FILE: {rel} | "
+            f"Moved to quarantine + restored from git | Safety: {score}/100"
         )
-
-        if self.intervention:
-            try:
-                if path.exists():
-                    quarantined = self.quarantine.quarantine(path, reason)
-                    self.logger.info(f"Quarantined instead of deleted: {quarantined}")
-                    self.logger.info(f"  ACTIONABLE: Review with `deadpush quarantine list` (run from the repo root). Restore with `deadpush quarantine restore {quarantined.name}`")
-            except Exception as e:
-                self.logger.error(f"Failed to quarantine {path}: {e}")
-
-    # ------------------------------------------------------------------
-    # Diff analysis for understanding what changed
-    # ------------------------------------------------------------------
-    SECURITY_KEYWORDS = {
-        "authenticate", "authorize", "permission", "role", "admin",
-        "password", "hash", "encrypt", "decrypt", "sanitize", "validate",
-        "escape", "csrf", "token", "jwt", "session", "login", "logout",
-        "ssl", "tls", "certificate", "cors", "helmet",
-    }
-    RISKY_REMOVAL_PATTERNS = [
-        r'^\s*-\s*.*(?:except|catch|try|finally)\s*[\(:].*',
-        r'^\s*-\s*.*(?:validate|sanitize|escape|check|verify|assert)\s*\(',
-        r'^\s*-\s*.*(?:authenticate|authorize|requireAuth|isAdmin)\s*\(',
-        r'^\s*-\s*.*(?:password|secret|token|api_key|apiKey)\s*[:=].*',
-        r'^\s*-.*\bpassword\b.*',
-        r'^\s*-.*\bsecret\b.*',
-    ]
-
-    def _analyze_diff(self, path: Path, rel_path: str) -> list[dict[str, Any]]:
-        """Run git diff on the file and analyze changes for risky patterns."""
-        findings: list[dict[str, Any]] = []
-
         try:
-            result = subprocess.run(
-                ["git", "diff", "HEAD", "--", rel_path],
-                capture_output=True, text=True, timeout=10,
-                cwd=self.config.repo_root,
-            )
-            diff = result.stdout
-            if not diff:
-                return findings
-        except Exception:
-            return findings
-
-        # Count added/removed lines
-        added = 0
-        removed = 0
-        for line in diff.splitlines():
-            if line.startswith("+") and not line.startswith("+++"):
-                added += 1
-            elif line.startswith("-") and not line.startswith("---"):
-                removed += 1
-
-        # Check for risky removals
-        for pattern in self.RISKY_REMOVAL_PATTERNS:
-            import re
-            matches = re.findall(pattern, diff, re.IGNORECASE | re.MULTILINE)
-            if matches:
-                findings.append({
-                    "type": "risky_removal",
-                    "severity": "high",
-                    "detail": f"Removed lines matching '{pattern}' ({len(matches)} occurrence(s))",
-                })
-
-        # Check for size bloat
-        if added > 100 and removed < 10:
-            findings.append({
-                "type": "bloat",
-                "severity": "medium",
-                "detail": f"Large net addition: +{added}/-{removed} lines. Verify no unnecessary code was added.",
+            self.session_mgr.record_incident({
+                "type": "blocked_file", "file": rel, "score": score,
             })
-
-        # Check for net removal of error handling
-        removed_catch = len(re.findall(r'^\s*-\s*.*(?:except|catch)\s*[\(:].*', diff, re.MULTILINE))
-        added_catch = len(re.findall(r'^\s*\+\s*.*(?:except|catch)\s*[\(:].*', diff, re.MULTILINE))
-        if removed_catch > added_catch:
-            findings.append({
-                "type": "error_handling_removed",
-                "severity": "high",
-                "detail": f"More error handlers removed ({removed_catch}) than added ({added_catch})",
-            })
-
-        return findings
-
-    def _intervene_config_change(self, path: Path, rel_path: str, event_type: str):
-        """Log and optionally backup sensitive config file changes."""
-        self.last_intervention_ts = time.time()
-        score = self.safety_score.report_incident(15, f"Sensitive config modified: {rel_path}", str(path))
-        try:
-            self.session_mgr.record_incident({"type": "config_change", "reason": f"Sensitive config modified: {rel_path}", "file": str(path), "score": score})
             self.session_mgr.update_safety_score(score)
         except Exception:
             pass
+
+    def _intervene_guardrails(self, path: Path, rel: str, result, event_type: str, old_source: str = ""):
+        """Intervene when guardrails detect block-level violations."""
+        from .intercept import _write_feedback, FEEDBACK_DIR
+
+        self.last_intervention_ts = time.time()
+        penalty = min(25, 5 * len(result.violations))
+        score = self.safety_score.report_incident(penalty, f"Guardrail block: {result.violations[0].description}", str(path))
+
+        self._quarantine_and_restore(path, rel, result, old_source)
+
         self.logger.warning(
-            f"CONFIG CHANGE [{event_type.upper()}] Sensitive config: {rel_path} | "
-            f"Safety: {score}/100 | Activity: {self.safety_score.get_activity_level()}"
+            f"INTERVENTION [{event_type.upper()}] GUARDRAIL BLOCK: {rel} | "
+            f"{len(result.violations)} violation(s) | "
+            f"Top: {result.violations[0].description} | "
+            f"Safety: {score}/100"
         )
 
-        # Backup the previous version from git if available
-        if event_type == "modified":
-            try:
-                import subprocess
-                result = subprocess.run(
-                    ["git", "show", f"HEAD:{rel_path}"],
-                    capture_output=True, text=True, timeout=5,
-                    cwd=self.config.repo_root,
-                )
-                if result.returncode == 0 and result.stdout:
-                    from datetime import datetime
-                    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    backup_name = f"{ts}_{path.name}.bak"
-                    backup_path = self._config_backup_dir / backup_name
-                    backup_path.write_text(result.stdout, encoding="utf-8")
-                    self.logger.info(f"Backed up previous version of {rel_path} to {backup_path}")
-                    self.logger.info(f"  Restore with: cp {backup_path} {path}")
-            except Exception:
-                pass
+        try:
+            _write_feedback(self.config.repo_root / FEEDBACK_DIR, rel, result)
+        except Exception:
+            pass
 
-        if self.intervention and self.strict_mode:
-            self.logger.warning(f"STRICT MODE: {rel_path} was modified. Review recommended before committing.")
-            self.logger.critical(f"  ACTION: Verify this change was intentional. Config files affect production behavior.")
+        try:
+            self.session_mgr.record_incident({
+                "type": "guardrail_block", "file": rel,
+                "violations": [v.to_dict() for v in result.violations],
+                "score": score,
+            })
+            self.session_mgr.update_safety_score(score)
+        except Exception:
+            pass
+
+    def _quarantine_and_restore(self, path: Path, rel: str, result, old_source: str):
+        """Quarantine the violating file and restore the original from git."""
+        if self.intervention and path.exists():
+            reason = result.violations[0].description if result.violations else "guardrail violation"
+            try:
+                quarantined = self.quarantine.quarantine(path, reason)
+                self.logger.info(f"Quarantined: {quarantined}")
+            except Exception as e:
+                self.logger.error(f"Failed to quarantine {path}: {e}")
+                try:
+                    path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+        # Restore original from git (if the file existed before)
+        if old_source:
+            self._restore_from_git(rel)
 
     def _intervene_blocking_debris(self, path: Path, blocking_items, event_type: str):
         self.last_intervention_ts = time.time()
         for item in blocking_items:
             score = self.safety_score.report_incident(12, item.reason, str(path))
             try:
-                self.session_mgr.record_incident({"type": "blocking_debris", "reason": item.reason, "file": str(path), "score": score})
+                self.session_mgr.record_incident({
+                    "type": "blocking_debris", "reason": item.reason,
+                    "file": str(path), "score": score,
+                })
                 self.session_mgr.update_safety_score(score)
             except Exception:
                 pass
             self.logger.warning(
                 f"INTERVENTION [{event_type.upper()}] {item.category} in {path.name} | "
-                f"{item.reason} | Safety: {score}/100 | Activity: {self.safety_score.get_activity_level()}"
+                f"{item.reason} | Safety: {score}/100"
             )
-
             if self.intervention and item.category == "hardcoded_secret":
                 try:
                     if path.exists():
                         quarantined = self.quarantine.quarantine(path, item.reason)
                         self.logger.critical(f"QUARANTINED FILE WITH HARDCODED SECRET: {quarantined}")
-                        self.logger.critical(f"  URGENT ACTION: Use `deadpush quarantine list` then `deadpush quarantine restore ...` ONLY after you have rotated the secret and reviewed the file.")
                 except Exception as e:
                     self.logger.error(f"Failed to quarantine secret file: {e}")
 

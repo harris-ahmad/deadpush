@@ -64,6 +64,22 @@ class McpServer:
         self.daemon.runtime = self.runtime
 
     # -----------------------------------------------------------------------
+    # Feedback helpers
+    # -----------------------------------------------------------------------
+    def _count_unacknowledged_feedback(self) -> int:
+        feedback_dir = self.repo_root / FEEDBACK_DIR
+        count = 0
+        if feedback_dir.exists():
+            for f in feedback_dir.glob("*.json"):
+                try:
+                    data = json.loads(f.read_text(encoding="utf-8"))
+                    if not data.get("acknowledged", False):
+                        count += 1
+                except Exception:
+                    pass
+        return count
+
+    # -----------------------------------------------------------------------
     # Tool definitions
     # -----------------------------------------------------------------------
     def _tools_list(self) -> list[dict[str, Any]]:
@@ -183,6 +199,39 @@ class McpServer:
                     "properties": {
                         "limit": {"type": "number", "description": "Max entries (default 5)"},
                     },
+                },
+            },
+            {
+                "name": "get_recent_feedback",
+                "description": "Read unacknowledged guardrail feedback entries. Filtered to show only feedback the agent has not yet acknowledged.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "limit": {"type": "number", "description": "Max entries (default 10)"},
+                    },
+                },
+            },
+            {
+                "name": "acknowledge_feedback",
+                "description": "Mark a feedback entry as acknowledged. The agent calls this after reading and addressing the feedback. Use the safe_name from get_recent_feedback (e.g. 'src__bad.py').",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "Feedback filename (safe_name, e.g. src__bad.py)"},
+                    },
+                    "required": ["name"],
+                },
+            },
+            {
+                "name": "retry_write",
+                "description": "Submit corrected content for a previously blocked file. Runs guardrails on the new content. If it passes, writes to the real path and acknowledges the previous feedback. If it still fails, quarantines and writes new feedback.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "Relative path (e.g. src/api.py)"},
+                        "content": {"type": "string", "description": "Corrected file content"},
+                    },
+                    "required": ["path", "content"],
                 },
             },
             # --- Status ---
@@ -451,6 +500,72 @@ class McpServer:
                     pass
         return _ok({"count": len(entries), "entries": entries}, f"{len(entries)} feedback entries.")
 
+    def _tool_get_recent_feedback(self, args: dict[str, Any]) -> dict[str, Any]:
+        limit = int(args.get("limit", 10))
+        feedback_dir = self.repo_root / FEEDBACK_DIR
+        entries = []
+        if feedback_dir.exists():
+            for f in sorted(feedback_dir.glob("*.json"), reverse=True):
+                try:
+                    data = json.loads(f.read_text(encoding="utf-8"))
+                    if not data.get("acknowledged", False):
+                        entries.append(data)
+                        if len(entries) >= limit:
+                            break
+                except Exception:
+                    pass
+        return _ok({"count": len(entries), "entries": entries}, f"{len(entries)} unacknowledged feedback entries.")
+
+    def _tool_acknowledge_feedback(self, args: dict[str, Any]) -> dict[str, Any]:
+        name = args.get("name", "")
+        if not name:
+            return _err("name is required")
+        feedback_dir = self.repo_root / FEEDBACK_DIR
+        path = feedback_dir / name
+        if not path.exists():
+            path = feedback_dir / f"{name}.json"
+        if not path.exists():
+            return _err(f"Feedback entry '{name}' not found.")
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            data["acknowledged"] = True
+            path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            return _ok({"name": name, "file": data.get("file", "")}, f"Feedback '{name}' acknowledged.")
+        except Exception as e:
+            return _err(f"Could not acknowledge feedback: {e}")
+
+    def _tool_retry_write(self, args: dict[str, Any]) -> dict[str, Any]:
+        path = args.get("path", "")
+        content = args.get("content", "")
+        if not path:
+            return _err("path is required")
+        if not content:
+            return _err("content is required")
+        # Write to staging through the daemon's pipeline
+        result = self.daemon.write_file(path, content)
+        # Acknowledge any previous feedback for this file
+        safe_name = path.replace("/", "__").replace("\\", "__")
+        feedback_dir = self.repo_root / FEEDBACK_DIR
+        prev_path = feedback_dir / f"{safe_name}.json"
+        if prev_path.exists():
+            try:
+                prev = json.loads(prev_path.read_text(encoding="utf-8"))
+                prev["acknowledged"] = True
+                prev_path.write_text(json.dumps(prev, indent=2), encoding="utf-8")
+            except Exception:
+                pass
+        if result.allowed:
+            return _ok({
+                "path": path,
+                "status": "allowed",
+                "violations": [],
+            }, "Retry approved. File written successfully.")
+        return _ok({
+            "path": path,
+            "status": "blocked",
+            "violations": [{"category": v.category, "description": v.description, "line": v.line, "severity": v.severity} for v in result.violations],
+        }, f"Retry blocked: {len(result.violations)} violation(s) still present.")
+
     def _tool_get_status(self, args: dict[str, Any]) -> dict[str, Any]:
         agent_md = self.repo_root / "AGENT.md"
         return _ok({
@@ -572,6 +687,20 @@ class McpServer:
     # -----------------------------------------------------------------------
     # MCP lifecycle
     # -----------------------------------------------------------------------
+    def _inject_feedback_summary(self, response: dict[str, Any]) -> dict[str, Any]:
+        try:
+            content = response.get("content", [])
+            for c in content:
+                if c.get("type") == "text":
+                    parsed = json.loads(c["text"])
+                    parsed["feedback_summary"] = {
+                        "unacknowledged": self._count_unacknowledged_feedback()
+                    }
+                    c["text"] = json.dumps(parsed, indent=2, default=str)
+        except Exception:
+            pass
+        return response
+
     def _handle_request(self, method: str, params: dict[str, Any] | None) -> dict[str, Any] | None:
         if method == "tools/list":
             return {"tools": self._tools_list()}
@@ -593,6 +722,9 @@ class McpServer:
                 "quarantine_list": self._tool_quarantine_list,
                 "quarantine_restore": self._tool_quarantine_restore,
                 "get_feedback": self._tool_get_feedback,
+                "get_recent_feedback": self._tool_get_recent_feedback,
+                "acknowledge_feedback": self._tool_acknowledge_feedback,
+                "retry_write": self._tool_retry_write,
                 "get_status": self._tool_get_status,
                 "get_safety_score": self._tool_get_safety_score,
                 "get_runtime_config": self._tool_get_runtime_config,
@@ -641,6 +773,7 @@ class McpServer:
             if method:
                 result = self._handle_request(method, params)
                 if result is not None:
+                    result = self._inject_feedback_summary(result)
                     self._send(msg_id, result)
 
             if method == "shutdown":

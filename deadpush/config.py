@@ -64,6 +64,35 @@ class DeadCodeConfig:
 
 
 @dataclass
+class BlockConfig:
+    """Files/patterns that should always be blocked from writes."""
+    blocked_files: list[str] = field(default_factory=lambda: [
+        "claude.md",
+        ".cursorrules",
+        ".claude_instructions",
+        ".copilot-instructions.md",
+        "windsurf_rules.md",
+    ])
+    blocked_patterns: list[str] = field(default_factory=list)
+
+
+def _load_deadpush_toml(root: Path) -> dict[str, Any]:
+    """Load .deadpush.toml from project root. Returns {} if missing."""
+    dp_paths = [
+        root / "deadpush.toml",
+        root / ".deadpush.toml",
+        root / ".deadpush" / "config.toml",
+    ]
+    for dp in dp_paths:
+        if dp.exists():
+            try:
+                return tomllib.loads(dp.read_text(encoding="utf-8"))
+            except Exception:
+                return {}
+    return {}
+
+
+@dataclass
 class Config:
     """Main deadpush configuration object passed around the system."""
     repo_root: Path
@@ -71,6 +100,7 @@ class Config:
     entrypoints: EntrypointsConfig = field(default_factory=EntrypointsConfig)
     debris: DebrisConfig = field(default_factory=DebrisConfig)
     dead_code: DeadCodeConfig = field(default_factory=DeadCodeConfig)
+    block: BlockConfig = field(default_factory=BlockConfig)
     ignore_patterns: list[str] = field(default_factory=lambda: [
         "__pycache__/", ".git/", "node_modules/", ".deadpush-archive/",
         ".venv/", "venv/", "dist/", "build/", "*.pyc", ".mypy_cache/",
@@ -130,6 +160,18 @@ class Config:
             except Exception:
                 pass
         return pathspec.PathSpec.from_lines("gitwildmatch", patterns)
+
+    def is_blocked(self, rel_path: str) -> bool:
+        """Check if a relative file path matches any blocked file/pattern."""
+        rp = rel_path.replace("\\", "/")
+        name = Path(rp).name
+        if name in self.block.blocked_files:
+            return True
+        from fnmatch import fnmatch
+        for pat in self.block.blocked_patterns:
+            if fnmatch(rp, pat) or fnmatch(name, pat):
+                return True
+        return False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -196,16 +238,23 @@ def load_config(explicit_root: Path | None = None) -> Config:
         except Exception:
             pass  # ignore bad toml, use defaults
 
-    # .deadpush.toml override (simple)
-    dpt = root / ".deadpush.toml"
-    if dpt.exists():
-        try:
-            data = tomllib.loads(dpt.read_text(encoding="utf-8"))
-            if "languages" in data:
-                cfg.languages = [str(x) for x in data["languages"]]
-            # ... other keys could be merged
-        except Exception:
-            pass
+    # deadpush.toml / .deadpush.toml / .deadpush/config.toml
+    dpt_data = _load_deadpush_toml(root)
+    if dpt_data:
+        if "languages" in dpt_data:
+            cfg.languages = [str(x) for x in dpt_data["languages"]]
+        block_data = dpt_data.get("block", {})
+        if "blocked_files" in block_data:
+            cfg.block.blocked_files = list(block_data["blocked_files"])
+        if "blocked_patterns" in block_data:
+            cfg.block.blocked_patterns = list(block_data["blocked_patterns"])
+        dc_data = dpt_data.get("dead_code", {})
+        if "min_confidence" in dc_data:
+            cfg.dead_code.min_confidence = str(dc_data["min_confidence"])
+        if "show_uncertain" in dc_data:
+            cfg.dead_code.show_uncertain = bool(dc_data["show_uncertain"])
+        if "custom_registrations" in dc_data:
+            cfg.dead_code.custom_registrations = list(dc_data["custom_registrations"])
 
     # Env var overrides for quick use
     if os.environ.get("DEADPUSH_LANGUAGES"):

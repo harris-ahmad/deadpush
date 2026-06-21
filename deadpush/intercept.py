@@ -240,21 +240,31 @@ def _check_sensitive_write(source: str, rel_path: str, config: DeadpushConfig, r
     return violations
 
 
-def _check_destructive_changes(source: str, rel_path: str, repo_root: Path, runtime: RuntimeConfig | None = None) -> list[Violation]:
-    """Check if the write would destroy existing content (near-empty rewrites, massive deletions)."""
+def _check_destructive_changes(
+    source: str, rel_path: str, repo_root: Path,
+    runtime: RuntimeConfig | None = None,
+    _old_source: str | None = None,
+) -> list[Violation]:
+    """Check if the write would destroy existing content (near-empty rewrites, massive deletions).
+
+    _old_source: optional pre-write content (used by the real-time guardian where
+                 the file has already been overwritten by the agent).
+    """
     violations: list[Violation] = []
     level = runtime.get_guardrail_level("destructive") if runtime else "warn"
     if level == "off":
         return violations
 
-    dest = (repo_root / rel_path).resolve()
-    if not dest.exists():
-        return violations
-
-    try:
-        old_content = dest.read_text(encoding="utf-8", errors="ignore")
-    except Exception:
-        return violations
+    if _old_source is not None:
+        old_content = _old_source
+    else:
+        dest = (repo_root / rel_path).resolve()
+        if not dest.exists():
+            return violations
+        try:
+            old_content = dest.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            return violations
 
     old_lines = old_content.splitlines()
     new_lines = source.splitlines()
@@ -288,6 +298,7 @@ def _write_feedback(feedback_dir: Path, file_rel: str, result: GuardrailResult):
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "file": file_rel,
         "status": "blocked" if not result.allowed else "approved",
+        "acknowledged": False,
         "violations": [v.to_dict() for v in result.violations],
         "diff": result.diff,
         "message": _generate_message(file_rel, result),
@@ -380,8 +391,27 @@ def _apply_guardrail_level(result: GuardrailResult, violations: list[Violation],
         result.violations.extend(violations)
 
 
-def _run_guardrails(staged_path: Path, staging_dir: Path, config: DeadpushConfig, runtime: RuntimeConfig | None = None) -> GuardrailResult:
-    """Run all guardrail checks on a staged file."""
+def _run_guardrails(
+    staged_path: Path,
+    staging_dir: Path,
+    config: DeadpushConfig,
+    runtime: RuntimeConfig | None = None,
+    *,
+    _old_source: str | None = None,
+    _rel_path_override: str | None = None,
+) -> GuardrailResult:
+    """Run all guardrail checks on a staged file.
+
+    Args:
+        staged_path: Path to the file to check.
+        staging_dir: Base directory for computing the relative path
+                     (pass repo_root when checking a file at its real path).
+        config: Deadpush configuration.
+        runtime: Optional runtime config for level overrides.
+        _old_source: Optional pre-write content (for real-time guardian flow).
+        _rel_path_override: Optional explicit relative path (bypasses staging_dir
+                           computation for the real-time guardian).
+    """
     result = GuardrailResult()
 
     try:
@@ -390,22 +420,30 @@ def _run_guardrails(staged_path: Path, staging_dir: Path, config: DeadpushConfig
         result.reject(Violation("internal", "Could not read staged file", 0, "high"))
         return result
 
-    # Compute diff against existing file (if any)
-    try:
-        dest = _get_dest_path(staged_path, staging_dir, config.repo_root)
-        old = dest.read_text(encoding="utf-8", errors="ignore") if dest.exists() else ""
-        rel_diff = _get_file_rel(staged_path, staging_dir)
-        result.diff = "".join(difflib.unified_diff(
-            old.splitlines(keepends=True),
-            source.splitlines(keepends=True),
-            fromfile=f"a/{rel_diff}",
-            tofile=f"b/{rel_diff}",
-        ))
-    except Exception:
-        result.diff = ""
+    rel = _rel_path_override if _rel_path_override is not None else _get_file_rel(staged_path, staging_dir)
 
-    rel = _get_file_rel(staged_path, staging_dir)
-    suffix = staged_path.suffix.lower()
+    # Compute diff
+    if _old_source is not None:
+        result.diff = "".join(difflib.unified_diff(
+            _old_source.splitlines(keepends=True),
+            source.splitlines(keepends=True),
+            fromfile=f"a/{rel}",
+            tofile=f"b/{rel}",
+        ))
+    else:
+        try:
+            dest = _get_dest_path(staged_path, staging_dir, config.repo_root)
+            old = dest.read_text(encoding="utf-8", errors="ignore") if dest.exists() else ""
+            result.diff = "".join(difflib.unified_diff(
+                old.splitlines(keepends=True),
+                source.splitlines(keepends=True),
+                fromfile=f"a/{rel}",
+                tofile=f"b/{rel}",
+            ))
+        except Exception:
+            result.diff = ""
+
+    suffix = Path(rel).suffix.lower()
 
     # Security checks — level-aware
     _apply_guardrail_level(result, _check_prompt_injection(source, runtime), runtime, "prompt_injection")
@@ -416,7 +454,7 @@ def _run_guardrails(staged_path: Path, staging_dir: Path, config: DeadpushConfig
     for v in _check_sensitive_write(source, rel, config, runtime):
         result.reject(v)
     destructive_level = runtime.get_guardrail_level("destructive") if runtime else "warn"
-    for v in _check_destructive_changes(source, rel, config.repo_root, runtime):
+    for v in _check_destructive_changes(source, rel, config.repo_root, runtime, _old_source=_old_source):
         if destructive_level == "block":
             result.reject(v)
         else:
