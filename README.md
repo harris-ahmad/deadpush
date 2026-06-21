@@ -1,102 +1,120 @@
 # deadpush
 
-Guardrails for the vibe coding era.
+[![GitHub stars](https://img.shields.io/github/stars/harris-ahmad/deadpush?style=social)](https://github.com/harris-ahmad/deadpush)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-This is the complete production implementation of deadpush as specified.
+**Your personal AI Agent Guardian.**  
+Protects you from the mistakes, secrets, and context pollution that AI coding agents (Claude, Cursor, Windsurf, etc.) inevitably create — even when you're not watching.
 
-## Location of full source code
+Run it once with `deadpush protect --daemon` and it runs in the background forever, monitoring your filesystem in real time.
 
-The full advanced Python implementation (all modules: cli.py, graph.py, debris.py, reachability.py, languages/*.py, hook.py, etc.) was built in this project.
+---
 
-See the detailed architecture in the original build prompt for the complete code of each file.
+## The Problem (2026 AI Coding Reality)
 
-## Quick start
+You tell your agent to "add the new feature" and walk away.
 
-```bash
-pip install -e .
-deadpush scan
-deadpush install
-```
+30 minutes later you come back to:
+- A `claude.md` or `.cursorrules` file committed to the repo
+- Hardcoded API keys in `.env` files the agent "helpfully" created
+- 47 new "temporary" scripts and scratchpads
+- Dead code and duplicated logic everywhere
 
-## What's included (v0.2+)
+**deadpush** is the always-on guardian that catches this the moment it happens.
 
-- **Beautiful Rich terminal UI** — premium experience with tables, trees, and colored confidence
-- **Safe Archive Mode** (`deadpush clean --safe`) — moves problematic files instead of deleting
-- **Smart Context Cleaner** (`deadpush clean-context`) — generates ignore patterns + pasteable message for Claude/Cursor
-- **Structural duplicate detection** — uses Python AST to catch AI-regenerated near-duplicates
-- **High-quality call graph construction** — structured CallSite extraction (receivers, methods, qualified names) + best-effort symbol resolution across imports and files for accurate reachability (much improved over raw-text matching)
-- Full reachability-based dead code detection with cross-verification support
-- Semantic debris detection (LLM context files, vibe scratchpads, committed secrets, etc.)
-- Pre-push git hook that blocks dangerous pushes
-- GitHub Action + optional PR commenting
-- Optional Anthropic LLM enrichment
-
-## The AI Agent Guardian (Core Value)
-
-The primary command per the project vision is the hands-off one:
+## One Command. Real Protection.
 
 ```bash
-# The single command for full autonomous protection (install + start bg + auto-reboot helpers):
+pip install deadpush[watch,rich]
 deadpush protect --daemon
-# (or --enable ; same effect)
-
-# This does:
-# - git pre-push hook install (blocks risky pushes)
-# - Auto-merges AI-agent / debris patterns into .cursorignore + .claudeignore + .gitignore
-# - Starts (and sets up for reboot) the persistent background guardian
-#   (double-fork, file logging only, Safety Score with multi-agent burst detection,
-#    rate-limited interventions, auto-quarantine instead of delete, recovery on watcher errors)
-
-# Inspect / control:
-deadpush status                 # Is it running? Last score? Recent incidents? Quarantines?
-deadpush quarantine list        # Review what was auto-quarantined (with reasons + original paths)
-deadpush quarantine restore foo.py   # Put it back (only if original spot free)
-deadpush guard --no-intervention   # Watch-only mode (no blocking)
-
-# Manual / re-start the watcher:
-deadpush guard --daemon
 ```
 
-This fulfills the core principle: protection as autonomous and "set-it-and-forget-it" as possible. Users (or their AI agents) run `deadpush protect --daemon` once and can step away while many Claude/Cursor/Windsurf agents work in parallel. The guardian monitors the FS in a detached process, handles bursts intelligently, and only intervenes on real risks (with easy restore).
+That's it.
 
-**Bonus for agents**: A Local Control Interface runs automatically (HTTP on http://127.0.0.1:14242 or the port in `~/.deadpush/guardian.control.port`). Your AI coding agents can query:
-- GET /status, /safety-score, /recent-incidents, /quarantine-list
-- POST /trigger-light-analysis or restore quarantined files safely
+It will:
+- Install a smart pre-push git hook
+- Merge AI-specific ignore patterns into `.cursorignore`, `.claudeignore`, and `.gitignore`
+- Start a persistent background process that watches your entire repo
+- Automatically quarantine dangerous files the second they appear
+- Track a **Safety Score** that reacts intelligently when multiple agents are going wild
 
-This lets agents self-regulate without you running manual commands.
+While you're at the gym, in a meeting, or sleeping, deadpush is on duty.
 
-See `deadpush protect --help` and `deadpush --help` for all options.
-
-## Other Useful Commands
+## See It In Action
 
 ```bash
-deadpush scan                 # Full analysis with beautiful output
-deadpush clean --safe         # Safely archive issues
-deadpush clean-context        # Get ignore patterns for your AI chat
-deadpush protect --daemon     # Full auto setup + start persistent guardian (PRIMARY)
-deadpush guard --daemon       # Start (or re-start) the background watcher
-deadpush status               # Show if guardian running, Safety Score, recent incidents
-deadpush verify               # Cross-verify static dead-code results with textual reference search (second opinion layer)
-deadpush quarantine list      # Review quarantined files
-deadpush quarantine restore <path>  # Restore a quarantined file
+# After running protect --daemon, try simulating an agent:
+mkdir -p .deadpush-e2e-sandbox
+touch .deadpush-e2e-sandbox/claude.md
+echo 'OPENAI_API_KEY=sk-...' > .deadpush-e2e-sandbox/.env.bad
+
+deadpush status
+deadpush quarantine list
 ```
 
-## Verifying Scan Integrity
+You'll see the guardian react, drop the Safety Score, and quarantine the files.
 
-The static analysis (`deadpush scan`) now builds proper structured call graphs (see `CallSite` in language plugins + resolver in cli.py). However, no static analysis is perfect (especially with JS/TS dynamic patterns, reflection, etc.).
-
-Use the built-in cross-verifier for an additional manual verification layer:
+For a full automated demo of every feature (including burst simulation and call-graph verification):
 
 ```bash
-deadpush verify --min-confidence 0.8
-# or with more context
-deadpush verify --format json > verification.json
+python scripts/full_e2e_test.py --simulate-agent --burst --run-scan
 ```
 
-It searches all source files for textual references to symbols the static analysis marked dead and highlights discrepancies. This lets you quickly see:
-- Real misses by the call graph (e.g. dynamic `getattr`, string requires).
-- Spurious textual matches (tests, comments, similar names).
+## Key Features
 
-Treat `deadpush scan` results + `deadpush verify` as strong hints that still benefit from human review.
+- **True background guardian** — Survives terminal close, supports systemd/launchd autostart
+- **Smart multi-agent Safety Score** — Penalizes bursts of dangerous activity from parallel agents
+- **Automatic quarantine** (never hard-delete) — Easy `deadpush quarantine list` / `restore`
+- **Local Control Interface for agents** — Your AI coding agents can query the guardian themselves (`GET /status`, `/quarantine-list`, etc. on localhost)
+- **Cross-platform pre-push hook** — Works in PowerShell, CMD, and Git Bash
+- **Strong static analysis + verification** — Structured call graphs + `deadpush verify` so you can actually trust (or challenge) the dead code reports
+- **Debris detection** — LLM context files, vibe scratchpads, hardcoded secrets, AI-generated duplicates
 
-For the complete source of every .py file, refer to the step-by-step implementation provided during the build.
+## Commands You'll Actually Use
+
+```bash
+deadpush protect --daemon     # The one command you run per repo
+deadpush status               # Is the guardian alive? What's the Safety Score?
+deadpush quarantine list      # See what it caught
+deadpush verify               # Cross-check the static analysis with real references
+```
+
+## Why This Matters in the AI Era
+
+AI agents are incredible productivity multipliers.
+
+They are also incredibly good at creating technical debt, leaking secrets, and polluting your context — especially when you give them long-running tasks and step away.
+
+deadpush is the missing safety net.
+
+## Installation
+
+```bash
+pip install deadpush[watch,rich]
+```
+
+Then run `deadpush protect --daemon` in any repo you care about.
+
+## Windows Users
+
+The pre-push hook ships as a Python script + `.cmd` shim. It works from PowerShell, Command Prompt, and Git Bash. The `deadpush protect` command records the exact Python interpreter so everything works even inside virtualenvs.
+
+## Development
+
+```bash
+git clone https://github.com/harris-ahmad/deadpush
+cd deadpush
+pip install -e ".[dev,watch,rich]"
+```
+
+## Philosophy
+
+Set it and forget it.
+
+The best guardian is one you forget exists — until the moment it saves you from your own agent.
+
+---
+
+**Star the repo** if you think every developer running AI coding agents in 2026 should have this running in the background.
+
+For the complete source and architecture, see the implementation notes in the repo.
