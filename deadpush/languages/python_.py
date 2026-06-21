@@ -209,6 +209,51 @@ class PythonPlugin:
         # app / cli common
         if any(pat in source for pat in ("app.run", "cli()", "fire.Fire", "Typer")):
             entries.append("app")
+        # Click decorator detection: @*.command() or @*.group() decorated functions
+        try:
+            import ast
+            tree_ast = ast.parse(tree.root_node.text.decode("utf-8", errors="ignore"))
+            for node in ast.walk(tree_ast):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    for dec in node.decorator_list:
+                        if isinstance(dec, ast.Call):
+                            # @main.command(), @cmd_hooks.command(), @app.get(), etc.
+                            if isinstance(dec.func, ast.Attribute) and dec.func.attr in ("command", "group"):
+                                entries.append(node.name)
+                            # @app.get(), @app.post(), etc. (FastAPI-style)
+                            if isinstance(dec.func, ast.Attribute) and dec.func.attr in ("get", "post", "put", "delete", "patch", "options", "head", "trace"):
+                                entries.append(node.name)
+                            # @click.command()
+                            if isinstance(dec.func, ast.Attribute) and dec.func.attr == "command":
+                                if isinstance(dec.func.value, ast.Name) and dec.func.value.id == "click":
+                                    entries.append(node.name)
+                        elif isinstance(dec, ast.Attribute):
+                            # @router.get without parentheses (rare)
+                            if dec.attr in ("get", "post", "put", "delete"):
+                                entries.append(node.name)
+        except Exception:
+            pass
+        # Pytest: treat test_* functions / Test* classes in test files as entry points
+        file_stem = Path(path).stem
+        if "/test_" in path or path.endswith("_test.py") or file_stem.startswith("test_") or file_stem == "conftest":
+            try:
+                import ast
+                tree_ast = ast.parse(tree.root_node.text.decode("utf-8", errors="ignore"))
+                for node in ast.walk(tree_ast):
+                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test_"):
+                        entries.append(node.name)
+                    # Pytest fixtures: @pytest.fixture or @pytest.fixture()
+                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        for dec in node.decorator_list:
+                            if isinstance(dec, ast.Call) and isinstance(dec.func, ast.Attribute) and dec.func.attr == "fixture":
+                                entries.append(node.name)
+                            if isinstance(dec, ast.Attribute) and dec.attr == "fixture":
+                                entries.append(node.name)
+                    # Test classes (class Test*)
+                    if isinstance(node, ast.ClassDef) and node.name.startswith("Test"):
+                        entries.append(node.name)
+            except Exception:
+                pass
         # honor dynamic patterns from config if they look like func names
         for pat in config_dynamic_patterns:
             if "(" not in pat and pat.replace("\\b", "").strip().isidentifier():

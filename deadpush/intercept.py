@@ -59,6 +59,7 @@ class GuardrailResult:
     def __init__(self):
         self.allowed = True
         self.violations: list[Violation] = []
+        self.diff: str = ""
 
     def reject(self, v: Violation):
         self.violations.append(v)
@@ -68,6 +69,7 @@ class GuardrailResult:
         return {
             "allowed": self.allowed,
             "violations": [v.to_dict() for v in self.violations],
+            "diff": self.diff,
         }
 
 
@@ -287,6 +289,7 @@ def _write_feedback(feedback_dir: Path, file_rel: str, result: GuardrailResult):
         "file": file_rel,
         "status": "blocked" if not result.allowed else "approved",
         "violations": [v.to_dict() for v in result.violations],
+        "diff": result.diff,
         "message": _generate_message(file_rel, result),
     }
     feedback_dir.mkdir(parents=True, exist_ok=True)
@@ -332,6 +335,13 @@ def _feedback_to_markdown(file_rel: str, result: GuardrailResult) -> str:
             lines.append(f"- **Line:** {v.line}")
             lines.append(f"- **Description:** {v.description}")
             lines.append("")
+    if result.diff:
+        lines.append("## Diff")
+        lines.append("")
+        lines.append("```diff")
+        lines.append(result.diff.rstrip("\n"))
+        lines.append("```")
+        lines.append("")
     if not result.allowed:
         lines.append("## What to do")
         lines.append("")
@@ -379,6 +389,20 @@ def _run_guardrails(staged_path: Path, staging_dir: Path, config: DeadpushConfig
     except Exception:
         result.reject(Violation("internal", "Could not read staged file", 0, "high"))
         return result
+
+    # Compute diff against existing file (if any)
+    try:
+        dest = _get_dest_path(staged_path, staging_dir, config.repo_root)
+        old = dest.read_text(encoding="utf-8", errors="ignore") if dest.exists() else ""
+        rel_diff = _get_file_rel(staged_path, staging_dir)
+        result.diff = "".join(difflib.unified_diff(
+            old.splitlines(keepends=True),
+            source.splitlines(keepends=True),
+            fromfile=f"a/{rel_diff}",
+            tofile=f"b/{rel_diff}",
+        ))
+    except Exception:
+        result.diff = ""
 
     rel = _get_file_rel(staged_path, staging_dir)
     suffix = staged_path.suffix.lower()

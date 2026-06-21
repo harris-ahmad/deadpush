@@ -32,6 +32,7 @@ from .graph import (
     build_repo_call_graph,
 )
 from .languages.base import CallSite
+from .report import generate_markdown_report, generate_json_report
 
 from .ui import (
     is_rich_available,
@@ -147,24 +148,61 @@ def _resolve_callee_to_symbol(
     return None
 
 
-def _run_full_analysis(config, explicit_entries=None, max_depth=-1, use_rich=True, check_imports=True):
+_CONFIDENCE_ORDER: dict[str, int] = {
+    "high": 0,
+    "medium": 1,
+    "low": 2,
+    "uncertain": 3,
+}
+
+
+def _filter_by_confidence(
+    dead_symbols: list[DeadSymbol],
+    config,
+    aggressive: bool = False,
+    show_uncertain: bool = False,
+    min_confidence: str | None = None,
+) -> list[DeadSymbol]:
+    """Filter dead symbols by confidence tier.
+
+    Default (agent-safe, conservative): only high-confidence (alive_score <= 0.2).
+    --aggressive: drop to low + show uncertain.
+    --min-confidence: explicit override.
+    """
+    if aggressive:
+        effective_min = "low"
+        effective_show_uncertain = True
+    else:
+        effective_min = min_confidence or config.dead_code.min_confidence
+        effective_show_uncertain = show_uncertain or config.dead_code.show_uncertain
+
+    threshold = _CONFIDENCE_ORDER.get(effective_min, 0)
+
+    filtered = []
+    for ds in dead_symbols:
+        tier_idx = _CONFIDENCE_ORDER.get(ds.tier_new, 3)
+        if tier_idx > threshold:
+            continue
+        if not effective_show_uncertain and ds.tier_new == "uncertain":
+            continue
+        filtered.append(ds)
+
+    return filtered
+
+
+def _run_full_analysis(config, explicit_entries=None, max_depth=-1, use_rich=True, check_imports=True,
+                      aggressive=False, show_uncertain=False, min_confidence=None):
     """Internal function that performs the full analysis."""
     from .entrypoints import resolve_entry_points
     from .languages import get_enabled_plugins
     from .reachability import compute_reachability
-    from .scorer import score_symbol
-    from .report import generate_markdown_report, generate_json_report
+    from .scorer import score_symbol, build_scorer
 
     plugins = get_enabled_plugins(config)
-    # Also eagerly pull rust/cpp etc if enabled even if their files were the trigger
-    # (the registry handles lazy loads for all)
-
     files = list(iter_source_files(config.repo_root, config))
 
     graph = CallGraph()
     per_file_graphs: dict[str, dict[str, Any]] = {}
-
-    # Collect imports for hallucination detection
     all_imports: list[tuple[str, str]] = []
 
     for f in files:
@@ -181,11 +219,9 @@ def _run_full_analysis(config, explicit_entries=None, max_depth=-1, use_rich=Tru
             tree = plugin.parse(f.path.read_bytes(), str(f.path))
             file_path = str(f.path)
 
-            # Legacy flat symbols (kept for compatibility)
             for sym in plugin.extract_symbols(tree, file_path):
                 graph.add_symbol(sym)
 
-            # Build high-quality call graph using structured CallSite data
             file_symbols = {s.id: s for s in graph.symbols.values() if s.path == file_path}
             file_imports: dict[str, str] = {}
             try:
@@ -194,7 +230,6 @@ def _run_full_analysis(config, explicit_entries=None, max_depth=-1, use_rich=Tru
                         for n in imp.names:
                             if n != "*":
                                 file_imports[n] = imp.module
-                        # Collect for import validation (external, non-relative)
                         if imp.level == 0:
                             all_imports.append((imp.module, f.path.suffix))
             except Exception:
@@ -209,19 +244,17 @@ def _run_full_analysis(config, explicit_entries=None, max_depth=-1, use_rich=Tru
                 conf = 0.95 if resolved_id else 0.75
                 graph.add_edge(Edge(src=call.caller_id, dst=target, kind="calls", confidence=conf))
 
-                # Rich CallEdge for BlastRadius-style proper call graphs
                 rich_calls.append({
                     "caller_id": call.caller_id,
                     "callee_name": call.callee,
                     "callee_id": resolved_id,
                     "line": call.line,
-                    "snippet": "",  # plugins can populate if they capture source
+                    "snippet": "",
                     "usage": "call",
                     "binding": call.receiver,
                     "package": file_imports.get(call.receiver or "") if call.receiver else None,
                 })
 
-            # Build a minimal per-file FileGraph (functions from legacy symbols + calls)
             file_functions: list[dict[str, Any]] = []
             for sym in plugin.extract_symbols(tree, file_path):
                 if sym.kind in ("function", "method", "class"):
@@ -236,17 +269,15 @@ def _run_full_analysis(config, explicit_entries=None, max_depth=-1, use_rich=Tru
 
             per_file_graphs[file_path] = {
                 "language": plugin.__class__.__name__.replace("Plugin", "").lower(),
-                "imports": [],  # plugins can enrich
-                "bindings": {},  # plugins can enrich
+                "imports": [],
+                "bindings": {},
                 "functions": file_functions,
                 "calls": rich_calls,
             }
 
-            # (Optional) could also add import edges here from plugin.extract_imports
         except Exception:
             continue
 
-    # Assemble the proper repo-level call graph using BlastRadius-inspired resolution
     try:
         repo_graph = build_repo_call_graph(per_file_graphs)
         graph.files_graph = per_file_graphs
@@ -254,19 +285,35 @@ def _run_full_analysis(config, explicit_entries=None, max_depth=-1, use_rich=Tru
         graph.call_edges = repo_graph.get("call_edges", [])
         graph.entry_points = repo_graph.get("entry_points", [])
     except Exception:
-        # Fall back gracefully; legacy edges are still there
         pass
 
     roots = resolve_entry_points(graph, files, plugins, config)
     reachability = compute_reachability(graph, roots, config)
 
+    # Build multi-factor scorer
+    file_paths = [f.path for f in files if f.is_text]
+    try:
+        scorer = build_scorer(
+            config=config,
+            graph=graph,
+            roots=set(roots),
+            all_file_paths=file_paths,
+            custom_registrations=config.dead_code.custom_registrations,
+        )
+    except Exception:
+        scorer = None
+
     dead_symbols = []
     for sym_id in list(reachability.unreachable) + list(reachability.uncertain):
         sym = graph.get_symbol(sym_id)
         if sym:
-            scored = score_symbol(sym, graph, reachability, config)
+            scored = score_symbol(sym, graph, reachability, config, scorer=scorer)
             if scored:
                 dead_symbols.append(scored)
+
+    # Filter by confidence tier
+    dead_symbols = _filter_by_confidence(dead_symbols, config, aggressive=aggressive,
+                                          show_uncertain=show_uncertain, min_confidence=min_confidence)
 
     detector = DebrisDetector(config)
     debris = detector.scan(files)
@@ -912,7 +959,11 @@ def cmd_churn(days, threshold, fmt):
 @click.option("--output", "-o", type=click.Path(), help="Write report to file")
 @click.option("--no-rich", is_flag=True, help="Force plain text output")
 @click.option("--check-imports/--no-check-imports", default=True, help="Validate external imports against package registries (default: on)")
-def cmd_scan(entry, depth, fmt, output, no_rich, check_imports):
+@click.option("--aggressive", is_flag=True, help="Include low-confidence dead symbols + uncertain tier (use for cleanup sprints)")
+@click.option("--show-uncertain", is_flag=True, help="Show uncertain-tier symbols (alive_score > 0.7, usually abstained)")
+@click.option("--min-confidence", type=click.Choice(["high", "medium", "low", "uncertain"]), default=None,
+              help="Minimum deadness confidence tier (default: high, overrides --aggressive)")
+def cmd_scan(entry, depth, fmt, output, no_rich, check_imports, aggressive, show_uncertain, min_confidence):
     """Full scan with rich output, SARIF, markdown, json etc."""
     config = load_config()
     if entry:
@@ -923,7 +974,11 @@ def cmd_scan(entry, depth, fmt, output, no_rich, check_imports):
     if use_rich and fmt != "summary":
         print_header("deadpush Scan", "Analyzing repository for dead code and debris...")
 
-    result = _run_full_analysis(config, list(entry) if entry else None, depth, use_rich=use_rich, check_imports=check_imports)
+    result = _run_full_analysis(
+        config, list(entry) if entry else None, depth, use_rich=use_rich,
+        check_imports=check_imports, aggressive=aggressive,
+        show_uncertain=show_uncertain, min_confidence=min_confidence,
+    )
 
     debris = result["debris"]
     dead = result["dead_symbols"]
@@ -952,6 +1007,13 @@ def cmd_scan(entry, depth, fmt, output, no_rich, check_imports):
         return
 
     if fmt == "rich" and use_rich:
+        # Count by tier
+        tier_counts: dict[str, int] = {}
+        for ds in dead:
+            t = getattr(ds, "tier_new", ds.tier)
+            tier_counts[t] = tier_counts.get(t, 0) + 1
+        tier_str = ", ".join(f"{k}={v}" for k, v in sorted(tier_counts.items()))
+
         print_scan_summary(
             total_files=len(result["files"]),
             dead_count=len(dead),
@@ -959,6 +1021,8 @@ def cmd_scan(entry, depth, fmt, output, no_rich, check_imports):
             blocking_debris=len(blocking),
             entry_points=len(result.get("roots", [])),
         )
+        if tier_str:
+            print(f"  Dead symbols by tier: {tier_str}")
         if blocking:
             print_blocking_warning(blocking)
         if debris:
@@ -1031,9 +1095,15 @@ def cmd_scan(entry, depth, fmt, output, no_rich, check_imports):
         layer_violations = len(result.get("layer_violations", []))
         sec_report = result.get("security_report")
         sec_untested = len(sec_report.untested) if sec_report else 0
+        # Count by tier
+        tier_counts: dict[str, int] = {}
+        for ds in dead:
+            t = getattr(ds, "tier_new", ds.tier)
+            tier_counts[t] = tier_counts.get(t, 0) + 1
+        tier_str = ", ".join(f"{k}={v}" for k, v in sorted(tier_counts.items()))
         click.echo(
             f"Scanned {len(result.get('files', []))} files. "
-            f"Found {len(dead)} dead symbols, {len(debris)} debris, "
+            f"Found {len(dead)} dead symbols ({tier_str}), {len(debris)} debris, "
             f"{exceeded} complexity alerts, "
             f"{test_issues} test issues, "
             f"{stale_docs} stale docs, "

@@ -333,7 +333,7 @@ def build_forward_adjacency(call_edges: list[dict[str, Any]]) -> dict[str, list[
     return adj
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass
 class DeadSymbol:
     symbol: Symbol
     tier: Literal["definite", "probable", "suspicious", "uncertain"]
@@ -341,6 +341,9 @@ class DeadSymbol:
     reasons: list[str]
     safe_to_delete: bool = True
     delete_order: int = 0
+    alive_score: float = 0.0
+    tier_new: str = "uncertain"
+    factor_breakdown: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)

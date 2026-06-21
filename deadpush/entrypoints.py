@@ -144,10 +144,19 @@ def resolve_entry_points(
             detected = lang_plug.detect_entry_points(tree, str(f.path), dynamic_pats)
             for det in detected:
                 # match against symbols we have for this file
+                matched = False
                 for sym_id, sym in graph.symbols.items():
-                    if sym.path == str(f.path) and (sym.name == det or det in sym.name):
+                    if sym.path != str(f.path):
+                        continue
+                    if sym.name == det:
                         roots.add(sym_id)
+                        matched = True
                         break
+                if not matched:
+                    for sym_id, sym in graph.symbols.items():
+                        if sym.path == str(f.path) and det in sym.name:
+                            roots.add(sym_id)
+                            break
                 # fallback synthetic if not parsed as symbol
                 if det in ("main", "__main__", "default", "app"):
                     candidate = f"{Path(f.path).as_posix()}::{det}"

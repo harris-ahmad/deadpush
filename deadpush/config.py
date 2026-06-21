@@ -56,12 +56,21 @@ class DebrisConfig:
 
 
 @dataclass
+class DeadCodeConfig:
+    """Configuration for dead code analysis (multi-factor scoring)."""
+    min_confidence: str = "high"
+    show_uncertain: bool = False
+    custom_registrations: list[str] = field(default_factory=list)
+
+
+@dataclass
 class Config:
     """Main deadpush configuration object passed around the system."""
     repo_root: Path
     languages: list[str] = field(default_factory=lambda: list(SUPPORTED_LANGUAGES))
     entrypoints: EntrypointsConfig = field(default_factory=EntrypointsConfig)
     debris: DebrisConfig = field(default_factory=DebrisConfig)
+    dead_code: DeadCodeConfig = field(default_factory=DeadCodeConfig)
     ignore_patterns: list[str] = field(default_factory=lambda: [
         "__pycache__/", ".git/", "node_modules/", ".deadpush-archive/",
         ".venv/", "venv/", "dist/", "build/", "*.pyc", ".mypy_cache/",
@@ -176,6 +185,14 @@ def load_config(explicit_root: Path | None = None) -> Config:
                 cfg.max_file_size_mb = int(tool["max_file_size_mb"])
             if "control_port" in tool:
                 cfg.control_port = int(tool["control_port"])
+            if "dead_code" in tool:
+                dc = tool["dead_code"]
+                if "min_confidence" in dc:
+                    cfg.dead_code.min_confidence = str(dc["min_confidence"])
+                if "show_uncertain" in dc:
+                    cfg.dead_code.show_uncertain = bool(dc["show_uncertain"])
+                if "custom_registrations" in dc:
+                    cfg.dead_code.custom_registrations = list(dc["custom_registrations"])
         except Exception:
             pass  # ignore bad toml, use defaults
 
