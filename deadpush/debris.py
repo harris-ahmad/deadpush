@@ -22,6 +22,13 @@ from .config import Config
 from .crawler import FileInfo
 from .graph import DebrisFile, content_hash
 
+SILENT_FAILURE_PATTERNS = [
+    re.compile(r'try\s*:.*?except\s*[^:]*:\s*\n\s*(?:pass|#.*|\.{3}|\.\.\.)', re.DOTALL),
+    re.compile(r'try\s*:.*?except\s*[^:]*:\s*\n\s*\n\s*(?:pass|return\s+None|return\s+"")', re.DOTALL),
+    re.compile(r'except\s*(?:Exception|BaseException|Error|RuntimeError|\(.*?\))?\s*:\s*(?:pass|#.*)'),
+    re.compile(r'except\s*:\s*#\s*(?:TODO|FIXME|HACK|ignore)', re.IGNORECASE),
+]
+
 import math
 import string
 
@@ -90,9 +97,17 @@ class DebrisDetector:
     def _check_file(self, f: FileInfo, all_files: list[FileInfo]) -> list[dict[str, Any]]:
         flags = []
         flags += self._check_filename(f)
-        if f.is_text:
-            flags += self._check_content(f)
-            flags += self._detect_hardcoded_secrets(f)
+        content = None
+        if f.is_text and f.size < 2 * 1024 * 1024:
+            try:
+                content = f.path.read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                pass
+        if content is not None:
+            flags += self._check_content(f, content)
+            flags += self._detect_hardcoded_secrets(f, content)
+            flags += self._check_anti_patterns(f, content)
+            flags += self._check_prompt_injection(f, content)
         flags += self._check_duplicates(f, all_files)
         flags += self._check_structural_duplicates(f, all_files)
         flags += self._check_git_status(f)
@@ -134,13 +149,17 @@ class DebrisDetector:
 
         return flags
 
-    def _check_content(self, f: FileInfo) -> list[dict[str, Any]]:
+    def _check_content(self, f: FileInfo, content: str | None = None) -> list[dict[str, Any]]:
         flags = []
-        try:
-            with f.path.open("r", encoding="utf-8", errors="ignore") as fh:
-                head = "".join([next(fh) for _ in range(55)])
-        except Exception:
-            return flags
+        if content is not None:
+            lines = content.splitlines()
+            head = "\n".join(lines[:55])
+        else:
+            try:
+                with f.path.open("r", encoding="utf-8", errors="ignore") as fh:
+                    head = "".join([next(fh) for _ in range(55)])
+            except Exception:
+                return flags
 
         content_lower = head.lower()
 
@@ -290,7 +309,7 @@ class DebrisDetector:
     # -------------------------------------------------------------------------
     # ADVANCED Hardcoded Secrets Detection (Production-Grade)
     # -------------------------------------------------------------------------
-    def _detect_hardcoded_secrets(self, f: FileInfo) -> list[dict[str, Any]]:
+    def _detect_hardcoded_secrets(self, f: FileInfo, content: str | None = None) -> list[dict[str, Any]]:
         """
         Advanced, multi-layered secret detection engine.
 
@@ -306,11 +325,12 @@ class DebrisDetector:
             return []
 
         flags = []
-        try:
-            content = f.path.read_text(encoding="utf-8", errors="ignore")
-            lines = content.splitlines()
-        except Exception:
-            return flags
+        if content is None:
+            try:
+                content = f.path.read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                return flags
+        lines = content.splitlines()
 
         # === Layer 1: High-confidence known formats ===
         known_formats = self._get_known_secret_formats()
@@ -557,7 +577,7 @@ class DebrisDetector:
     # -------------------------------------------------------------------------
     # Obfuscation Detection (Concatenation, Base64, etc.)
     # -------------------------------------------------------------------------
-    def _detect_obfuscated_secrets(self, content: str, lines: list[str]) -> list[dict[str, Any]]:
+    def _detect_obfuscated_secrets(self, content: str, lines: list[str] | None = None) -> list[dict[str, Any]]:
         """Detect secrets that are split or encoded to evade simple detection."""
         flags = []
 
@@ -596,6 +616,84 @@ class DebrisDetector:
                         })
                 except Exception:
                     pass
+
+        return flags
+
+    def _check_anti_patterns(self, f: FileInfo, content: str) -> list[dict[str, Any]]:
+        """Detect silent failure patterns that hide bugs."""
+        if not f.is_text or f.size > 800_000:
+            return []
+        flags = []
+        for i, pattern in enumerate(SILENT_FAILURE_PATTERNS):
+            matches = pattern.findall(content)
+            if matches:
+                flags.append({
+                    "category": "silent_failure",
+                    "confidence": 0.88,
+                    "reason": f"Empty/silent except block that swallows errors ({len(matches)} occurrence{'s' if len(matches) > 1 else ''})",
+                    "block": False,
+                    "suggestion": "Remove the bare except or at minimum log the error. Bare except: pass is a leading cause of silent bugs in AI-generated code.",
+                })
+                break
+
+        # Bare except: pass (line-level detection for non-multiline)
+        for i, line in enumerate(content.splitlines()):
+            stripped = line.strip()
+            if stripped == "except:" or stripped == "except: pass":
+                flags.append({
+                    "category": "silent_failure",
+                    "confidence": 0.95,
+                    "reason": f"Bare 'except:' on line {i+1} — catches everything silently",
+                    "block": False,
+                    "suggestion": "Specify the exception type and at minimum log it.",
+                })
+                break
+
+        return flags
+
+    # -------------------------------------------------------------------------
+    # Prompt Injection Detection
+    # -------------------------------------------------------------------------
+    PROMPT_INJECTION_PATTERNS: list[tuple[str, float, str]] = [
+        # Direct AI instruction patterns
+        (r'(?i)AI[:;]\s*(?:ignore|skip|bypass|disable|don\'?t\s+(?:check|validate|scan))', 0.95, "AI override instruction — tells agents to skip or bypass safety checks"),
+        (r'(?i)as\s+(?:an\s+)?AI\s*(?:assistant|agent|model|coding\s+agent)[,;]\s*(?:please|you\s+(?:should|must|will|need\s+to))\s+(?:ignore|skip|bypass|disable|never|always)', 0.93, "AI role-playing instruction — may influence agent behavior unsafely"),
+        (r'(?i)AI\s+(?:should|must|will|can|needs?\s+to)\s+(?:ignore|skip|bypass|disable|never\s+check|always\s+approve)', 0.92, "AI imperative instruction — attempts to override agent judgment"),
+        (r'(?i)(?:<!--|#)\s*@?\s*(?:ai|claude|chatgpt|cursor|copilot)\s*(?:ignore|skip|bypass)\s*(?:the\s+)?(?:below|above|following)', 0.97, "AI directive embedded in comment — may bypass safety guidelines"),
+        # System prompt remnants
+        (r'(?i)you\s+are\s+(?:an?\s+)?(?:expert|senior|advanced|helpful)\s+(?:AI|assistant|software\s+engineer|coder)', 0.88, "System prompt fragment — AI context file or prompt left in codebase"),
+        (r'(?i)your\s+(?:task|job|mission|purpose|goal)\s+is\s+to', 0.85, "AI task instruction — may be a system prompt remnant"),
+        (r'(?i)never\s+(?:tell|reveal|disclose|mention|share)\s+(?:the\s+)?(?:user|anyone|them)\s+(?:about|that)', 0.94, "AI instruction to hide information — potential prompt injection"),
+        # Unsafe override patterns
+        (r'(?i)ignore\s+(?:all\s+)?(?:previous|prior|safety|security|ethical)\s+(?:instructions|guidelines|rules|constraints)', 0.98, "Direct override of safety instructions — high-risk prompt injection"),
+        (r'(?i)you\s+(?:have|have\s+been)\s+(?:full|complete)\s+(?:permission|authorization|clearance)\s+to', 0.90, "AI permission override — attempts to grant unauthorized capabilities"),
+        # Embedded in documentation/comments
+        (r'(?i)<\|?(?:im_start|im_end|system|assistant|user)\|?>', 0.96, "Chat markup format token — LLM conversation exported to codebase"),
+        (r'(?i)\{\{.*(?:prompt|system|user|assistant).*\}\}', 0.80, "Template injection pattern — may be prompt template"),
+    ]
+
+    def _check_prompt_injection(self, f: FileInfo, content: str) -> list[dict[str, Any]]:
+        """Detect prompt injections, AI instructions, and system prompt remnants."""
+        flags: list[dict[str, Any]] = []
+        if not content:
+            return flags
+
+        rel = str(getattr(f, "rel_path", f.path)).lower()
+        # Skip our own files and known safe files
+        if ".deadpush" in rel or "__pycache__" in rel:
+            return flags
+
+        for pattern, confidence, reason in self.PROMPT_INJECTION_PATTERNS:
+            matches = re.findall(pattern, content)
+            if matches:
+                flags.append({
+                    "category": "prompt_injection",
+                    "confidence": confidence,
+                    "reason": reason,
+                    "block": False,
+                    "suggestion": "Remove injected instructions from the codebase. AI agents may follow embedded instructions, creating security or behavioral risks.",
+                })
+                break  # One flag per file is enough
 
         return flags
 

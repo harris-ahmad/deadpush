@@ -33,9 +33,11 @@ except ImportError:
 
 from .config import load_config
 from .debris import DebrisDetector
+from .session import SessionManager
 
 # For Local Control Interface (AGENT priority 4 - for automatic interaction by Claude/Cursor/etc agents)
 import json
+import subprocess
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
@@ -549,6 +551,7 @@ class GuardianHandler(FileSystemEventHandler or object):
         self.detector = DebrisDetector(config)
         self.quarantine = QuarantineManager(config.repo_root)
         self.safety_score = SessionSafetyScore()
+        self.session_mgr = SessionManager()
 
         self.critical_llm_files = {
             "claude.md", ".cursorrules", ".claude_instructions",
@@ -558,6 +561,10 @@ class GuardianHandler(FileSystemEventHandler or object):
         # Rate limiting for multi-agent scenarios
         self.last_intervention_ts = 0.0
         self.cooldown_seconds = 2.0  # Prevent rapid interventions from multiple agents
+
+        # Sensitive config backup directory
+        self._config_backup_dir = config.repo_root / ".deadpush-config-backups"
+        self._config_backup_dir.mkdir(parents=True, exist_ok=True)
 
     def on_created(self, event):
         if event.is_directory:
@@ -592,6 +599,38 @@ class GuardianHandler(FileSystemEventHandler or object):
                 self._intervene_critical_file(path, "LLM Context File", event_type)
                 return
 
+            # === Sensitive Configuration Files ===
+            try:
+                rel = path.relative_to(self.config.repo_root).as_posix()
+                if self.config.is_sensitive_config(rel):
+                    self._intervene_config_change(path, rel, event_type)
+                    # Continue analysis even for config files (they may also have secrets)
+            except (ValueError, Exception):
+                pass
+
+            # === Diff Analysis (what changed, not just that it changed) ===
+            try:
+                rel = path.relative_to(self.config.repo_root).as_posix()
+                diff_findings = self._analyze_diff(path, rel)
+                for finding in diff_findings:
+                    severity = finding.get("severity", "medium")
+                    penalty = 15 if severity == "high" else 8
+                    score = self.safety_score.report_incident(penalty, f"Diff: {finding['detail']}", str(path))
+                    self.logger.warning(
+                        f"DIFF [{finding['type'].upper()}] {rel} | "
+                        f"{finding['detail']} | Safety: {score}/100"
+                    )
+            except Exception:
+                pass
+
+            # === Record file change in active session ===
+            try:
+                rel = path.relative_to(self.config.repo_root).as_posix()
+                self.session_mgr.record_file_change(rel)
+                self.session_mgr.update_safety_score(self.safety_score.score)
+            except Exception:
+                pass
+
             # === Full Analysis ===
             from .crawler import FileInfo
             fi = FileInfo(
@@ -613,6 +652,8 @@ class GuardianHandler(FileSystemEventHandler or object):
     def _intervene_critical_file(self, path: Path, reason: str, event_type: str):
         self.last_intervention_ts = time.time()
         score = self.safety_score.report_incident(20, reason, str(path))
+        self.session_mgr.record_incident({"type": "critical_file", "reason": reason, "file": str(path), "score": score})
+        self.session_mgr.update_safety_score(score)
         self.logger.warning(
             f"INTERVENTION [{event_type.upper()}] Critical file: {path.name} | "
             f"Reason: {reason} | Safety: {score}/100 ({self.safety_score.get_status()}) | "
@@ -628,10 +669,127 @@ class GuardianHandler(FileSystemEventHandler or object):
             except Exception as e:
                 self.logger.error(f"Failed to quarantine {path}: {e}")
 
+    # ------------------------------------------------------------------
+    # Diff analysis for understanding what changed
+    # ------------------------------------------------------------------
+    SECURITY_KEYWORDS = {
+        "authenticate", "authorize", "permission", "role", "admin",
+        "password", "hash", "encrypt", "decrypt", "sanitize", "validate",
+        "escape", "csrf", "token", "jwt", "session", "login", "logout",
+        "ssl", "tls", "certificate", "cors", "helmet",
+    }
+    RISKY_REMOVAL_PATTERNS = [
+        r'^\s*-\s*.*(?:except|catch|try|finally)\s*[\(:].*',
+        r'^\s*-\s*.*(?:validate|sanitize|escape|check|verify|assert)\s*\(',
+        r'^\s*-\s*.*(?:authenticate|authorize|requireAuth|isAdmin)\s*\(',
+        r'^\s*-\s*.*(?:password|secret|token|api_key|apiKey)\s*[:=].*',
+        r'^\s*-.*\bpassword\b.*',
+        r'^\s*-.*\bsecret\b.*',
+    ]
+
+    def _analyze_diff(self, path: Path, rel_path: str) -> list[dict[str, Any]]:
+        """Run git diff on the file and analyze changes for risky patterns."""
+        findings: list[dict[str, Any]] = []
+
+        try:
+            result = subprocess.run(
+                ["git", "diff", "HEAD", "--", rel_path],
+                capture_output=True, text=True, timeout=10,
+                cwd=self.config.repo_root,
+            )
+            diff = result.stdout
+            if not diff:
+                return findings
+        except Exception:
+            return findings
+
+        # Count added/removed lines
+        added = 0
+        removed = 0
+        for line in diff.splitlines():
+            if line.startswith("+") and not line.startswith("+++"):
+                added += 1
+            elif line.startswith("-") and not line.startswith("---"):
+                removed += 1
+
+        # Check for risky removals
+        for pattern in self.RISKY_REMOVAL_PATTERNS:
+            import re
+            matches = re.findall(pattern, diff, re.IGNORECASE | re.MULTILINE)
+            if matches:
+                findings.append({
+                    "type": "risky_removal",
+                    "severity": "high",
+                    "detail": f"Removed lines matching '{pattern}' ({len(matches)} occurrence(s))",
+                })
+
+        # Check for size bloat
+        if added > 100 and removed < 10:
+            findings.append({
+                "type": "bloat",
+                "severity": "medium",
+                "detail": f"Large net addition: +{added}/-{removed} lines. Verify no unnecessary code was added.",
+            })
+
+        # Check for net removal of error handling
+        removed_catch = len(re.findall(r'^\s*-\s*.*(?:except|catch)\s*[\(:].*', diff, re.MULTILINE))
+        added_catch = len(re.findall(r'^\s*\+\s*.*(?:except|catch)\s*[\(:].*', diff, re.MULTILINE))
+        if removed_catch > added_catch:
+            findings.append({
+                "type": "error_handling_removed",
+                "severity": "high",
+                "detail": f"More error handlers removed ({removed_catch}) than added ({added_catch})",
+            })
+
+        return findings
+
+    def _intervene_config_change(self, path: Path, rel_path: str, event_type: str):
+        """Log and optionally backup sensitive config file changes."""
+        self.last_intervention_ts = time.time()
+        score = self.safety_score.report_incident(15, f"Sensitive config modified: {rel_path}", str(path))
+        try:
+            self.session_mgr.record_incident({"type": "config_change", "reason": f"Sensitive config modified: {rel_path}", "file": str(path), "score": score})
+            self.session_mgr.update_safety_score(score)
+        except Exception:
+            pass
+        self.logger.warning(
+            f"CONFIG CHANGE [{event_type.upper()}] Sensitive config: {rel_path} | "
+            f"Safety: {score}/100 | Activity: {self.safety_score.get_activity_level()}"
+        )
+
+        # Backup the previous version from git if available
+        if event_type == "modified":
+            try:
+                import subprocess
+                result = subprocess.run(
+                    ["git", "show", f"HEAD:{rel_path}"],
+                    capture_output=True, text=True, timeout=5,
+                    cwd=self.config.repo_root,
+                )
+                if result.returncode == 0 and result.stdout:
+                    from datetime import datetime
+                    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    backup_name = f"{ts}_{path.name}.bak"
+                    backup_path = self._config_backup_dir / backup_name
+                    backup_path.write_text(result.stdout, encoding="utf-8")
+                    self.logger.info(f"Backed up previous version of {rel_path} to {backup_path}")
+                    self.logger.info(f"  Restore with: cp {backup_path} {path}")
+            except Exception:
+                pass
+
+        if self.intervention and self.strict_mode:
+            self.logger.warning(f"STRICT MODE: {rel_path} was modified. Review recommended before committing.")
+            self.logger.critical(f"  ACTION: Verify this change was intentional. Config files affect production behavior.")
+
     def _intervene_blocking_debris(self, path: Path, blocking_items, event_type: str):
         self.last_intervention_ts = time.time()
         for item in blocking_items:
             score = self.safety_score.report_incident(12, item.reason, str(path))
+            try:
+                self.session_mgr.record_incident({"type": "blocking_debris", "reason": item.reason, "file": str(path), "score": score})
+                self.session_mgr.update_safety_score(score)
+            except Exception:
+                pass
             self.logger.warning(
                 f"INTERVENTION [{event_type.upper()}] {item.category} in {path.name} | "
                 f"{item.reason} | Safety: {score}/100 | Activity: {self.safety_score.get_activity_level()}"

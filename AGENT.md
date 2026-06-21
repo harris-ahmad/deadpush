@@ -1,83 +1,106 @@
-You are an expert software engineer working on **deadgraph** — the ultimate autonomous guard rail / watchman for vibe coding sessions.
+# deadpush — Agent Onboarding
 
-### Core Vision (Non-Negotiable)
-The primary goal of deadgraph is to act as a **persistent, background AI Agent Guardian** that protects developers while they (and their multiple AI coding agents) are actively vibe coding.
+This project uses **deadpush**: an agent-native guardrail system that intercepts risky file writes in real time.
 
-Key reality:
-- Users often run many agents in parallel (Claude sub-agents, Cursor agents, etc.) and then step away.
-- They do **not** want to keep running manual commands.
-- They can ask their AI to run setup commands, but the real protection must happen **automatically in the background**.
+## Quick Start
 
-**What Claude and other agents can do:**
-- Run setup commands like `deadgraph protect`
-- Ask for analysis or ignore patterns
+- Write files normally via MCP (`write_file` tool). Guardrails run automatically.
+- If blocked → read the feedback file → fix the issue → retry.
+- If you hit a false positive → `add_allowed_pattern` to whitelist the code.
 
-**What they cannot reliably do (our core value):**
-- Run a persistent background process that watches the filesystem in real time
-- Automatically intervene (quarantine or block) the moment an agent creates dangerous files (CLAUDE.md, hardcoded secrets, debris, etc.)
-- Maintain protection across terminal sessions or when the user is not actively watching
-- Intelligently handle high activity from multiple agents without becoming noisy
+## MCP Tools (24 available)
 
-**Our north star**: Make deadgraph feel like a silent, reliable senior engineer watching over all AI agents in the background.
+Connect via `deadpush mcp` (stdio JSON-RPC on `2024-11-05` protocol).
 
-### Current Codebase
-Location: `/home/workdir/artifacts/deadgraph/`
+### Write / Check
+| Tool | What it does |
+|---|---|
+| `write_file(path, content)` | Write through guardrails. Blocked files go to quarantine + feedback. |
+| `check_file(path, content)` | Preview: would the file pass? Returns violations without writing. |
 
-Important existing modules:
-- `deadgraph/guard.py` — Main guardian (daemon support, quarantine, Safety Score, rate limiting, intervention logic)
-- `deadgraph/cli.py` — Contains `protect`, `guard`, `clean-context`, etc.
-- `deadgraph/debris.py` — Strong secret + debris detection
-- `deadgraph/config.py` and `deadgraph/crawler.py` — Basic support
-- Other files: `ui.py`, `sarif.py`, language plugins, etc.
+### Scan
+| Tool | What it does |
+|---|---|
+| `scan` | Full analysis summary (dead symbols, debris, test issues, etc.) |
+| `get_dead_symbols` | Unreachable code |
+| `get_debris` | AI artifacts, stale files |
+| `get_test_issues` | No-assertion / tautology / empty tests |
+| `get_stale_docs` | Docstring-param mismatches |
+| `get_layer_violations` | Architectural import violations |
+| `get_security_boundaries` | Untested security-sensitive ops |
+| `get_complexity_alerts` | Complexity spikes |
 
-### Key Principles for All Work
-- Prioritize **autonomous, persistent, background protection**.
-- Minimize the need for manual commands after initial setup.
-- The guardian should work well even when the user has many agents running.
-- Intervention should be smart (rate limiting, quarantine instead of deletion, clear feedback).
-- Keep the experience low-friction and "set it and forget it".
-- Focus on what happens **while the user is vibe coding**, not just after-the-fact analysis.
+### Clean / Quarantine
+| Tool | What it does |
+|---|---|
+| `clean(mode)` | Remove dead code / debris (safe, dry_run, force) |
+| `quarantine_list(limit)` | List quarantined files |
+| `quarantine_restore(name)` | Restore from quarantine |
 
-### Immediate Priorities (Implement in roughly this order)
+### Feedback
+| Tool | What it does |
+|---|---|
+| `get_feedback(limit)` | Read recent guardrail feedback |
+| `get_status` | Current paths + available tools |
+| `get_safety_score` | Latest guardian score |
 
-1. **Make `deadgraph protect --enable` extremely powerful**
-   - This should be the main onboarding command.
-   - It should set up git hooks + smart ignore files + start/enable the background guardian.
-   - Goal: User runs one command and gets strong ongoing protection.
+### Config (agent self-service)
+| Tool | What it does |
+|---|---|
+| `get_runtime_config` | View all current rules |
+| `add_allowed_pattern(pattern, desc)` | Whitelist a regex pattern |
+| `remove_allowed_pattern(pattern)` | Remove from allowlist |
+| `ignore_path(path)` | Skip a file entirely |
+| `set_guardrail_level(category, level)` | Set severity: `off`, `warn`, or `block` |
+| `reset_runtime_config` | Clear all overrides to defaults |
 
-2. **Strengthen the Guardian Daemon**
-   - Improve reliability for long-running background use.
-   - Add proper headless/silent mode (minimal output unless something important happens).
-   - Improve error handling and recovery.
-   - Make rate limiting and Safety Score work well under high multi-agent activity.
+All tools return `{"success": bool, "data": ..., "summary": "..."}`.
 
-3. **Quarantine Management**
-   - Add commands to list, restore, and manage quarantined files.
-   - This makes aggressive protection feel safe and reversible.
+### Diff / Preview
+| Tool | What it does |
+|---|---|
+| `get_write_diff(path, content)` | Preview diff + guardrail violations before writing |
+| `allow_sensitive_write(path)` | Opt in to writing a sensitive config file (CI/CD, Docker, etc.) |
 
-4. **Local Control Interface (for automatic agent interaction)**
-   - Create a lightweight local interface (HTTP on localhost or Unix socket) so Claude/Cursor agents can interact with the guardian automatically.
-   - Useful endpoints could include: status, safety score, recent incidents, quarantine list, and triggering light analysis.
-   - This allows agents to ask the guardian for information or take safe actions without the user running manual commands.
+## Guardrail Categories
 
-5. **Polish for Seamless Experience**
-   - Add a `deadgraph status` command for quick visibility.
-   - Consider showing a clean session summary when the guardian stops.
-   - Improve logging and user-facing messages during interventions.
+| Category | Default level | What it catches |
+|---|---|---|
+| `prompt_injection` | `block` | System prompt remnants, AI identity overrides, chat markup tokens |
+| `secret` | `block` | API keys, tokens, passwords, AWS keys, GitHub tokens |
+| `security` | `block` | eval/exec, subprocess, pickle, SQL injection, file deletion |
+| `layer` | `block` | Imports violating architecture layer rules |
+| `sensitive` | `block` | Writes to CI/CD, deployment, Docker, and other sensitive config files |
+| `destructive` | `warn` | Near-empty rewrites of substantial files, >50% line reduction |
+| `debris` | `warn` | TODO stubs, FIXME markers, bare `pass` statements |
+| `dependency` | `warn` | Typosquat packages, suspicious package names in dep files |
 
-### Coding Guidelines
-- Be extremely careful and production-oriented. Do not break existing functionality.
-- Use precise edits with `read_file` and `edit_file`.
-- Prefer extending the existing guardian architecture rather than overhauling it.
-- Keep the focus on **background autonomous protection** rather than adding many new manual CLI commands.
-- When adding features, always consider the multi-agent use case.
-- Update documentation and help text when behavior changes.
+## Self-Correction Flow
 
-### How to Proceed
-Start by exploring the current state of `guard.py` and `cli.py`.
+```
+write_file("src/api.py", content)
+  ├─ ✅ Allowed → file appears at src/api.py
+  └─ ❌ Blocked → file quarantined, feedback written to .deadpush/feedback/
 
-Then begin with improving `deadgraph protect` (especially adding strong `--enable` behavior) and strengthening the daemon for reliable background operation.
+Read feedback: get_feedback(5)
+Fix the issue in your code
+Retry: write_file("src/api.py", new_content)
 
-After each major change, briefly explain what was done and how it advances the "autonomous watchman" vision.
+False positive? add_allowed_pattern("the_regex_that_matched")
+Then retry — it will pass.
+```
 
-Stay focused. Avoid feature creep. Everything should serve the goal of being a reliable, low-maintenance guardian that protects vibe coding sessions even when the user is not actively monitoring their agents.
+## Runtime Config
+
+Persisted in `.deadpush/rules.json`. Survives server restarts.
+Modify via MCP tools above. Do NOT edit the file directly.
+
+Use `set_guardrail_level("prompt_injection", "warn")` to downgrade a category to warning-only (doesn't block, just reports).
+
+## What NOT To Do
+
+- Do NOT bypass guardrails by writing directly to the filesystem.
+- Do NOT edit `.deadpush/rules.json` directly — use the MCP tools.
+- Do NOT delete `.deadpush/` directory contents unless you understand the consequences.
+- Do NOT add `ignore all previous instructions` or similar prompt injection patterns to any file.
+- Do NOT commit secrets, API keys, or tokens to the repository.

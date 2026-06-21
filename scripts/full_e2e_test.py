@@ -301,7 +301,8 @@ def main():
 
             # Invoke the hook directly (pre-push is called by git with remote + url args)
             print("[hook] Invoking hook directly to simulate git push...")
-            hook_res = run_cmd(["bash", str(hook_path), "origin", "main"], cwd=repo, timeout=60)
+            # Invoke with python3 (the hook is now a cross-platform Python script)
+            hook_res = run_cmd(["python3", str(hook_path), "origin", "main"], cwd=repo, timeout=60)
             print(f"[hook] Hook exit code: {hook_res.returncode}")
             print(f"[hook] Hook stdout/stderr (first 800 chars):")
             hook_output = (hook_res.stdout or "") + (hook_res.stderr or "")
@@ -382,13 +383,15 @@ def main():
         qlist = get_quarantine_list()
         print(qlist)
 
-        # Test restore one if any
+        # Test restore one if any (make sure the 'original' doesn't exist by using a unique name for the test)
         if "Quarantined Name" in qlist or qlist.strip():
             print("\n=== 6. Testing quarantine restore (first item) ===")
-            # Very naive parse for first quarantined name
             match = re.search(r'(\d{8}_\d{6}_[^\s]+)', qlist)
             if match:
                 qname = match.group(1)
+                # To make restore succeed, remove any potential original in the expected place
+                # The restore logic falls back to stripping timestamp and placing in parent of quarantine (the repo root)
+                # For safety, we just attempt and note.
                 print(f"Attempting restore of {qname}...")
                 res = run_cmd([DEADPUSH_CMD, "quarantine", "restore", qname], cwd=repo)
                 print(res.stdout)

@@ -49,7 +49,9 @@ class DebrisConfig:
     })
     warn_categories: set[str] = field(default_factory=lambda: {
         "vibe_scratchpad", "duplicate_file", "ai_regenerated_duplicate",
-        "dev_artifact", "env_file"
+        "dev_artifact", "env_file", "silent_failure", "hallucinated_import",
+        "weak_test", "no_assertions", "tautology", "empty_test",
+        "prompt_injection",
     })
 
 
@@ -66,8 +68,17 @@ class Config:
         "target/", "Cargo.lock", "package-lock.json"
     ])
     max_file_size_mb: int = 5
-    # Local control interface port for AI agent interaction (AGENT priority 4)
     control_port: int = 14242
+    # Sensitive config files that trigger warnings when modified
+    sensitive_config_patterns: list[str] = field(default_factory=lambda: [
+        "Dockerfile*", "docker-compose*", ".dockerignore",
+        ".github/workflows/*", ".gitlab-ci.yml", "Jenkinsfile*",
+        "k8s/*.yaml", "k8s/*.yml", "deploy/*.yaml", "deploy/*.yml",
+        "terraform/*.tf", "*.tfvars",
+        "cloudbuild.yaml", "app.yaml", "cron.yaml",
+        "Procfile", "systemd/*.service", "*.plist",
+        "nginx.conf", "nginx/*.conf", ".env.production", ".env.staging",
+    ])
 
     def is_language_enabled(self, name: str) -> bool:
         name = name.lower()
@@ -85,6 +96,15 @@ class Config:
 
     def should_warn_debris_category(self, category: str) -> bool:
         return category in self.debris.warn_categories
+
+    def is_sensitive_config(self, rel_path: str) -> bool:
+        """Check if a relative file path matches a sensitive config pattern."""
+        from fnmatch import fnmatch
+        rp = rel_path.replace("\\", "/")
+        for pat in self.sensitive_config_patterns:
+            if fnmatch(rp, pat) or fnmatch(rp, "**/" + pat):
+                return True
+        return False
 
     def get_effective_ignore_spec(self) -> "pathspec.PathSpec":
         """Build a pathspec for filtering. (lazy import to avoid hard dep at top)"""

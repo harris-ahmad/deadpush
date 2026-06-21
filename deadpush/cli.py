@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import re
 import shutil
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -146,7 +147,7 @@ def _resolve_callee_to_symbol(
     return None
 
 
-def _run_full_analysis(config, explicit_entries=None, max_depth=-1, use_rich=True):
+def _run_full_analysis(config, explicit_entries=None, max_depth=-1, use_rich=True, check_imports=True):
     """Internal function that performs the full analysis."""
     from .entrypoints import resolve_entry_points
     from .languages import get_enabled_plugins
@@ -162,6 +163,9 @@ def _run_full_analysis(config, explicit_entries=None, max_depth=-1, use_rich=Tru
 
     graph = CallGraph()
     per_file_graphs: dict[str, dict[str, Any]] = {}
+
+    # Collect imports for hallucination detection
+    all_imports: list[tuple[str, str]] = []
 
     for f in files:
         if not f.is_text:
@@ -190,6 +194,9 @@ def _run_full_analysis(config, explicit_entries=None, max_depth=-1, use_rich=Tru
                         for n in imp.names:
                             if n != "*":
                                 file_imports[n] = imp.module
+                        # Collect for import validation (external, non-relative)
+                        if imp.level == 0:
+                            all_imports.append((imp.module, f.path.suffix))
             except Exception:
                 pass
 
@@ -264,6 +271,70 @@ def _run_full_analysis(config, explicit_entries=None, max_depth=-1, use_rich=Tru
     detector = DebrisDetector(config)
     debris = detector.scan(files)
 
+    # Test quality analysis
+    try:
+        from .tests import TestAnalyzer
+        test_analyzer = TestAnalyzer()
+        test_issues = test_analyzer.analyze_batch(files)
+    except Exception:
+        test_issues = []
+
+    # Security boundary scan
+    try:
+        from .security import SecurityScanner
+        ss = SecurityScanner(config.repo_root)
+        sec_report = ss.scan_and_report(files)
+    except Exception:
+        sec_report = None
+
+    # Stale comment detection
+    try:
+        from .comments import StaleCommentDetector
+        cd = StaleCommentDetector()
+        stale_docs = cd.analyze_batch(files)
+    except Exception:
+        stale_docs = []
+
+    # Architecture layer enforcement
+    try:
+        from .layers import LayerEnforcer
+        enforcer = LayerEnforcer()
+        layer_violations = enforcer.analyze_batch(files)
+    except Exception:
+        layer_violations = []
+
+    # Complexity gate: check for significant increases from baseline
+    try:
+        from .complexity import ComplexityTracker
+        tracker = ComplexityTracker()
+        complexity_alerts = []
+        for f in files:
+            if f.is_text:
+                alert = tracker.check_complexity(str(f.rel_path), f.path)
+                if alert:
+                    complexity_alerts.append(alert)
+    except Exception:
+        complexity_alerts = []
+
+    # Import hallucination validation (opt-in network check)
+    if check_imports:
+        try:
+            from .imports import ImportValidator
+            validator = ImportValidator()
+            hallucinated = validator.validate_batch(all_imports)
+            for h in hallucinated:
+                from .graph import DebrisFile
+                debris.append(DebrisFile(
+                    path="(external import)",
+                    category=h["category"],
+                    confidence=h["confidence"],
+                    reasons=[h["reason"]],
+                    block_push=False,
+                    suggestion=h.get("suggestion", ""),
+                ))
+        except Exception:
+            pass
+
     return {
         "graph": graph,
         "debris": debris,
@@ -271,6 +342,11 @@ def _run_full_analysis(config, explicit_entries=None, max_depth=-1, use_rich=Tru
         "reachability": reachability,
         "files": files,
         "roots": roots,
+        "complexity_alerts": complexity_alerts,
+        "test_issues": test_issues,
+        "stale_docs": stale_docs,
+        "layer_violations": layer_violations,
+        "security_report": sec_report,
     }
 
 
@@ -423,14 +499,26 @@ def cmd_protect(enable, daemon):
 
     print_header("deadpush Protect", "One-command setup for AI Agent Guardian (persistent background protection)")
 
-    # 1. Install git hook (pre-push safety net)
-    print("\n[1/3] Installing git pre-push hook...")
+    # 1. Install git hooks (pre-push + pre-commit)
+    print("\n[1/3] Installing git hooks (pre-push + pre-commit)...")
     try:
         from .hooks import install_hook
         install_hook(config.repo_root)
     except Exception as e:
         print_warning(f"Git hook installation issue: {e}")
         print_warning("  (Tip: ensure this is a git repo with .git/hooks/)")
+    try:
+        from .hooks import install_precommit_hook
+        install_precommit_hook(config.repo_root)
+        print("  Also installed pre-commit guardrail hook.")
+    except Exception as e:
+        print_warning(f"Pre-commit hook installation issue: {e}")
+    try:
+        from .hooks import setup_mcp_discovery
+        setup_mcp_discovery(config.repo_root)
+        print("  Agent auto-discovery configured (.cursor/mcp.json, .vscode/mcp.json).")
+    except Exception as e:
+        print_warning(f"MCP discovery setup issue: {e}")
 
     # 2. Generate + merge smart ignore patterns into the real ignore files
     #    (this is the key hands-off part - users no longer have to manually curate)
@@ -453,13 +541,22 @@ def cmd_protect(enable, daemon):
     except Exception as e:
         print_warning(f"  Ignore file update skipped (non-fatal): {e}")
 
-    # 3. Optionally start the persistent guardian in background
-    print("\n[3/3] Guardian setup...")
+    # 3. Optionally start the persistent guardian in background + set up agent-native MCP control
+    print("\n[3/3] Guardian + Agent Control setup...")
     if start_background:
         print("Starting AI Agent Guardian in persistent background (daemon) mode...")
-        print("  (Survives terminal close/logout. Use `deadpush status` to inspect. `pkill -f guardian` or delete pidfile to stop.)")
-        # Generate OS auto-start helpers (launchd plist on macOS, systemd user service on Linux) + instructions.
-        # This is part of making it truly set-it-and-forget-it across reboots (AGENT priority 2 support).
+        print("  (Survives terminal close/logout. Use `deadpush status` to inspect.)")
+
+        # Ensure directories for the Intercept/MCP write guardrails (for agents using deadpush mcp)
+        try:
+            from .intercept import STAGING_DIR, FEEDBACK_DIR, GUARDRAIL_DIR, QUARANTINE_DIR
+            for d in [GUARDRAIL_DIR, STAGING_DIR, FEEDBACK_DIR, QUARANTINE_DIR]:
+                (config.repo_root / d).mkdir(parents=True, exist_ok=True)
+            print("  Created agent write staging/feedback directories under .deadpush/")
+        except Exception:
+            pass
+
+        # Auto-start helpers for reboot survival (AGENT priority 2)
         try:
             from .guard import run_guardian, setup_autostart
             autostart_info = setup_autostart(config.repo_root)
@@ -469,23 +566,38 @@ def cmd_protect(enable, daemon):
         except Exception as e:
             print_warning(f"Autostart helper generation skipped (non-fatal): {e}")
 
-        print("  Local Control Interface for AI agents will be available at http://127.0.0.1:14242/ (or the port in ~/.deadpush/guardian.control.port)")
-        print("  Agents can GET /status , /quarantine-list , /safety-score etc. or POST /trigger-light-analysis .")
-
         print_success("✅ Protection setup + daemon launch complete!")
-        # Note: the following call will fork+exit the parent process for true backgrounding.
-        # Child logs to file; parent returns control to user immediately.
+
+        # Prominent MCP / Local Control instructions for AI agents (the key new feature in AGENT.md)
+        print("\n=== For your AI coding agents (Claude, Cursor, Windsurf, etc.) ===")
+        print("Configure your agent to launch this as its MCP / tool server:")
+        print("    deadpush mcp")
+        print("")
+        print("This gives agents native, guardrailed tools over stdio (MCP protocol):")
+        print("  - write_file   : write only if it passes all guardrails (layers, secrets, injection, etc.)")
+        print("  - check_file   : preview whether a write would be blocked")
+        print("  - get_feedback : see why previous writes were blocked")
+        print("  - get_status   : current guardrail configuration")
+        print("")
+        print("Agents can now safely write code without you in the loop, while the background")
+        print("guardian (started above) continues its FS watching + Safety Score.")
+
+        # Launch the main background guardian
         try:
             from .guard import run_guardian
             run_guardian(intervention=True, daemon=True, strict=False)
         except SystemExit:
-            pass  # expected from daemon parent fork branch
+            pass
         except Exception as e:
             print_warning(f"Daemon launch had issue (try `deadpush guard --daemon`): {e}")
     else:
-        print_success("Protection setup complete (hooks installed, smart ignores updated).")
+        print_success("Protection setup complete (hooks + ignores).")
         print("Guardian NOT started in background.")
-        print("  Start it with: deadpush guard --daemon   OR   deadpush protect --daemon")
+        print("  Start with: deadpush protect --daemon  (or --enable)")
+        print("")
+        print("For AI agents, also tell them to use:")
+        print("    deadpush mcp")
+        print("as their tool server (gives them guardrailed writes).")
 
 
 
@@ -616,13 +728,191 @@ def cmd_verify(fmt, min_confidence, include_tests):
     print("but cross-verification gives you manual audit power.")
 
 
+# =============================================================================
+# Vibe Session Management
+# =============================================================================
+
+@main.group("session")
+def cmd_session():
+    """Manage vibe coding sessions.
+
+    Sessions help you track what happened during a period of AI-assisted coding.
+    Start a session before you begin vibe coding, then end it when you're done.
+    The guardian can tag all interventions with the active session.
+    """
+    pass
+
+
+@cmd_session.command("start")
+@click.option("--label", "-l", default="", help="A label for this session (e.g. 'adding stripe payments')")
+def cmd_session_start(label):
+    """Start a new vibe coding session."""
+    from .session import SessionManager
+    mgr = SessionManager()
+    existing = mgr.get_active_session()
+    if existing:
+        print_warning(f"Session '{existing.label}' is already active (started {existing.start_time}).")
+        if not click.confirm("End it and start a new one?"):
+            return
+        mgr.end_session()
+
+    session = mgr.start_session(label=label)
+    print_success(f"Session started: {session.label}")
+    print(f"  ID: {session.id}")
+    print(f"  Started: {session.start_time}")
+    print()
+    print("Run `deadpush session end` to finish this session and get a rollup summary.")
+    print("The guardian will tag all interventions during this session.")
+
+
+@cmd_session.command("end")
+def cmd_session_end():
+    """End the current vibe session and show a rollup summary."""
+    from .session import SessionManager
+    mgr = SessionManager()
+    active = mgr.get_active_session()
+    if not active:
+        print_warning("No active session to end.")
+        return
+
+    session = mgr.end_session()
+    if session:
+        print_success("Session ended.")
+        print()
+        summary = mgr.get_session_summary(session)
+        click.echo(summary)
+    else:
+        print_error("Could not end session.")
+
+
+@cmd_session.command("status")
+def cmd_session_status():
+    """Show the active session info."""
+    from .session import SessionManager
+    mgr = SessionManager()
+    active = mgr.get_active_session()
+    if not active:
+        print_warning("No active session. Start one with `deadpush session start`.")
+        return
+
+    print_header("Active Vibe Session", active.label)
+    print(f"  Started: {active.start_time}")
+    print(f"  Files changed: {len(active.files_changed)}")
+    print(f"  Incidents: {len(active.incidents)}")
+    print(f"  Safety: {active.safety_score_start} → {active.safety_score_end or active.safety_score_start}")
+
+    if active.files_changed:
+        print(f"\n  Files touched ({len(active.files_changed)}):")
+        for f in active.files_changed[-10:]:
+            print(f"    - {f}")
+        if len(active.files_changed) > 10:
+            print(f"    ... and {len(active.files_changed) - 10} more")
+
+    if active.incidents:
+        print(f"\n  Recent incidents ({len(active.incidents)} total):")
+        for inc in active.incidents[-5:]:
+            print(f"    - {inc.get('reason', '?')}")
+
+
+@cmd_session.command("log")
+@click.option("--limit", type=int, default=10, help="Number of sessions to show")
+def cmd_session_log(limit):
+    """Show session history."""
+    from .session import SessionManager
+    mgr = SessionManager()
+    history = mgr.get_session_history(limit=limit)
+
+    if not history:
+        print_warning("No completed sessions yet.")
+        return
+
+    print_header("Vibe Session History", f"Last {len(history)} sessions")
+    for session in history:
+        summary = mgr.get_session_summary(session)
+        # Only show first line
+        first_line = summary.split("\n")[0]
+        score_info = ""
+        if session.safety_score_end is not None:
+            diff = session.safety_score_end - session.safety_score_start
+            score_info = f" | Safety: {session.safety_score_start}→{session.safety_score_end} ({'+' if diff >= 0 else ''}{diff})"
+        print(f"  {session.id} - {first_line}{score_info}")
+        print(f"           {len(session.files_changed)} files, {len(session.incidents)} incidents")
+        print()
+
+
+@main.command("churn")
+@click.option("--days", type=int, default=30, help="Analysis window in days (default: 30)")
+@click.option("--threshold", type=float, default=0.5, help="Churn score threshold to flag (0-1, default: 0.5)")
+@click.option("--format", "fmt", type=click.Choice(["rich", "json"]), default="rich")
+def cmd_churn(days, threshold, fmt):
+    """Analyze git churn to detect thrashed files.
+
+    High churn files are being rewritten frequently — a common signal of
+    AI agents repeatedly modifying the same code, or architectural instability.
+    """
+    config = load_config()
+    from .churn import ChurnAnalyzer
+    analyzer = ChurnAnalyzer(config.repo_root, window_days=days)
+    report = analyzer.analyze()
+
+    if not report.total_files_analyzed:
+        print_warning("No git history found in this repository (or window is too small).")
+        return
+
+    if fmt == "json":
+        data = {
+            "window_days": days,
+            "total_commits": report.total_commits_in_window,
+            "total_files_analyzed": report.total_files_analyzed,
+            "high_churn_files": [
+                {
+                    "path": f.path,
+                    "commit_count": f.commit_count,
+                    "author_count": f.author_count,
+                    "churn_score": f.churn_score,
+                    "reason": f.flag_reason,
+                }
+                for f in report.high_churn_files
+                if f.churn_score >= threshold
+            ],
+        }
+        click.echo(json.dumps(data, indent=2))
+        return
+
+    print_header("deadpush Churn Analysis", f"Last {days} days — {report.total_commits_in_window} commits across {report.total_files_analyzed} files")
+
+    flagged = [f for f in report.high_churn_files if f.churn_score >= threshold]
+    if not flagged:
+        print_success(f"No files exceed churn threshold ({threshold}). Repo looks stable.")
+        return
+
+    print_warning(f"{len(flagged)} file(s) with elevated churn (threshold >= {threshold}):")
+    print()
+    for f in flagged[:25]:
+        flag = "🔥" if f.churn_score > 0.7 else "⚠"
+        click.echo(f"  {flag}  {f.path}")
+        click.echo(f"       {f.commit_count} changes, {f.author_count} author(s), score: {f.churn_score:.2f}")
+        click.echo(f"       {f.flag_reason}")
+        print()
+    if len(flagged) > 25:
+        click.echo(f"  ... and {len(flagged) - 25} more. Use --format json for full data.")
+
+    print()
+    click.echo("Interpretation:")
+    click.echo("  - High churn = files being rewritten frequently. In vibe coding, this means")
+    click.echo("    AI agents are thrashing on these files instead of editing in place.")
+    click.echo("  - Investigate whether these files need architectural refactoring to become stable.")
+    click.echo("  - Run `deadpush scan` to check for dead code and debris in high-churn files.")
+
+
 @main.command("scan")
 @click.option("--entry", "-e", multiple=True, help="Explicit entry points")
 @click.option("--depth", type=int, default=-1)
 @click.option("--format", "fmt", type=click.Choice(["rich", "markdown", "json", "sarif", "summary"]), default="rich")
 @click.option("--output", "-o", type=click.Path(), help="Write report to file")
 @click.option("--no-rich", is_flag=True, help="Force plain text output")
-def cmd_scan(entry, depth, fmt, output, no_rich):
+@click.option("--check-imports/--no-check-imports", default=True, help="Validate external imports against package registries (default: on)")
+def cmd_scan(entry, depth, fmt, output, no_rich, check_imports):
     """Full scan with rich output, SARIF, markdown, json etc."""
     config = load_config()
     if entry:
@@ -633,7 +923,7 @@ def cmd_scan(entry, depth, fmt, output, no_rich):
     if use_rich and fmt != "summary":
         print_header("deadpush Scan", "Analyzing repository for dead code and debris...")
 
-    result = _run_full_analysis(config, list(entry) if entry else None, depth, use_rich=use_rich)
+    result = _run_full_analysis(config, list(entry) if entry else None, depth, use_rich=use_rich, check_imports=check_imports)
 
     debris = result["debris"]
     dead = result["dead_symbols"]
@@ -675,11 +965,80 @@ def cmd_scan(entry, depth, fmt, output, no_rich):
             RICH_CONSOLE.print(create_debris_table(debris))
         if dead:
             RICH_CONSOLE.print(create_dead_symbols_tree(dead))
+
+        # Security boundaries
+        sec_report = result.get("security_report")
+        if sec_report and sec_report.untested:
+            print_warning(f"Security Boundaries: {len(sec_report.untested)} untested security-sensitive operation(s)")
+            for sb in sec_report.untested[:6]:
+                print(f"  🔐 {sb.file}:{sb.line}  {sb.description} ({sb.category})")
+
+        # Architecture layer violations
+        layer_violations = result.get("layer_violations", [])
+        if layer_violations:
+            print_warning(f"Layer Violations: {len(layer_violations)} import(s) cross architectural boundaries")
+            for lv in layer_violations[:6]:
+                print(f"  🏛 {lv.file}:{lv.line}  {lv.description[:100]}")
+
+        # Stale documentation issues
+        stale_docs = result.get("stale_docs", [])
+        if stale_docs:
+            by_type: dict[str, list] = {}
+            for sd in stale_docs:
+                by_type.setdefault(sd.issue_type, []).append(sd)
+            parts = []
+            for t, items in sorted(by_type.items()):
+                parts.append(f"{len(items)} {t.replace('_', ' ')}")
+            print_warning(f"Stale Documentation: {', '.join(parts)}")
+            for sd in stale_docs[:6]:
+                print(f"  📝 {sd.file}:{sd.line}  {sd.description[:90]}")
+
+        # Test quality issues
+        test_issues = result.get("test_issues", [])
+        if test_issues:
+            by_type: dict[str, list] = {}
+            for ti in test_issues:
+                by_type.setdefault(ti.issue_type, []).append(ti)
+            parts = []
+            for t, items in sorted(by_type.items()):
+                parts.append(f"{len(items)} {t.replace('_', ' ')}")
+            print_warning(f"Test Quality: {', '.join(parts)}")
+            for ti in test_issues[:8]:
+                print(f"  ⚠ {ti.file}:{ti.line}  {ti.description[:90]}")
+            if len(test_issues) > 8:
+                print(f"  ... and {len(test_issues) - 8} more. Run with --format json for full data.")
+
+        # Complexity alerts
+        complexity_alerts = result.get("complexity_alerts", [])
+        if complexity_alerts:
+            exceeded = [a for a in complexity_alerts if a.get("exceeded")]
+            high_initial = [a for a in complexity_alerts if not a.get("exceeded") and a.get("note")]
+            if exceeded:
+                print_warning(f"Complexity Gate: {len(exceeded)} file(s) exceeded the complexity threshold:")
+                for a in exceeded[:10]:
+                    print(f"  ⚠ {a['file']}: {a['baseline']} → {a['current']} (+{a['pct_increase']}%)")
+                if len(exceeded) > 10:
+                    print(f"  ... and {len(exceeded) - 10} more")
+            if high_initial:
+                print(f"  ℹ {len(high_initial)} file(s) with high initial complexity (first scan)")
+
         print_success("Scan complete. Run `deadpush clean --safe` to safely archive issues.")
     else:
+        complexity_alerts = result.get("complexity_alerts", [])
+        exceeded = len([a for a in complexity_alerts if a.get("exceeded")])
+        test_issues = len(result.get("test_issues", []))
+        stale_docs = len(result.get("stale_docs", []))
+        layer_violations = len(result.get("layer_violations", []))
+        sec_report = result.get("security_report")
+        sec_untested = len(sec_report.untested) if sec_report else 0
         click.echo(
             f"Scanned {len(result.get('files', []))} files. "
-            f"Found {len(dead)} dead symbols and {len(debris)} debris."
+            f"Found {len(dead)} dead symbols, {len(debris)} debris, "
+            f"{exceeded} complexity alerts, "
+            f"{test_issues} test issues, "
+            f"{stale_docs} stale docs, "
+            f"{layer_violations} layer violations, "
+            f"{sec_untested} untested security boundaries."
         )
 
 
@@ -855,6 +1214,128 @@ def cmd_quarantine_clear(older_than, force):
             return
     n = qm.clear(older_than_days=older_than)
     print_success(f"Cleared {n} quarantined item(s).")
+
+
+@main.group("hooks")
+def cmd_hooks():
+    """Manage deadpush git hooks."""
+    pass
+
+
+@cmd_hooks.command("install-precommit")
+def cmd_hooks_install_precommit():
+    """Install the pre-commit guardrail hook.
+
+    Blocks commits with prompt injection, hardcoded secrets,
+    security violations, and architecture layer violations.
+    """
+    config = load_config()
+    try:
+        from .hooks import install_precommit_hook
+        install_precommit_hook(config.repo_root)
+        print_success("Pre-commit guardrail hook installed.")
+    except Exception as e:
+        print_error(f"Failed to install pre-commit hook: {e}")
+
+
+@cmd_hooks.command("run-precommit")
+def cmd_hooks_run_precommit():
+    """Run guardrails on staged files (called by the pre-commit hook).
+
+    Exits with code 1 if violations are found, blocking the commit.
+    """
+    config = load_config()
+    from .hooks import run_precommit_guardrails
+    passed, violations = run_precommit_guardrails(config.repo_root)
+    sys.exit(0 if passed else 1)
+
+
+@main.command("deps")
+@click.option("--registry/--no-registry", default=True, help="Look up registry metadata for new packages (default: on)")
+@click.option("--format", "fmt", type=click.Choice(["rich", "text", "json"]), default="rich")
+def cmd_deps(registry, fmt):
+    """Review dependencies — show new packages added since last commit."""
+    config = load_config()
+    from .deps import DepsReviewer
+    reviewer = DepsReviewer(config.repo_root)
+
+    diff = reviewer.diff_with_head()
+
+    if not diff.added and not diff.changed and not diff.removed:
+        click.echo("No dependency changes since HEAD.")
+        return
+
+    if fmt == "json":
+        import json as _json
+        data = {
+            "added": [{"name": d.name, "version": d.version, "source": d.source_file} for d in diff.added],
+            "removed": [{"name": d.name, "version": d.version, "source": d.source_file} for d in diff.removed],
+            "changed": [{"name": o.name, "old_version": o.version, "new_version": n.version, "source": o.source_file} for o, n in diff.changed],
+        }
+        click.echo(_json.dumps(data, indent=2))
+        return
+
+    if diff.removed:
+        print_warning(f"Removed ({len(diff.removed)}):")
+        for d in diff.removed:
+            print_warning(f"  ✂ {d.name} {d.version} ({d.source_file})")
+
+    if diff.changed:
+        print_info(f"Changed ({len(diff.changed)}):")
+        for o, n in diff.changed:
+            print_info(f"  ↕ {o.name} {o.version} → {n.version}")
+
+    if diff.added:
+        print_warning(f"New Dependencies ({len(diff.added)}):")
+        reviews = reviewer.review_added(diff.added) if registry else []
+        review_map = {r["name"]: r for r in reviews}
+        for d in diff.added:
+            r = review_map.get(d.name)
+            if r and r.get("registry_info"):
+                info = r["registry_info"]
+                first_release = info.get("first_release", "?")
+                summary = info.get("summary", "")
+                print_warning(f"  ⚡ {d.name} {d.version} ({d.source_file})")
+                if summary:
+                    click.echo(f"      {summary[:80]}")
+                if first_release:
+                    click.echo(f"      First release: {first_release}")
+            else:
+                print_warning(f"  ⚡ {d.name} {d.version} ({d.source_file}) (no registry metadata)")
+
+
+@main.command("intercept")
+@click.option("--daemon", is_flag=True, help="Run as persistent background daemon")
+@click.option("--http/--no-http", default=False, help="Also start HTTP API on port 9876 (default: off)")
+def cmd_intercept(daemon, http):
+    """Start the pre-write file interception daemon.
+
+    Watches .deadpush/staging/ for files written by coding agents.
+    Runs guardrails on each file — approves safe writes or blocks dangerous ones
+    with structured feedback the agent can read and self-correct from.
+    """
+    from .intercept import run_intercept
+    run_intercept(daemon=daemon, http=http)
+
+
+@main.command("mcp")
+def cmd_mcp():
+    """Start the Model Context Protocol server for AI agent integration.
+
+    Runs over stdio. Any MCP-compatible agent (Cursor, Claude Desktop, etc.)
+    can connect and call all deadpush capabilities as native tools:
+      - write_file / check_file: guardrailed file writing
+      - scan: full analysis (dead code, debris, tests, docs, layers, security)
+      - get_dead_symbols / get_debris / get_test_issues / get_stale_docs
+      - get_layer_violations / get_security_boundaries / get_complexity_alerts
+      - clean: remove dead code and debris
+      - quarantine_list / quarantine_restore: manage quarantined files
+      - get_feedback / get_status / get_safety_score
+
+    All tools return structured JSON. Configure your agent to run: deadpush mcp
+    """
+    from .mcp_server import run_mcp
+    run_mcp()
 
 
 if __name__ == "__main__":

@@ -48,3 +48,10 @@ Homepage = "https://github.com/harris-ahmad/deadpush"
 
 [tool.hatch.build.targets.wheel]
 packages = ["deadpush"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--tb=short -q"
+filterwarnings = [
+    "ignore::pytest.PytestCollectionWarning",
+]

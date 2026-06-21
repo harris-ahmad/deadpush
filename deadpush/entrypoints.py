@@ -1,18 +1,110 @@
 """
-Entry point resolution using plugins + config + heuristics.
+Entry point resolution using plugins + config + heuristics + framework-aware route detection.
 
 This integrates language plugins deeply: each plugin can contribute
 detect_entry_points + we also honor explicit config + common conventions.
+Framework route registrations (Flask, FastAPI, Express, etc.) are detected
+via pattern scanning across source files.
 """
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any
 
 from .config import Config
 from .graph import CallGraph, Symbol
 
+
+# ---------------------------------------------------------------------------
+# Framework-aware route pattern detection
+# ---------------------------------------------------------------------------
+
+_FRAMEWORK_PATTERNS: list[tuple[str, str, list[str]]] = [
+    ("flask", r'@\w+\.route\([\'"]([^\'"]+)[\'"]', [".py"]),
+    ("flask_blueprint", r'@\w+\.(?:route|get|post|put|delete|patch)\([\'"]([^\'"]+)[\'"]', [".py"]),
+    ("fastapi", r'@\w+\.(?:get|post|put|delete|patch|options|head|trace)\([\'"]([^\'"]+)[\'"]', [".py"]),
+    ("django_url", r"path\([\'\"]([^\'\"]+)[\'\"],\s*(\w+)", [".py"]),
+    ("django_re_path", r"re_path\([\'\"]([^\'\"]+)[\'\"],\s*(\w+)", [".py"]),
+    ("django_include", r"include\([\'\"]([^\'\"]+)[\'\"]", [".py"]),
+    ("express_get", r"\.(?:get|post|put|delete|patch|use)\s*\(\s*[\'\"]([^\'\"]*)[\'\"],\s*(\w+)", [".js", ".jsx", ".ts", ".tsx"]),
+    ("express_route", r"(?:app|router)\.route\([\'\"]([^\'\"]+)[\'\"][^)]*\)\s*\.(?:get|post|put|delete|patch)\s*\((\w+)", [".js", ".jsx", ".ts", ".tsx"]),
+    ("nextjs_page", r"export\s+default\s+(?:function|const|async\s+function)\s+(\w+)", [".js", ".jsx", ".ts", ".tsx"]),
+    ("go_http", r"http\.HandleFunc\([\'\"]([^\'\"]+)[\'\"],\s*(\w+)", [".go"]),
+    ("go_gin", r"(?:router|r|gin\.Default\(\))\.(?:GET|POST|PUT|DELETE|PATCH|Handle)\([\'\"]([^\'\"]+)[\'\"],\s*(\w+)", [".go"]),
+    ("rust_axum", r"\.route\([\'\"]([^\'\"]+)[\'\"],\s*(\w+)", [".rs"]),
+    ("rust_actix", r"\.route\([\'\"]([^\'\"]+)[\'\"],\s*\w+\.\w+\(\)\.to\((\w+)", [".rs"]),
+]
+
+
+def _scan_file_for_routes(path: Path) -> list[str]:
+    """Scan a single source file for framework route handler references."""
+    try:
+        text = path.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return []
+
+    handlers: list[str] = []
+    for name, pattern, extensions in _FRAMEWORK_PATTERNS:
+        if path.suffix.lower() in extensions:
+            for match in re.finditer(pattern, text, re.MULTILINE):
+                if match.lastindex and match.lastindex >= 2:
+                    handlers.append(match.group(match.lastindex))
+                elif match.lastindex == 1:
+                    # Some patterns only capture the route, not the handler
+                    pass
+    return handlers
+
+
+def detect_framework_entry_points(
+    files: list[Any],
+    graph: CallGraph,
+) -> list[str]:
+    """Detect entry points from framework route registrations.
+
+    Scans source files for common framework routing patterns (Flask, FastAPI,
+    Express, Django, Gin, Axum, etc.) and returns symbol IDs for handler
+    functions referenced in route definitions.
+
+    This catches cases like Flask @app.route, FastAPI @app.get, Express app.get(),
+    Django urlpatterns, etc. — all of which are "entry points" from the
+    framework's perspective even if they don't have a traditional main().
+    """
+    roots: set[str] = set()
+
+    # Collect handler names from all source files
+    handler_names: set[str] = set()
+    for f in files:
+        if not getattr(f, "is_text", True):
+            continue
+        handlers = _scan_file_for_routes(f.path)
+        handler_names.update(handlers)
+
+    if not handler_names:
+        return []
+
+    # Match handler names to symbol IDs in the graph
+    name_index: dict[str, list[str]] = {}
+    for sid, sym in graph.symbols.items():
+        name_index.setdefault(sym.name, []).append(sid)
+
+    for name in handler_names:
+        ids = name_index.get(name, [])
+        for sid in ids:
+            roots.add(sid)
+
+        # Try stem of file (e.g., for Django views)
+        for sid, sym in graph.symbols.items():
+            if name in sid and sym.name == name:
+                roots.add(sid)
+
+    return list(roots)
+
+
+# ---------------------------------------------------------------------------
+# Main resolver
+# ---------------------------------------------------------------------------
 
 def resolve_entry_points(
     graph: CallGraph,
@@ -69,7 +161,14 @@ def resolve_entry_points(
         if sym.is_entry_point:
             roots.add(sym_id)
 
-    # 4. Common fallbacks if nothing found
+    # 4. Framework-aware route detection
+    try:
+        framework_roots = detect_framework_entry_points(files, graph)
+        roots.update(framework_roots)
+    except Exception:
+        pass
+
+    # 5. Common fallbacks if nothing found
     if not roots:
         for sym_id, sym in graph.symbols.items():
             if sym.name in ("main", "Main", "__main__", "index", "app", "server"):
