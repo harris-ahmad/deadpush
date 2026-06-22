@@ -64,6 +64,14 @@ class DeadCodeConfig:
 
 
 @dataclass
+class TestConfig:
+    """Configuration for post-write test verification."""
+    command: str = "pytest"
+    timeout_seconds: int = 30
+    enabled: bool = True
+
+
+@dataclass
 class BlockConfig:
     """Files/patterns that should always be blocked from writes."""
     blocked_files: list[str] = field(default_factory=lambda: [
@@ -100,6 +108,7 @@ class Config:
     entrypoints: EntrypointsConfig = field(default_factory=EntrypointsConfig)
     debris: DebrisConfig = field(default_factory=DebrisConfig)
     dead_code: DeadCodeConfig = field(default_factory=DeadCodeConfig)
+    test: TestConfig = field(default_factory=TestConfig)
     block: BlockConfig = field(default_factory=BlockConfig)
     ignore_patterns: list[str] = field(default_factory=lambda: [
         "__pycache__/", ".git/", "node_modules/", ".deadpush-archive/",
@@ -255,6 +264,13 @@ def load_config(explicit_root: Path | None = None) -> Config:
             cfg.dead_code.show_uncertain = bool(dc_data["show_uncertain"])
         if "custom_registrations" in dc_data:
             cfg.dead_code.custom_registrations = list(dc_data["custom_registrations"])
+        test_data = dpt_data.get("tests", {})
+        if "command" in test_data:
+            cfg.test.command = str(test_data["command"])
+        if "timeout_seconds" in test_data:
+            cfg.test.timeout_seconds = int(test_data["timeout_seconds"])
+        if "enabled" in test_data:
+            cfg.test.enabled = bool(test_data["enabled"])
 
     # Env var overrides for quick use
     if os.environ.get("DEADPUSH_LANGUAGES"):

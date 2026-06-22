@@ -14,10 +14,11 @@ import difflib
 import json
 import re
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
-from .intercept import InterceptDaemon, GuardrailResult
+from .intercept import InterceptDaemon, GuardrailResult, Violation
 from .intercept import _run_guardrails, _check_sensitive_write, _check_destructive_changes, STAGING_DIR, FEEDBACK_DIR
 from .config import load_config
 from .rules import RuntimeConfig
@@ -326,6 +327,29 @@ class McpServer:
                     "required": ["path"],
                 },
             },
+            # --- Test Verification ---
+            {
+                "name": "verify_write",
+                "description": "Write a file through guardrails AND run the relevant test file. If tests pass, the file is written. If tests fail, the file is NOT written and the agent receives structured test output. Use this when you want to verify your change doesn't break existing tests.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "Relative path (e.g. src/api.py)"},
+                        "content": {"type": "string", "description": "File content"},
+                    },
+                    "required": ["path", "content"],
+                },
+            },
+            {
+                "name": "get_test_results",
+                "description": "Get recent test verification results. Returns structured test output from the last N verify_write calls.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "limit": {"type": "number", "description": "Max entries (default 10)"},
+                    },
+                },
+            },
         ]
 
     # -----------------------------------------------------------------------
@@ -349,6 +373,102 @@ class McpServer:
             "status": "blocked",
             "violations": [{"category": v.category, "description": v.description, "line": v.line, "severity": v.severity} for v in result.violations],
         }, f"File blocked: {len(result.violations)} violation(s).")
+
+    def _tool_verify_write(self, args: dict[str, Any]) -> dict[str, Any]:
+        path = args.get("path", "")
+        content = args.get("content", "")
+        if not path:
+            return _err("path is required")
+        if not content:
+            return _err("content is required")
+
+        # Step 1: Run guardrails
+        result = self.daemon.write_file(path, content)
+        if not result.allowed:
+            return _ok({
+                "path": path,
+                "status": "blocked_by_guardrails",
+                "violations": [{"category": v.category, "description": v.description, "line": v.line, "severity": v.severity} for v in result.violations],
+                "test_result": None,
+            }, f"File blocked by guardrails: {len(result.violations)} violation(s).")
+
+        # Step 2: Run test verification
+        from .verifier import TestVerifier
+        verifier = TestVerifier(self.config)
+        verification = verifier.verify_write(path, content)
+
+        if not verification["verifiable"]:
+            # No test file found — file is already written, just report it
+            return _ok({
+                "path": path,
+                "status": "allowed",
+                "violations": [],
+                "test_result": None,
+                "note": verification["reason"],
+            }, "File written (no test file found for verification).")
+
+        test_result = verification["test_result"]
+        if test_result["passed"]:
+            return _ok({
+                "path": path,
+                "status": "allowed",
+                "violations": [],
+                "test_result": test_result,
+            }, f"Tests passed ({test_result['test_file']}). File written.")
+
+        # Tests failed — quarantine the written file + restore from git
+        self._quarantine_and_restore(path, result)
+        return _ok({
+            "path": path,
+            "status": "test_failure",
+            "violations": [{"category": "test_failure", "description": f"Tests failed: {test_result['test_file']}", "line": 0, "severity": "high"}],
+            "test_result": test_result,
+        }, f"Tests FAILED ({test_result['test_file']}). File quarantined and restored.")
+
+    def _quarantine_and_restore(self, rel_path: str, guardrail_result: GuardrailResult):
+        """Quarantine a written file and restore it from git."""
+        from .intercept import QUARANTINE_DIR, FEEDBACK_DIR, _write_feedback
+        dest = self.repo_root / rel_path
+        if not dest.exists():
+            return
+
+        # Move to quarantine
+        quarantine_dir = self.repo_root / QUARANTINE_DIR
+        quarantine_dir.mkdir(parents=True, exist_ok=True)
+        safe_name = rel_path.replace("/", "__").replace("\\", "__")
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        quarantined = quarantine_dir / f"{timestamp}__{safe_name}"
+        try:
+            import shutil
+            shutil.move(str(dest), str(quarantined))
+        except Exception:
+            return
+
+        # Write feedback
+        feedback_result = GuardrailResult()
+        for v in guardrail_result.violations:
+            feedback_result.reject(v)
+        feedback_result.reject(Violation("test_failure", f"Tests failed, file quarantined to {quarantined.name}", 0, "high"))
+        _write_feedback(self.repo_root / FEEDBACK_DIR, rel_path, feedback_result)
+
+        # Restore from git
+        try:
+            import subprocess
+            git_show = subprocess.run(
+                ["git", "show", f"HEAD:{rel_path}"],
+                capture_output=True, text=True,
+                cwd=str(self.repo_root),
+            )
+            if git_show.returncode == 0 and git_show.stdout:
+                dest.write_text(git_show.stdout, encoding="utf-8")
+        except Exception:
+            pass
+
+    def _tool_get_test_results(self, args: dict[str, Any]) -> dict[str, Any]:
+        limit = int(args.get("limit", 10))
+        from .verifier import load_recent_results
+        entries = load_recent_results(self.config, limit=limit)
+        return _ok({"count": len(entries), "results": entries}, f"{len(entries)} test result(s).")
 
     def _tool_check_file(self, args: dict[str, Any]) -> dict[str, Any]:
         path = args.get("path", "")
@@ -735,6 +855,8 @@ class McpServer:
                 "reset_runtime_config": self._tool_reset_runtime_config,
                 "get_write_diff": self._tool_get_write_diff,
                 "allow_sensitive_write": self._tool_allow_sensitive_write,
+                "verify_write": self._tool_verify_write,
+                "get_test_results": self._tool_get_test_results,
             }
             handler = tool_map.get(name)
             if not handler:
