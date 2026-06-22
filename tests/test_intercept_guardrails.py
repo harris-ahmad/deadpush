@@ -140,13 +140,13 @@ class TestSecurityChecker:
 
 
 class TestDebrisChecker:
-    def test_detects_todo(self):
+    def test_todo_allowed(self):
         vs = _check_debris_patterns("TODO: fix this", ".py")
-        assert any("TODO" in v.description for v in vs)
+        assert len(vs) == 0  # TODO is intentional developer annotation
 
-    def test_detects_fixme(self):
+    def test_fixme_allowed(self):
         vs = _check_debris_patterns("# FIXME: hack", ".py")
-        assert any("FIXME" in v.description for v in vs)
+        assert len(vs) == 0  # FIXME is intentional developer annotation
 
     def test_detects_pass_stub(self):
         vs = _check_debris_patterns("def foo():\n    pass", ".py")

@@ -30,6 +30,92 @@ STAGING_DIR = ".deadpush/staging"
 FEEDBACK_DIR = ".deadpush/feedback"
 QUARANTINE_DIR = ".deadpush/quarantine"
 GUARDRAIL_DIR = ".deadpush"
+LEARNED_PATTERNS_FILE = ".deadpush/learned_patterns.json"
+
+# ---------------------------------------------------------------------------
+# Test/mock context detection
+# ---------------------------------------------------------------------------
+
+_TEST_FILE_INDICATORS = [
+    "test", "spec", "mock", "fixture", "stub", "fake", "conftest",
+    "factory", "helper", "assertion", "matcher",
+]
+
+_TEST_DIR_INDICATORS = [
+    "/test/", "/tests/", "/spec/", "/specs/", "/__tests__/",
+    "/mocks/", "/fixtures/", "/testing/",
+]
+
+_LEARNED_PATTERNS: dict[str, list[dict[str, Any]]] | None = None
+
+
+def _is_test_or_mock(rel_path: str) -> bool:
+    """Check if a file path indicates test/mock/debug context."""
+    lower = rel_path.lower()
+    for indicator in _TEST_DIR_INDICATORS:
+        if indicator in lower:
+            return True
+    stem = Path(lower).stem
+    for indicator in _TEST_FILE_INDICATORS:
+        if stem.startswith(indicator) or stem.endswith(indicator):
+            return True
+    return False
+
+
+def _load_learned_patterns(repo_root: Path) -> dict[str, list[dict[str, Any]]]:
+    """Load agent-taught false positive patterns."""
+    global _LEARNED_PATTERNS
+    if _LEARNED_PATTERNS is not None:
+        return _LEARNED_PATTERNS
+    path = repo_root / LEARNED_PATTERNS_FILE
+    if path.exists():
+        try:
+            _LEARNED_PATTERNS = json.loads(path.read_text(encoding="utf-8"))
+            return _LEARNED_PATTERNS
+        except Exception:
+            pass
+    _LEARNED_PATTERNS = {"patterns": [], "suppressed_categories": {}}
+    return _LEARNED_PATTERNS
+
+
+def _save_learned_patterns(repo_root: Path) -> None:
+    """Persist learned false positive patterns."""
+    global _LEARNED_PATTERNS
+    if _LEARNED_PATTERNS is None:
+        return
+    path = repo_root / LEARNED_PATTERNS_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(_LEARNED_PATTERNS, indent=2), encoding="utf-8")
+
+
+def _is_suppressed(category: str, description: str, repo_root: Path) -> bool:
+    """Check if a pattern has been learned as a false positive."""
+    learned = _load_learned_patterns(repo_root)
+    for entry in learned.get("patterns", []):
+        if entry.get("category") != category:
+            continue
+        if entry.get("pattern") and entry["pattern"] in description:
+            return True
+    return False
+
+
+def _learn_false_positive(category: str, pattern: str, reason: str, repo_root: Path) -> None:
+    """Record a false positive pattern learned from the agent."""
+    learned = _load_learned_patterns(repo_root)
+    # Deduplicate
+    for existing in learned["patterns"]:
+        if existing.get("category") == category and existing.get("pattern") == pattern:
+            existing["count"] = existing.get("count", 1) + 1
+            _save_learned_patterns(repo_root)
+            return
+    learned["patterns"].append({
+        "category": category,
+        "pattern": pattern,
+        "reason": reason,
+        "count": 1,
+    })
+    _save_learned_patterns(repo_root)
+
 
 # ---------------------------------------------------------------------------
 # Guardrail check results
@@ -38,19 +124,23 @@ GUARDRAIL_DIR = ".deadpush"
 class Violation:
     """A single guardrail violation found in a staged file."""
 
-    def __init__(self, category: str, description: str, line: int = 0, severity: str = "medium"):
+    def __init__(self, category: str, description: str, line: int = 0, severity: str = "medium", uncertainty: str = ""):
         self.category = category
         self.description = description
         self.line = line
         self.severity = severity
+        self.uncertainty = uncertainty
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        d: dict[str, Any] = {
             "category": self.category,
             "description": self.description,
             "line": self.line,
             "severity": self.severity,
         }
+        if self.uncertainty:
+            d["uncertainty"] = self.uncertainty
+        return d
 
 
 class GuardrailResult:
@@ -106,12 +196,13 @@ def _check_prompt_injection(source: str, runtime: RuntimeConfig | None = None) -
     return violations
 
 
-def _check_security(source: str, runtime: RuntimeConfig | None = None) -> list[Violation]:
+def _check_security(source: str, runtime: RuntimeConfig | None = None, rel_path: str | None = None) -> list[Violation]:
     """Check for security-sensitive operations."""
     violations: list[Violation] = []
     level = runtime.get_guardrail_level("security") if runtime else "block"
     if level == "off":
         return violations
+    is_test = _is_test_or_mock(rel_path) if rel_path else False
     patterns = [
         (r"\b(eval|exec)\s*\(", "Dynamic code execution"),
         (r"\b(subprocess\.(call|run|Popen|check_output|check_call)|os\.system|os\.popen)\s*\(", "Shell command execution"),
@@ -126,7 +217,10 @@ def _check_security(source: str, runtime: RuntimeConfig | None = None) -> list[V
             if m and runtime and runtime.is_allowed(m.group()):
                 continue
             if m:
-                violations.append(Violation("security", desc, i, "high" if "exec" in pattern or "pickle" in pattern else "medium"))
+                sev = "high" if "exec" in pattern or "pickle" in pattern else "medium"
+                if is_test:
+                    sev = "low"
+                violations.append(Violation("security", desc, i, sev))
     return violations
 
 
@@ -136,10 +230,7 @@ def _check_debris_patterns(source: str, suffix: str, runtime: RuntimeConfig | No
     level = runtime.get_guardrail_level("debris") if runtime else "warn"
     if level == "off":
         return violations
-    patterns = [
-        (r"TODO:\s*(fix|implement|add|remove|change|update)", "Stub TODO placeholder"),
-        (r"#\s*(FIXME|HACK|XXX|BUG)\s*:", "Marker comment"),
-    ]
+    patterns: list[tuple[str, str]] = []
     if suffix in (".py", ".js", ".ts", ".jsx", ".tsx"):
         patterns.append((r"pass\s*$", "Stub pass statement"), )
     lines = source.splitlines()
@@ -198,12 +289,13 @@ def _check_dependency_integrity(source: str, rel_path: str, repo_root: Path | st
     return violations
 
 
-def _check_hardcoded_secrets(source: str, runtime: RuntimeConfig | None = None) -> list[Violation]:
+def _check_hardcoded_secrets(source: str, runtime: RuntimeConfig | None = None, rel_path: str | None = None) -> list[Violation]:
     """Check for hardcoded secrets, API keys, tokens."""
     violations: list[Violation] = []
     level = runtime.get_guardrail_level("secret") if runtime else "block"
     if level == "off":
         return violations
+    is_test = _is_test_or_mock(rel_path) if rel_path else False
     patterns = [
         (r'(?:api[_-]?key|apikey|secret[_-]?key|secret[_-]?token)\s*[:=]\s*["\'].+["\']', "Hardcoded API key/secret", "high"),
         (r'(?:sk-[a-zA-Z0-9]{20,}|pk-[a-zA-Z0-9]{20,})', "Hardcoded API token (starts with sk-/pk-)", "critical"),
@@ -219,7 +311,8 @@ def _check_hardcoded_secrets(source: str, runtime: RuntimeConfig | None = None) 
             if m and runtime and runtime.is_allowed(m.group()):
                 continue
             if m:
-                violations.append(Violation("secret", f"{desc}: {line.strip()[:60]}", i, severity))
+                effective_sev = "warn" if (is_test and severity in ("high", "critical")) else severity
+                violations.append(Violation("secret", f"{desc}: {line.strip()[:60]}", i, effective_sev))
     return violations
 
 
@@ -445,14 +538,23 @@ def _run_guardrails(
 
     suffix = Path(rel).suffix.lower()
 
-    # Security checks — level-aware
+    # Suppress violations that match learned false positive patterns
+    learned = _load_learned_patterns(config.repo_root)
+    suppressed_desc: set[str] = set()
+    for entry in learned.get("patterns", []):
+        if entry.get("pattern"):
+            suppressed_desc.add(entry["pattern"])
+
+    # Security checks — level-aware (with path context for test/mock lowering)
     _apply_guardrail_level(result, _check_prompt_injection(source, runtime), runtime, "prompt_injection")
-    _apply_guardrail_level(result, _check_hardcoded_secrets(source, runtime), runtime, "secret")
-    _apply_guardrail_level(result, _check_security(source, runtime), runtime, "security")
+    _apply_guardrail_level(result, _check_hardcoded_secrets(source, runtime, rel_path=rel), runtime, "secret")
+    _apply_guardrail_level(result, _check_security(source, runtime, rel_path=rel), runtime, "security")
+
+    # Filter out learned false positive violations
+    result.violations = [v for v in result.violations if v.description not in suppressed_desc]
 
     # Config / destructive checks
-    for v in _check_sensitive_write(source, rel, config, runtime):
-        result.reject(v)
+    _apply_guardrail_level(result, _check_sensitive_write(source, rel, config, runtime), runtime, "sensitive")
     destructive_level = runtime.get_guardrail_level("destructive") if runtime else "warn"
     for v in _check_destructive_changes(source, rel, config.repo_root, runtime, _old_source=_old_source):
         if destructive_level == "block":

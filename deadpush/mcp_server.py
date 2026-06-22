@@ -327,6 +327,36 @@ class McpServer:
                     "required": ["path"],
                 },
             },
+            # --- Agent-as-Adjudicator ---
+            {
+                "name": "verify_finding",
+                "description": "Adjudicate a guardrail finding. Presents the finding with structured uncertainty for the agent to verify. Returns a scoring rubric. Call learn_false_positive if the agent determines the finding is a false positive.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "category": {"type": "string", "description": "Category: security, secret, prompt_injection, layer, debris, sensitive, destructive, dependency"},
+                        "description": {"type": "string", "description": "The full violation description text"},
+                        "file_path": {"type": "string", "description": "Relative path of the flagged file"},
+                        "line": {"type": "number", "description": "Line number of the violation"},
+                        "severity": {"type": "string", "description": "Severity: low, medium, high, critical"},
+                        "uncertainty": {"type": "string", "description": "Why this flag might be wrong (contextual notes)"},
+                    },
+                    "required": ["category", "description", "file_path"],
+                },
+            },
+            {
+                "name": "learn_false_positive",
+                "description": "Teach deadpush that a pattern is a false positive. After verifying a finding manually, call this to persist the pattern so it is auto-suppressed in future guardrail checks.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "category": {"type": "string", "description": "Guardrail category"},
+                        "pattern": {"type": "string", "description": "The violation description text (or pattern) to suppress"},
+                        "reason": {"type": "string", "description": "Why this is a false positive (for future reference)"},
+                    },
+                    "required": ["category", "pattern", "reason"],
+                },
+            },
             # --- Test Verification ---
             {
                 "name": "verify_write",
@@ -544,9 +574,9 @@ class McpServer:
         sec = result.get("security_report")
         if not sec:
             return _ok({"count": 0, "boundaries": []}, "No security data.")
-        untested = [{"file": s.file, "line": s.line, "category": s.category, "description": s.description, "severity": s.severity}
+        untested = [{"file": s.file, "line": s.line, "category": s.category, "description": s.description}
                     for s in sec.untested]
-        tested = [{"file": s.file, "line": s.line, "category": s.category, "description": s.description, "severity": s.severity}
+        tested = [{"file": s.file, "line": s.line, "category": s.category, "description": s.description}
                   for s in sec.tested]
         return _ok({"count_untested": len(untested), "count_tested": len(tested), "untested": untested, "tested": tested},
                    f"{len(untested)} untested security boundaries.")
@@ -804,6 +834,60 @@ class McpServer:
         self.runtime.add_allowed_pattern(re.escape(path) + "\\Z", f"Sensitive write bypass for {path}")
         return _ok({"path": path}, f"Sensitive write for '{path}' allowed. Added to allowlist.")
 
+    def _tool_verify_finding(self, args: dict[str, Any]) -> dict[str, Any]:
+        category = args.get("category", "")
+        description = args.get("description", "")
+        file_path = args.get("file_path", "")
+        line = args.get("line", 0)
+        severity = args.get("severity", "")
+        uncertainty = args.get("uncertainty", "")
+
+        if not category or not description or not file_path:
+            return _err("category, description, and file_path are required")
+
+        return _ok({
+            "finding": {
+                "category": category,
+                "description": description,
+                "file_path": file_path,
+                "line": line,
+                "severity": severity,
+                "uncertainty": uncertainty,
+            },
+            "adjudication_prompt": (
+                f"Review this {category} finding in {file_path}:{line}.\n"
+                f"  Description: {description}\n"
+                f"  Severity: {severity}\n"
+                f"  Uncertainty: {uncertainty or 'None provided'}\n\n"
+                "Is this a TRUE POSITIVE (actual issue) or FALSE POSITIVE (safe code)?\n"
+                "- If TRUE POSITIVE: fix the issue and retry.\n"
+                "- If FALSE POSITIVE: call learn_false_positive with category, the description pattern, and your reason."
+            ),
+            "scoring": {
+                "certainty_levels": {
+                    "certain": "No doubt — pattern is definitely a violation",
+                    "likely": "Probably a violation but edge case possible",
+                    "ambiguous": "Could go either way — context needed",
+                    "likely_fp": "Probably a false positive — low risk pattern",
+                    "certain_fp": "Definitely not a violation — safe code pattern",
+                }
+            }
+        }, f"Finding presented for adjudication ({category}: {description[:60]}).")
+
+    def _tool_learn_false_positive(self, args: dict[str, Any]) -> dict[str, Any]:
+        category = args.get("category", "")
+        pattern = args.get("pattern", "")
+        reason = args.get("reason", "")
+        if not category or not pattern or not reason:
+            return _err("category, pattern, and reason are required")
+        from .intercept import _learn_false_positive
+        _learn_false_positive(category, pattern, reason, self.repo_root)
+        return _ok({
+            "category": category,
+            "pattern": pattern,
+            "reason": reason,
+        }, f"Learned false positive pattern for '{category}': {pattern[:60]}")
+
     # -----------------------------------------------------------------------
     # MCP lifecycle
     # -----------------------------------------------------------------------
@@ -855,6 +939,8 @@ class McpServer:
                 "reset_runtime_config": self._tool_reset_runtime_config,
                 "get_write_diff": self._tool_get_write_diff,
                 "allow_sensitive_write": self._tool_allow_sensitive_write,
+                "verify_finding": self._tool_verify_finding,
+                "learn_false_positive": self._tool_learn_false_positive,
                 "verify_write": self._tool_verify_write,
                 "get_test_results": self._tool_get_test_results,
             }

@@ -68,11 +68,36 @@ class ImportAnalyzer:
         except SyntaxError:
             return
 
+        # Attach parent references for docstring detection
         for node in ast.walk(tree):
-            if isinstance(node, ast.Constant) and isinstance(node.value, str):
-                val = node.value.strip()
-                if val.isidentifier() and len(val) > 1:
-                    self._string_refs[val][rel].append(node.lineno)
+            for child in ast.iter_child_nodes(node):
+                child.parent = node  # type: ignore[attr-defined]
+
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
+                continue
+            val = node.value.strip()
+            if not val.isidentifier() or len(val) <= 1:
+                continue
+            # Exclude docstrings
+            if isinstance(node.parent, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                if isinstance(node.parent, ast.Module):
+                    if node.parent.body and node.parent.body[0] is node:
+                        continue
+                elif node.parent.body and node.parent.body[0] is node:
+                    continue
+            # Exclude logging/print calls (strings as arguments to call keywords)
+            if isinstance(node.parent, ast.Call):
+                if isinstance(node.parent.func, ast.Attribute):
+                    if node.parent.func.attr.lower() in ("info", "debug", "warning", "error", "critical", "log", "exception"):
+                        continue
+                if isinstance(node.parent.func, ast.Name) and node.parent.func.id.lower() == "print":
+                    continue
+            # Exclude strings in attribute access (obj.name) — those are attribute lookups, not string refs
+            if isinstance(node.parent, ast.Attribute):
+                if node.parent.attr == node.value:
+                    continue
+            self._string_refs[val][rel].append(node.lineno)
 
     def count_external_imports(self, name: str, exclude_path: str) -> int:
         """Count files (excluding the definition file) that import this name."""

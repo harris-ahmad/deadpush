@@ -128,6 +128,7 @@ def build_scorer(
     roots: set[str],
     all_file_paths: list[Path],
     custom_registrations: list[str] | None = None,
+    test_file_paths: list[Path] | None = None,
 ) -> MultiFactorDeadnessScorer:
     """Build a MultiFactorDeadnessScorer from analysis context."""
     registration = RegistrationDetector(all_file_paths, config.repo_root)
@@ -145,5 +146,6 @@ def build_scorer(
         imports=imports,
         roots=roots,
         all_file_paths=all_file_paths,
+        test_file_paths=test_file_paths,
     )
     return scorer

@@ -96,7 +96,7 @@ def detect_framework_entry_points(
 
         # Try stem of file (e.g., for Django views)
         for sid, sym in graph.symbols.items():
-            if name in sid and sym.name == name:
+            if sym.name == name:
                 roots.add(sid)
 
     return list(roots)

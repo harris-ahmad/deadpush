@@ -94,7 +94,8 @@ def _resolve_callee_to_symbol(
     1. Exact match on callee name within current file (local function/method)
     2. Method on same receiver if tracked (very basic)
     3. Imported name resolution (from file_imports)
-    4. Global / other file symbol name match (last resort)
+    4. Dotted name resolution (module.function)
+    5. Global / other file symbol name match (last resort)
     This is still heuristic (no full type tracking or points-to), but
     dramatically better than raw string edges for call-graph integrity.
     """
@@ -115,22 +116,46 @@ def _resolve_callee_to_symbol(
         for sid, sym in file_symbols.items():
             if sym.kind in ("method", "function") and sym.name == callee:
                 # Heuristic: if receiver is this/self or class name prefix
-                if recv in ("this", "self") or any(c in sid for c in [recv, "." + recv]):
+                parts = sid.split(".")
+                recv_class = parts[-2] if len(parts) >= 2 else ""
+                if recv in ("this", "self") or recv == recv_class:
                     return sid
         # Try receiver as module prefix from imports
         if recv in file_imports:
             mod = file_imports[recv]
-            candidate = f"{mod}::{callee}"  # rough
+            # Build candidate: mod::callee and check for exact match
             for sid in all_symbols:
-                if callee in sid and mod in sid:
+                if sid == f"{mod}::{callee}":
+                    return sid
+                # Also check sym.name match with mod prefix in sid
+                sym = all_symbols[sid]
+                if sym.name == callee and sid.startswith(f"{mod}."):
                     return sid
 
     # 3. Direct import resolution
     if callee in file_imports:
         mod = file_imports[callee]
         for sid, sym in all_symbols.items():
-            if sym.name == callee and mod in sid:
+            if sym.name == callee:
+                # Prefer exact module prefix
+                if sid.startswith(f"{mod}.") or sid.startswith(f"{mod}::"):
+                    return sid
+        # Broader: any symbol with this name
+        for sid, sym in all_symbols.items():
+            if sym.name == callee:
                 return sid
+
+    # 3b. Dotted name resolution (e.g., "module.function")
+    if "." in callee:
+        parts = callee.rsplit(".", 1)
+        mod_prefix = parts[0]
+        func_name = parts[1]
+        for sid, sym in all_symbols.items():
+            if sym.name == func_name and (sid.startswith(f"{mod_prefix}.") or f"::{func_name}" in sid):
+                return sid
+        # Also check if the dotted name is a full symbol id
+        if callee in all_symbols:
+            return callee
 
     # 4. Fallback: any symbol with matching name (across files) - low confidence
     # Prefer same basename file
@@ -138,7 +163,9 @@ def _resolve_callee_to_symbol(
     base = Path(current_file).stem
     for sid, sym in all_symbols.items():
         if sym.name == callee:
-            if base in sid:
+            if sid.startswith(f"{base}.") or sid.startswith(f"{base}::"):
+                candidates.insert(0, sid)
+            elif f"/{base}." in sid:
                 candidates.insert(0, sid)
             else:
                 candidates.append(sid)
@@ -292,6 +319,10 @@ def _run_full_analysis(config, explicit_entries=None, max_depth=-1, use_rich=Tru
 
     # Build multi-factor scorer
     file_paths = [f.path for f in files if f.is_text]
+    test_file_paths = [
+        f.path for f in files
+        if f.is_text and ("test" in str(f.rel_path).lower() or "spec" in str(f.rel_path).lower())
+    ]
     try:
         scorer = build_scorer(
             config=config,
@@ -299,17 +330,42 @@ def _run_full_analysis(config, explicit_entries=None, max_depth=-1, use_rich=Tru
             roots=set(roots),
             all_file_paths=file_paths,
             custom_registrations=config.dead_code.custom_registrations,
+            test_file_paths=test_file_paths,
         )
     except Exception:
         scorer = None
 
     dead_symbols = []
+    all_scored: dict[str, Any] = {}
     for sym_id in list(reachability.unreachable) + list(reachability.uncertain):
         sym = graph.get_symbol(sym_id)
         if sym:
             scored = score_symbol(sym, graph, reachability, config, scorer=scorer)
             if scored:
                 dead_symbols.append(scored)
+                all_scored[sym_id] = scored
+
+    # Phase 3: propagate deadness through call graph
+    if scorer is not None and all_scored:
+        try:
+            alive_scores = {sid: ds.alive_score for sid, ds in all_scored.items()}
+            scorer.compute_call_chain_scores(alive_scores)
+            for sid, ds in all_scored.items():
+                cc = scorer._call_chain_scores.get(sid, 0.0)
+                old_factors = dict(ds.factor_breakdown)
+                old_factors["call_chain"] = cc
+                weights = scorer.WEIGHTS
+                new_score = sum(weights[k] * old_factors.get(k, 0.0) for k in weights)
+                ds.alive_score = round(new_score, 3)
+                ds.factor_breakdown["call_chain"] = cc
+                # Update deadness tier
+                deadness_tier = scorer.classify(new_score)
+                ds.tier_new = deadness_tier
+                # Map deadness tier to legacy tier
+                tier_map = {"high": "definite", "medium": "probable", "low": "suspicious", "uncertain": "uncertain"}
+                ds.tier = tier_map.get(deadness_tier, "uncertain")
+        except Exception:
+            pass
 
     # Filter by confidence tier
     dead_symbols = _filter_by_confidence(dead_symbols, config, aggressive=aggressive,

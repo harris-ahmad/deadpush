@@ -15,6 +15,11 @@ import re
 from pathlib import Path
 from typing import Any
 
+_KNOWN_FRAMEWORK_OBJECTS: set[str] = {
+    "app", "application", "router", "bp", "blueprint", "api",
+    "route", "routes", "site", "server", "web",
+}
+
 _DECORATOR_PATTERNS: dict[str, float] = {
     "register": 0.9,
     "route": 0.8,
@@ -169,19 +174,36 @@ class RegistrationDetector:
                     self._registered.add(sym_id)
                     self._scores[sym_id] = max(self._scores.get(sym_id, 0), weight)
 
-    def _decorator_weight(self, dec: ast.expr) -> float:
+    @staticmethod
+    def _namespace_for_attr(dec: ast.expr) -> str | None:
+        """Extract the leftmost name from an attribute chain (e.g. app.get → 'app')."""
         if isinstance(dec, ast.Call) and isinstance(dec.func, ast.Attribute):
-            attr_name = dec.func.attr.lower()
-            return _DECORATOR_PATTERNS.get(attr_name, 0.0)
-        if isinstance(dec, ast.Call) and isinstance(dec.func, ast.Name):
-            name = dec.func.id.lower()
-            return _DECORATOR_PATTERNS.get(name, 0.0)
+            return RegistrationDetector._namespace_for_attr(dec.func)
         if isinstance(dec, ast.Attribute):
-            attr_name = dec.attr.lower()
-            return _DECORATOR_PATTERNS.get(attr_name, 0.0)
+            if isinstance(dec.value, ast.Name):
+                return dec.value.id.lower()
+            if isinstance(dec.value, ast.Attribute):
+                return RegistrationDetector._namespace_for_attr(dec.value)
+        return None
+
+    def _decorator_weight(self, dec: ast.expr) -> float:
+        if isinstance(dec, (ast.Call, ast.Attribute)):
+            if isinstance(dec, ast.Call):
+                func = dec.func
+            else:
+                func = dec
+            if isinstance(func, ast.Attribute):
+                attr_name = func.attr.lower()
+                weight = _DECORATOR_PATTERNS.get(attr_name, 0.0)
+                namespace = self._namespace_for_attr(dec)
+                if weight > 0 and namespace and namespace not in _KNOWN_FRAMEWORK_OBJECTS:
+                    weight *= 0.3
+                return weight
+            if isinstance(func, ast.Name):
+                return _DECORATOR_PATTERNS.get(func.id.lower(), 0.0)
+            return 0.0
         if isinstance(dec, ast.Name):
-            name = dec.id.lower()
-            return _DECORATOR_PATTERNS.get(name, 0.0)
+            return _DECORATOR_PATTERNS.get(dec.id.lower(), 0.0)
         return 0.0
 
     def _scan_dict_registrations(self, text: str, rel: str) -> None:
@@ -190,16 +212,34 @@ class RegistrationDetector:
         except SyntaxError:
             return
 
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Dict):
-                for val in node.values:
-                    self._check_registry_value(val, rel)
-            elif isinstance(node, ast.List):
-                for elt in node.elts:
+        def _var_matches(name: str) -> bool:
+            return any(p.search(name) for p in _REGISTRY_VARIABLE_PATTERNS)
+
+        def _scan_value(val: ast.expr) -> None:
+            if isinstance(val, ast.Dict):
+                for v in val.values:
+                    self._check_registry_value(v, rel)
+            elif isinstance(val, ast.List):
+                for elt in val.elts:
                     self._check_registry_value(elt, rel)
-            elif isinstance(node, ast.Call):
-                for kw in node.keywords:
+            elif isinstance(val, ast.Call):
+                for kw in val.keywords:
                     self._check_registry_value(kw.value, rel)
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    var_name = None
+                    if isinstance(target, ast.Name):
+                        var_name = target.id
+                    elif isinstance(target, ast.Subscript) and isinstance(target.value, ast.Name):
+                        var_name = target.value.id
+                    if var_name and _var_matches(var_name):
+                        _scan_value(node.value)
+                        break
+            elif isinstance(node, ast.AugAssign):
+                if isinstance(node.target, ast.Name) and _var_matches(node.target.id):
+                    _scan_value(node.value)
 
     def _check_registry_value(self, val: ast.expr, rel: str) -> None:
         if isinstance(val, ast.Name):

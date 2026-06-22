@@ -3,10 +3,17 @@
 Combines 6 independent signals into a single alive_score (0.0 = dead, 1.0 = alive).
 False positives are weighted as worse than false negatives — when evidence is
 ambiguous, the scorer abstains (tier = "uncertain").
+
+New in Phase 3:
+- Call-chain-aware deadness: propagates penalty through the call graph
+- Test-aware deadness: symbols unreferenced in tests get lower confidence
+- Composite signal: merges all 8 factors into one score
 """
 
 from __future__ import annotations
 
+import ast
+import re
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -26,6 +33,7 @@ class DeadnessResult:
     tier: Literal["high", "medium", "low", "uncertain"]
     factors: dict[str, float] = field(default_factory=dict)
     reasons: list[str] = field(default_factory=list)
+    uncertainty: str = ""
 
 
 ABSTAIN_NAMES: set[str] = {
@@ -66,15 +74,28 @@ def _should_abstain(sym: Symbol, reg: RegistrationDetector) -> bool:
 
 
 class MultiFactorDeadnessScorer:
-    """Score a single symbol using 6 independent factors."""
+    """Score a single symbol using 8 independent factors.
+
+    Factors (weight):
+      in_degree (0.30)   — how many callers in the call graph
+      registration (0.20) — framework registration patterns
+      string_ref (0.10)  — name appears as string literal elsewhere
+      import_count (0.10) — imported by other modules
+      entry_point (0.05) — reachable from entry points
+      git_freshness (0.05) — recently modified (git blame)
+      call_chain (0.10)  — callers are live (propagated from call graph)
+      test_coverage (0.10) — referenced in test files
+    """
 
     WEIGHTS = {
-        "in_degree": 0.35,
-        "registration": 0.25,
-        "string_ref": 0.15,
-        "import_count": 0.15,
+        "in_degree": 0.30,
+        "registration": 0.20,
+        "string_ref": 0.10,
+        "import_count": 0.10,
         "entry_point": 0.05,
         "git_freshness": 0.05,
+        "call_chain": 0.10,
+        "test_coverage": 0.10,
     }
 
     def __init__(
@@ -86,6 +107,7 @@ class MultiFactorDeadnessScorer:
         imports: ImportAnalyzer,
         roots: set[str],
         all_file_paths: list[Path],
+        test_file_paths: list[Path] | None = None,
     ):
         self.config = config
         self.repo_root = repo_root
@@ -96,6 +118,9 @@ class MultiFactorDeadnessScorer:
         self.all_file_paths = all_file_paths
         self._blame_cache: dict[str, dict[int, float]] = {}
         self._log_cache: dict[str, tuple[float, float]] = {}
+        # Phase 3: call-chain propagation + test coverage
+        self._call_chain_scores: dict[str, float] = {}
+        self._test_file_refs: set[str] = self._build_test_refs(test_file_paths or [])
 
     def score(self, sym: Symbol) -> DeadnessResult | None:
         """Score a single symbol. Returns None if abstention applies."""
@@ -143,12 +168,26 @@ class MultiFactorDeadnessScorer:
         elif f6 <= 0.2:
             reasons.append("Not modified recently or never")
 
+        f7 = self._factor_call_chain(sym)
+        factors["call_chain"] = f7
+        if f7 >= 0.8:
+            reasons.append("Called by live symbols in call graph")
+        elif f7 <= 0.2:
+            reasons.append("All callers appear to be dead code")
+
+        f8 = self._factor_test_coverage(sym)
+        factors["test_coverage"] = f8
+        if f8 >= 0.7:
+            reasons.append("Referenced in test files")
+        elif f8 <= 0.2:
+            reasons.append("Not referenced in any test file")
+
         alive_score = sum(
             self.WEIGHTS[k] * factors[k]
             for k in self.WEIGHTS
         )
 
-        tier = self._classify(alive_score)
+        tier = self.classify(alive_score)
 
         return DeadnessResult(
             alive_score=round(alive_score, 3),
@@ -156,6 +195,82 @@ class MultiFactorDeadnessScorer:
             factors=factors,
             reasons=reasons,
         )
+
+    def _build_test_refs(self, test_file_paths: list[Path]) -> set[str]:
+        """Pre-scan test files for symbol name references."""
+        refs: set[str] = set()
+        for fp in test_file_paths:
+            try:
+                text = fp.read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                continue
+            # Match import-like and string references
+            for m in re.finditer(r"import\s+(\w+)|from\s+(\w+)|['\"](\w+)['\"]", text):
+                for g in m.groups():
+                    if g and len(g) > 1 and g.isidentifier():
+                        refs.add(g)
+            # Match function calls and attribute access
+            tree = None
+            try:
+                tree = ast.parse(text)
+            except SyntaxError:
+                continue
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                    if len(node.func.id) > 1:
+                        refs.add(node.func.id)
+                elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+                    if len(node.func.attr) > 1:
+                        refs.add(node.func.attr)
+                elif isinstance(node, ast.Name):
+                    if isinstance(node.ctx, ast.Load) and len(node.id) > 1:
+                        refs.add(node.id)
+        return refs
+
+    def _factor_test_coverage(self, sym: Symbol) -> float:
+        """Score based on whether the symbol is referenced in test files."""
+        name = sym.name.lower()
+        if not self._test_file_refs:
+            return 0.5  # neutral when no test files exist
+        if name in self._test_file_refs or name in {r.lower() for r in self._test_file_refs}:
+            return 0.9
+        # Check registration detector string refs that came from test files
+        if self.registration.score(sym.id) > 0:
+            return 0.7
+        return 0.2
+
+    def compute_call_chain_scores(self, alive_scores: dict[str, float]) -> None:
+        """Pass 2: propagate deadness through the call graph.
+
+        For each symbol, compute what fraction of its callers are alive
+        (alive_score > 0.2).  If all callers are dead, the symbol's
+        call_chain factor drops accordingly.
+        """
+        for sym_id in alive_scores:
+            incoming = self.graph.incoming(sym_id)
+            if not incoming:
+                self._call_chain_scores[sym_id] = 0.0
+                continue
+            live_callers = 0
+            total_callers = 0
+            seen: set[str] = set()
+            for edge in incoming:
+                caller = edge.src
+                if caller in seen:
+                    continue
+                seen.add(caller)
+                total_callers += 1
+                caller_score = alive_scores.get(caller)
+                if caller_score is None:
+                    # Caller that wasn't scored (abstained) — treat as alive
+                    live_callers += 1
+                elif caller_score > 0.2:
+                    live_callers += 1
+            self._call_chain_scores[sym_id] = live_callers / total_callers if total_callers else 0.0
+
+    def _factor_call_chain(self, sym: Symbol) -> float:
+        """Score based on whether callers are live (post-propagation)."""
+        return self._call_chain_scores.get(sym.id, 0.0)
 
     def _factor_in_degree(self, sym: Symbol) -> float:
         """Score based on how many callers this symbol has in the call graph."""
@@ -249,7 +364,6 @@ class MultiFactorDeadnessScorer:
                     commit_time = int(line.split()[1])
                     age_days = (now - commit_time) / 86400
                     line_dates[current_line] = age_days
-                    current_line += 1
                 elif line.startswith("\t"):
                     current_line += 1
                 elif line.startswith("boundary"):
@@ -285,7 +399,7 @@ class MultiFactorDeadnessScorer:
         except ValueError:
             return abs_path
 
-    def _classify(self, score: float) -> Literal["high", "medium", "low", "uncertain"]:
+    def classify(self, score: float) -> Literal["high", "medium", "low", "uncertain"]:
         if score <= 0.2:
             return "high"
         if score <= 0.4:

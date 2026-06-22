@@ -133,9 +133,9 @@ def _check_typosquat(name: str, ecosystem: str) -> list[str]:
     for known_name in known:
         k_clean = known_name.lower().replace("-", "").replace("_", "").replace("/", "")
         dist = _levenshtein(n_clean, k_clean)
-        if 0 < dist <= 2:
+        if 0 < dist <= 1:
             suspects.append(known_name)
-        elif dist <= 3 and len(n_clean) <= 5:
+        elif dist <= 2 and len(n_clean) <= 4:
             suspects.append(known_name)
     return suspects
 
