@@ -28,7 +28,7 @@ from .rules import RuntimeConfig
 
 STAGING_DIR = ".deadpush/staging"
 FEEDBACK_DIR = ".deadpush/feedback"
-QUARANTINE_DIR = ".deadpush/quarantine"
+QUARANTINE_DIR = ".deadpush-quarantine"
 GUARDRAIL_DIR = ".deadpush"
 LEARNED_PATTERNS_FILE = ".deadpush/learned_patterns.json"
 
@@ -600,8 +600,20 @@ def _block(staged_path: Path, staging_dir: Path, repo_root: Path, feedback_dir: 
     rel = _get_file_rel(staged_path, staging_dir)
     safe_name = rel.replace("/", "__").replace("\\", "__")
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    quarantined = quarantine_dir / f"{timestamp}__{safe_name}"
+    quarantined = quarantine_dir / f"{timestamp}_{safe_name}"
     shutil.move(str(staged_path), str(quarantined))
+
+    # Write .reason file compatible with QuarantineManager
+    reason = result.violations[0].description if result.violations else "guardrail violation"
+    reason_path = quarantined.with_name(quarantined.name + ".reason")
+    try:
+        reason_path.write_text(
+            f"Quarantined at {datetime.now()}\n"
+            f"Reason: {reason}\n"
+            f"Original path: {repo_root / rel}\n"
+        )
+    except Exception:
+        pass
 
     _clean_empty_dirs(staging_dir)
     _write_feedback(feedback_dir, rel, result)

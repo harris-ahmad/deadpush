@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -40,6 +41,23 @@ def _send(proc, msg):
     proc.stdin.write(line)
     proc.stdin.flush()
     return json.loads(proc.stdout.readline())
+
+
+def _init_and_notify(proc):
+    """Initialize MCP session: send initialize + notifications/initialized."""
+    _send(proc, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+    proc.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n")
+    proc.stdin.flush()
+    return proc
+
+
+def _shutdown_and_wait(proc):
+    """Send shutdown and wait for process exit."""
+    try:
+        _send(proc, {"jsonrpc": "2.0", "id": 999, "method": "shutdown", "params": {}})
+        proc.wait(timeout=5)
+    except Exception:
+        proc.kill()
 
 
 class TestMcpProtocol:
@@ -385,3 +403,215 @@ class TestMcpConfigTools:
         finally:
             _send(proc, {"jsonrpc": "2.0", "id": 99, "method": "shutdown", "params": {}})
             proc.wait(timeout=5)
+
+
+# ======================================================================
+# Phase 4 — JSON-RPC protocol compliance
+# ======================================================================
+
+class TestMcpProtocolCompliance:
+    """JSON-RPC 2.0 protocol compliance for the MCP server."""
+
+    def test_shutdown_clean_exit(self, temp_repo):
+        """Shutdown returns result=None and process exits with code 0."""
+        proc = _spawn_mcp_server(temp_repo)
+        resp = _send(proc, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+        assert "result" in resp
+        resp2 = _send(proc, {"jsonrpc": "2.0", "id": 2, "method": "shutdown", "params": {}})
+        assert resp2["result"] is None
+        proc.wait(timeout=5)
+        assert proc.returncode == 0
+
+    def test_malformed_json_returns_parse_error(self, temp_repo):
+        """Invalid JSON on stdin returns JSON-RPC -32700 Parse error."""
+        proc = _spawn_mcp_server(temp_repo)
+        try:
+            _init_and_notify(proc)
+
+            # Send line that is not valid JSON
+            proc.stdin.write("not valid json\n")
+            proc.stdin.flush()
+            line = proc.stdout.readline()
+            resp = json.loads(line)
+            assert "error" in resp, f"Expected error response, got: {resp}"
+            assert resp["error"]["code"] == -32700
+            assert resp["id"] is None
+
+            # Server should still respond to subsequent valid requests
+            resp2 = _send(proc, {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
+            assert "result" in resp2
+        finally:
+            _shutdown_and_wait(proc)
+
+    def test_unknown_method_returns_is_error(self, temp_repo):
+        """Unknown JSON-RPC method returns an error result (not silent hang)."""
+        proc = _spawn_mcp_server(temp_repo)
+        try:
+            _init_and_notify(proc)
+            resp = _send(proc, {"jsonrpc": "2.0", "id": 2, "method": "unknown_method_xyz", "params": {}})
+            # Must get a response (not hang) — either isError or JSON-RPC error
+            assert "result" in resp or "error" in resp
+            if "result" in resp:
+                assert resp["result"].get("isError") is True
+        finally:
+            _shutdown_and_wait(proc)
+
+    def test_notification_cancelled_no_crash(self, temp_repo):
+        """notifications/cancelled is silently accepted (no crash, no hang)."""
+        proc = _spawn_mcp_server(temp_repo)
+        try:
+            _init_and_notify(proc)
+            # Send notifications/cancelled — no response expected
+            proc.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "notifications/cancelled"}) + "\n")
+            proc.stdin.flush()
+            time.sleep(0.1)
+            # Server should still respond to next request
+            resp = _send(proc, {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
+            assert "result" in resp
+            assert "tools" in resp["result"]
+        finally:
+            _shutdown_and_wait(proc)
+
+    def test_double_initialize_no_crash(self, temp_repo):
+        """Receiving initialize twice does not crash the server."""
+        proc = _spawn_mcp_server(temp_repo)
+        try:
+            resp1 = _send(proc, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+            assert "result" in resp1
+            resp2 = _send(proc, {"jsonrpc": "2.0", "id": 2, "method": "initialize", "params": {}})
+            assert "result" in resp2
+            # Server should still be operational
+            resp3 = _send(proc, {"jsonrpc": "2.0", "id": 3, "method": "tools/list", "params": {}})
+            assert "result" in resp3
+        finally:
+            _shutdown_and_wait(proc)
+
+    def test_double_shutdown_no_crash(self, temp_repo):
+        """Sending shutdown twice does not crash the server."""
+        proc = _spawn_mcp_server(temp_repo)
+        _init_and_notify(proc)
+        resp1 = _send(proc, {"jsonrpc": "2.0", "id": 1, "method": "shutdown", "params": {}})
+        assert resp1["result"] is None
+        # Second shutdown should not hang — server may ignore or error
+        try:
+            proc.stdin.write(json.dumps({"jsonrpc": "2.0", "id": 2, "method": "shutdown", "params": {}}) + "\n")
+            proc.stdin.flush()
+            proc.wait(timeout=5)
+        except Exception:
+            pass
+        assert proc.returncode == 0
+
+
+# ======================================================================
+# Phase 4 — Argument validation
+# ======================================================================
+
+class TestMcpArgValidation:
+    """Server returns structured errors for invalid argument types."""
+
+    def test_complexity_alerts_invalid_min_pct(self, temp_repo):
+        """get_complexity_alerts with non-numeric min_pct returns error."""
+        proc = _spawn_mcp_server(temp_repo)
+        try:
+            _init_and_notify(proc)
+            resp = _send(proc, {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
+                "name": "get_complexity_alerts", "arguments": {"min_pct": "abc"}
+            }})
+            result = json.loads(resp["result"]["content"][0]["text"])
+            assert result["success"] is False
+            assert "min_pct" in result["error"]
+        finally:
+            _shutdown_and_wait(proc)
+
+    def test_get_feedback_invalid_limit(self, temp_repo):
+        """get_feedback with non-numeric limit returns error."""
+        proc = _spawn_mcp_server(temp_repo)
+        try:
+            _init_and_notify(proc)
+            resp = _send(proc, {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
+                "name": "get_feedback", "arguments": {"limit": "xyz"}
+            }})
+            result = json.loads(resp["result"]["content"][0]["text"])
+            assert result["success"] is False
+        finally:
+            _shutdown_and_wait(proc)
+
+    def test_get_test_results_invalid_limit(self, temp_repo):
+        """get_test_results with non-numeric limit returns error."""
+        proc = _spawn_mcp_server(temp_repo)
+        try:
+            _init_and_notify(proc)
+            resp = _send(proc, {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
+                "name": "get_test_results", "arguments": {"limit": [1, 2, 3]}
+            }})
+            result = json.loads(resp["result"]["content"][0]["text"])
+            assert result["success"] is False
+        finally:
+            _shutdown_and_wait(proc)
+
+    def test_quarantine_list_invalid_limit(self, temp_repo):
+        """quarantine_list with non-numeric limit returns error."""
+        proc = _spawn_mcp_server(temp_repo)
+        try:
+            _init_and_notify(proc)
+            resp = _send(proc, {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
+                "name": "quarantine_list", "arguments": {"limit": None}
+            }})
+            result = json.loads(resp["result"]["content"][0]["text"])
+            assert result["success"] is False
+        finally:
+            _shutdown_and_wait(proc)
+
+    def test_get_recent_feedback_invalid_limit(self, temp_repo):
+        """get_recent_feedback with non-numeric limit returns error."""
+        proc = _spawn_mcp_server(temp_repo)
+        try:
+            _init_and_notify(proc)
+            resp = _send(proc, {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
+                "name": "get_recent_feedback", "arguments": {"limit": "3.14"}
+            }})
+            result = json.loads(resp["result"]["content"][0]["text"])
+            assert result["success"] is False
+        finally:
+            _shutdown_and_wait(proc)
+
+    def test_float_limit_truncated(self, temp_repo):
+        """Float limit for quarantine_list is silently truncated to int."""
+        proc = _spawn_mcp_server(temp_repo)
+        try:
+            _init_and_notify(proc)
+            resp = _send(proc, {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
+                "name": "quarantine_list", "arguments": {"limit": 1.5}
+            }})
+            result = json.loads(resp["result"]["content"][0]["text"])
+            # Should succeed (float silently converted to int)
+            assert result["success"]
+        finally:
+            _shutdown_and_wait(proc)
+
+    def test_empty_path_rejected(self, temp_repo):
+        """write_file with empty path returns error."""
+        proc = _spawn_mcp_server(temp_repo)
+        try:
+            _init_and_notify(proc)
+            resp = _send(proc, {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
+                "name": "write_file", "arguments": {"path": "", "content": "x = 1\n"}
+            }})
+            result = json.loads(resp["result"]["content"][0]["text"])
+            assert result["success"] is False
+        finally:
+            _shutdown_and_wait(proc)
+
+    def test_nonexistent_tool_name(self, temp_repo):
+        """tools/call with nonexistent tool name returns error (not crash)."""
+        proc = _spawn_mcp_server(temp_repo)
+        try:
+            _init_and_notify(proc)
+            resp = _send(proc, {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
+                "name": "nonexistent_tool_xyz", "arguments": {}
+            }})
+            result = json.loads(resp["result"]["content"][0]["text"])
+            assert result["success"] is False
+            assert "Unknown tool" in result.get("summary", "") or "Unknown tool" in result.get("error", "")
+        finally:
+            _shutdown_and_wait(proc)

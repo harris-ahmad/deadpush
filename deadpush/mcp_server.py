@@ -1035,6 +1035,8 @@ class McpServer:
                 if result is not None:
                     result = self._inject_feedback_summary(result)
                     self._send(msg_id, result)
+                else:
+                    self._send_error(msg_id, -32601, f"Method not found: {method}")
 
     def _send(self, msg_id: Any, result: Any):
         if self._stdio_broken:
