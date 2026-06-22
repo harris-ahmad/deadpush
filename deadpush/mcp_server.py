@@ -63,6 +63,7 @@ class McpServer:
         self.runtime = RuntimeConfig(self.repo_root)
         self.daemon = InterceptDaemon(self.repo_root, self.config)
         self.daemon.runtime = self.runtime
+        self._stdio_broken = False
 
     # -----------------------------------------------------------------------
     # Feedback helpers
@@ -79,6 +80,22 @@ class McpServer:
                 except Exception:
                     pass
         return count
+
+    def _safe_call(self, handler: Callable[[dict[str, Any]], dict[str, Any]], args: dict[str, Any]) -> dict[str, Any]:
+        try:
+            return handler(args)
+        except Exception as e:
+            return _err(str(e))
+
+    def _send_error(self, msg_id: Any, code: int, message: str):
+        if self._stdio_broken:
+            return
+        response = {"jsonrpc": "2.0", "id": msg_id, "error": {"code": code, "message": message}}
+        try:
+            sys.stdout.write(json.dumps(response) + "\n")
+            sys.stdout.flush()
+        except (BrokenPipeError, OSError):
+            self._stdio_broken = True
 
     # -----------------------------------------------------------------------
     # Tool definitions
@@ -495,7 +512,10 @@ class McpServer:
             pass
 
     def _tool_get_test_results(self, args: dict[str, Any]) -> dict[str, Any]:
-        limit = int(args.get("limit", 10))
+        try:
+            limit = int(args.get("limit", 10))
+        except (ValueError, TypeError):
+            return _err("limit must be a number")
         from .verifier import load_recent_results
         entries = load_recent_results(self.config, limit=limit)
         return _ok({"count": len(entries), "results": entries}, f"{len(entries)} test result(s).")
@@ -582,7 +602,10 @@ class McpServer:
                    f"{len(untested)} untested security boundaries.")
 
     def _tool_get_complexity_alerts(self, args: dict[str, Any]) -> dict[str, Any]:
-        min_pct = float(args.get("min_pct", 20))
+        try:
+            min_pct = float(args.get("min_pct", 20))
+        except (ValueError, TypeError):
+            return _err("min_pct must be a number")
         result = self._run_analysis()
         alerts = [a for a in result.get("complexity_alerts", []) if a.get("pct_increase", 0) >= min_pct]
         return _ok({"count": len(alerts), "alerts": alerts}, f"{len(alerts)} complexity alerts.")
@@ -614,7 +637,10 @@ class McpServer:
                    f"Cleaned {len(moved)} items to {archive_dir}.")
 
     def _tool_quarantine_list(self, args: dict[str, Any]) -> dict[str, Any]:
-        limit = int(args.get("limit", 20))
+        try:
+            limit = int(args.get("limit", 20))
+        except (ValueError, TypeError):
+            return _err("limit must be a number")
         try:
             from .guard import QuarantineManager
             qm = QuarantineManager(self.repo_root)
@@ -638,7 +664,10 @@ class McpServer:
             return _err(str(e))
 
     def _tool_get_feedback(self, args: dict[str, Any]) -> dict[str, Any]:
-        limit = int(args.get("limit", 5))
+        try:
+            limit = int(args.get("limit", 5))
+        except (ValueError, TypeError):
+            return _err("limit must be a number")
         feedback_dir = self.repo_root / FEEDBACK_DIR
         entries = []
         if feedback_dir.exists():
@@ -651,7 +680,10 @@ class McpServer:
         return _ok({"count": len(entries), "entries": entries}, f"{len(entries)} feedback entries.")
 
     def _tool_get_recent_feedback(self, args: dict[str, Any]) -> dict[str, Any]:
-        limit = int(args.get("limit", 10))
+        try:
+            limit = int(args.get("limit", 10))
+        except (ValueError, TypeError):
+            return _err("limit must be a number")
         feedback_dir = self.repo_root / FEEDBACK_DIR
         entries = []
         if feedback_dir.exists():
@@ -947,7 +979,7 @@ class McpServer:
             handler = tool_map.get(name)
             if not handler:
                 return _err(f"Unknown tool: {name}")
-            return handler(arguments)
+            return self._safe_call(handler, arguments)
         return None
 
     def run(self):
@@ -955,12 +987,15 @@ class McpServer:
         self.daemon.start(http=False)
 
         for line in sys.stdin:
+            if self._stdio_broken:
+                break
             line = line.strip()
             if not line:
                 continue
             try:
                 msg = json.loads(line)
             except json.JSONDecodeError:
+                self._send_error(None, -32700, "Parse error")
                 continue
 
             msg_id = msg.get("id")
@@ -975,8 +1010,12 @@ class McpServer:
                 })
                 continue
 
-            if method == "notifications/initialized":
+            if method in ("notifications/initialized", "notifications/cancelled"):
                 continue
+
+            if method == "shutdown":
+                self._send(msg_id, None)
+                break
 
             if method:
                 result = self._handle_request(method, params)
@@ -984,14 +1023,15 @@ class McpServer:
                     result = self._inject_feedback_summary(result)
                     self._send(msg_id, result)
 
-            if method == "shutdown":
-                self._send(msg_id, None)
-                break
-
     def _send(self, msg_id: Any, result: Any):
+        if self._stdio_broken:
+            return
         response = {"jsonrpc": "2.0", "id": msg_id, "result": result}
-        sys.stdout.write(json.dumps(response) + "\n")
-        sys.stdout.flush()
+        try:
+            sys.stdout.write(json.dumps(response) + "\n")
+            sys.stdout.flush()
+        except (BrokenPipeError, OSError):
+            self._stdio_broken = True
 
 
 def run_mcp():
