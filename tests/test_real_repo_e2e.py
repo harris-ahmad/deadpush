@@ -10,6 +10,7 @@ Run:  pytest tests/test_real_repo_e2e.py -v -x
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -23,7 +24,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 REPO_ROOT = str(Path(__file__).resolve().parent.parent)
 VENV_PY = str(Path(REPO_ROOT) / ".venv" / "bin" / "python3")
-AUTH_REPO = Path("/Users/harris/Documents/personal/AuthenticationSystem")
+AUTH_REPO_ENV = "DEADPUSH_TEST_REPO"
+AUTH_REPO = Path(os.environ.get(AUTH_REPO_ENV, str(Path.home() / "Documents" / "personal" / "AuthenticationSystem")))
+
+pytestmark = pytest.mark.skipif(
+    not AUTH_REPO.exists(),
+    reason=f"Set ${AUTH_REPO_ENV} or clone the AuthenticationSystem repo to {AUTH_REPO}",
+)
 
 
 # ======================================================================

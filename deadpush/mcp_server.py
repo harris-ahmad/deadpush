@@ -405,12 +405,12 @@ class McpServer:
     def _run_analysis(self) -> dict[str, Any]:
         """Run full analysis and return structured results."""
         from .cli import _run_full_analysis
-        from concurrent.futures import ThreadPoolExecutor, TimeoutError as _TimeoutError
+        from concurrent.futures import ThreadPoolExecutor
         with ThreadPoolExecutor(max_workers=1) as pool:
             future = pool.submit(_run_full_analysis, self.config)
             try:
                 return future.result(timeout=60)
-            except _TimeoutError:
+            except TimeoutError:
                 return _err("Analysis timed out after 60s")
             except Exception as e:
                 return _err(f"Analysis failed: {e}")
