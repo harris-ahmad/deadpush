@@ -346,8 +346,8 @@ class McpServer:
             },
             # --- Agent-as-Adjudicator ---
             {
-                "name": "verify_finding",
-                "description": "Adjudicate a guardrail finding. Presents the finding with structured uncertainty for the agent to verify. Returns a scoring rubric. Call learn_false_positive if the agent determines the finding is a false positive.",
+                "name": "adjudicate_finding",
+                "description": "Adjudicate a guardrail finding. Presents the finding with structured uncertainty for the agent to adjudicate. Returns a scoring rubric. Call learn_false_positive if the agent determines the finding is a false positive.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -405,7 +405,15 @@ class McpServer:
     def _run_analysis(self) -> dict[str, Any]:
         """Run full analysis and return structured results."""
         from .cli import _run_full_analysis
-        return _run_full_analysis(self.config)
+        from concurrent.futures import ThreadPoolExecutor, TimeoutError as _TimeoutError
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(_run_full_analysis, self.config)
+            try:
+                return future.result(timeout=60)
+            except _TimeoutError:
+                return _err("Analysis timed out after 60s")
+            except Exception as e:
+                return _err(f"Analysis failed: {e}")
 
     def _tool_write_file(self, args: dict[str, Any]) -> dict[str, Any]:
         path = args.get("path", "")
@@ -526,9 +534,9 @@ class McpServer:
         if not path:
             return _err("path is required")
         staging_dir = self.daemon.staging_dir
-        staging_path = (staging_dir / path).resolve()
-        staging_path.parent.mkdir(parents=True, exist_ok=True)
         try:
+            staging_path = (staging_dir / path).resolve()
+            staging_path.parent.mkdir(parents=True, exist_ok=True)
             staging_path.write_text(content, encoding="utf-8")
             result = _run_guardrails(staging_path, staging_dir, self.config, self.runtime)
             staging_path.unlink(missing_ok=True)
@@ -628,7 +636,10 @@ class McpServer:
         archive_dir.mkdir(parents=True, exist_ok=True)
         moved = []
         for item in all_issues:
-            path = Path(item.path if hasattr(item, "path") else item.symbol.path)
+            item_path = getattr(item, "path", None) or getattr(getattr(item, "symbol", None), "path", None)
+            if not item_path:
+                continue
+            path = Path(item_path)
             if path.exists():
                 dest = archive_dir / path.name
                 shutil.move(str(path), str(dest))
@@ -702,6 +713,8 @@ class McpServer:
         name = args.get("name", "")
         if not name:
             return _err("name is required")
+        if not isinstance(name, str):
+            return _err("name must be a string")
         feedback_dir = self.repo_root / FEEDBACK_DIR
         path = feedback_dir / name
         if not path.exists():
@@ -866,7 +879,7 @@ class McpServer:
         self.runtime.add_allowed_pattern(re.escape(path) + "\\Z", f"Sensitive write bypass for {path}")
         return _ok({"path": path}, f"Sensitive write for '{path}' allowed. Added to allowlist.")
 
-    def _tool_verify_finding(self, args: dict[str, Any]) -> dict[str, Any]:
+    def _tool_adjudicate_finding(self, args: dict[str, Any]) -> dict[str, Any]:
         category = args.get("category", "")
         description = args.get("description", "")
         file_path = args.get("file_path", "")
@@ -933,8 +946,8 @@ class McpServer:
                         "unacknowledged": self._count_unacknowledged_feedback()
                     }
                     c["text"] = json.dumps(parsed, indent=2, default=str)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[deadpush] _inject_feedback_summary failed: {e}", file=sys.stderr, flush=True)
         return response
 
     def _handle_request(self, method: str, params: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -971,7 +984,7 @@ class McpServer:
                 "reset_runtime_config": self._tool_reset_runtime_config,
                 "get_write_diff": self._tool_get_write_diff,
                 "allow_sensitive_write": self._tool_allow_sensitive_write,
-                "verify_finding": self._tool_verify_finding,
+                "adjudicate_finding": self._tool_adjudicate_finding,
                 "learn_false_positive": self._tool_learn_false_positive,
                 "verify_write": self._tool_verify_write,
                 "get_test_results": self._tool_get_test_results,

@@ -112,7 +112,7 @@ class TestMcpProtocol:
         "ignore_path", "set_guardrail_level", "reset_runtime_config",
         "get_write_diff", "allow_sensitive_write",
         "verify_write", "get_test_results",
-        "verify_finding", "learn_false_positive",
+        "adjudicate_finding", "learn_false_positive",
     ]
 
     def test_all_tools_registered(self, mcp_proc):
@@ -157,7 +157,7 @@ class TestMcpProtocol:
             "allow_sensitive_write": {"path": "Dockerfile"},
             "verify_write": {"path": "z.py", "content": "z = 3"},
             "get_test_results": {},
-            "verify_finding": {"category": "security", "description": "test", "file_path": "x.py"},
+            "adjudicate_finding": {"category": "security", "description": "test", "file_path": "x.py"},
             "learn_false_positive": {"category": "security", "pattern": "test", "reason": "manual"},
         }
         fails = []
@@ -431,9 +431,9 @@ class TestLearningLoop:
     finding → verify_finding → learn_false_positive → auto-suppressed.
     """
 
-    def test_verify_finding_returns_adjudication(self, mcp_proc):
-        """verify_finding returns structured adjudication prompt + scoring."""
-        resp = _call(mcp_proc, "verify_finding", {
+    def test_adjudicate_finding_returns_adjudication(self, mcp_proc):
+        """adjudicate_finding returns structured adjudication prompt + scoring."""
+        resp = _call(mcp_proc, "adjudicate_finding", {
             "category": "security",
             "description": "eval(user_input) detected",
             "file_path": "src/foo.py",
@@ -481,9 +481,9 @@ class TestLearningLoop:
         resp = _call(mcp_proc, "learn_false_positive", {"category": "security", "pattern": "x"})
         assert resp["success"] is False, "Should fail without reason"
 
-    def test_verify_finding_requires_required_args(self, mcp_proc):
-        """verify_finding fails with missing required args."""
-        resp = _call(mcp_proc, "verify_finding", {"category": "security"})
+    def test_adjudicate_finding_requires_required_args(self, mcp_proc):
+        """adjudicate_finding fails with missing required args."""
+        resp = _call(mcp_proc, "adjudicate_finding", {"category": "security"})
         assert resp["success"] is False
 
 
