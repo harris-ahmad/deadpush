@@ -332,6 +332,7 @@ def _run_full_analysis(config, explicit_entries=None, max_depth=-1, use_rich=Tru
             custom_registrations=config.dead_code.custom_registrations,
             test_file_paths=test_file_paths,
         )
+        scorer.prefetch_blame_data(max_workers=10)
     except Exception:
         scorer = None
 

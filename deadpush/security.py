@@ -71,10 +71,14 @@ class SecurityScanner:
     def __init__(self, repo_root: Path | None = None):
         self.repo_root = repo_root or Path.cwd()
 
+    MAX_FILE_SIZE = 50 * 1024 * 1024  # 50 MB
+
     def scan_file(self, file_path: Path) -> list[SecurityBoundary]:
         """Find security-sensitive operations in a single file."""
         boundaries: list[SecurityBoundary] = []
         try:
+            if file_path.stat().st_size > self.MAX_FILE_SIZE:
+                return boundaries
             source = file_path.read_text(encoding="utf-8", errors="ignore")
         except Exception:
             return boundaries

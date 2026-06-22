@@ -25,6 +25,11 @@ from .graph import CallGraph, Symbol
 from .registration import RegistrationDetector
 from .importgraph import ImportAnalyzer
 
+# Module-level blame cache shared across scorer instances (TTL: 60s)
+_GLOBAL_BLAME_CACHE: dict[str, tuple[float, dict[int, float]]] = {}
+
+import time as _time
+
 
 @dataclass
 class DeadnessResult:
@@ -121,6 +126,8 @@ class MultiFactorDeadnessScorer:
         # Phase 3: call-chain propagation + test coverage
         self._call_chain_scores: dict[str, float] = {}
         self._test_file_refs: set[str] = self._build_test_refs(test_file_paths or [])
+        self._git_history_checked = False
+        self._git_history_has_commits = False
 
     def score(self, sym: Symbol) -> DeadnessResult | None:
         """Score a single symbol. Returns None if abstention applies."""
@@ -189,11 +196,21 @@ class MultiFactorDeadnessScorer:
 
         tier = self.classify(alive_score)
 
+        uncertainty_parts: list[str] = []
+        if tier == "uncertain":
+            uncertainty_parts.append(f"alive_score {alive_score:.3f} in uncertain range (>0.7)")
+        rel = self._rel_path(sym.path)
+        if rel not in self._blame_cache:
+            uncertainty_parts.append("git blame data not available")
+        if not self._test_file_refs:
+            uncertainty_parts.append("no test files found for coverage analysis")
+
         return DeadnessResult(
             alive_score=round(alive_score, 3),
             tier=tier,
             factors=factors,
             reasons=reasons,
+            uncertainty="; ".join(uncertainty_parts) if uncertainty_parts else "",
         )
 
     def _build_test_refs(self, test_file_paths: list[Path]) -> set[str]:
@@ -205,7 +222,7 @@ class MultiFactorDeadnessScorer:
             except Exception:
                 continue
             # Match import-like and string references
-            for m in re.finditer(r"import\s+(\w+)|from\s+(\w+)|['\"](\w+)['\"]", text):
+            for m in re.finditer(r"(?:import\s+(\w+)|from\s+(\w+)|['\"](\w+?)['\"])", text):
                 for g in m.groups():
                     if g and len(g) > 1 and g.isidentifier():
                         refs.add(g)
@@ -316,8 +333,26 @@ class MultiFactorDeadnessScorer:
             return 0.5
         return 0.0
 
+    def _has_git_history(self) -> bool:
+        """Check if the repo has any commits (avoids FP for new repos)."""
+        if self._git_history_checked:
+            return self._git_history_has_commits
+        self._git_history_checked = True
+        try:
+            result = subprocess.run(
+                ["git", "rev-list", "--count", "HEAD"],
+                capture_output=True, text=True, check=False, timeout=5,
+                cwd=self.repo_root,
+            )
+            self._git_history_has_commits = result.returncode == 0 and int(result.stdout.strip()) > 0
+        except Exception:
+            self._git_history_has_commits = False
+        return self._git_history_has_commits
+
     def _factor_git_freshness(self, sym: Symbol) -> float:
         """Score based on git blame (when was the symbol last modified)."""
+        if not self._has_git_history():
+            return 0.5  # neutral — no git history to judge freshness
         rel = self._rel_path(sym.path)
         try:
             file_path = self.repo_root / rel
@@ -325,7 +360,17 @@ class MultiFactorDeadnessScorer:
                 return 0.0
 
             if rel not in self._blame_cache:
-                self._blame_cache[rel] = self._blame_file(file_path)
+                # Check global cache before blaming
+                global _GLOBAL_BLAME_CACHE
+                now = _time.time()
+                if rel in _GLOBAL_BLAME_CACHE:
+                    ts, data = _GLOBAL_BLAME_CACHE[rel]
+                    if now - ts < 60:
+                        self._blame_cache[rel] = data
+                    else:
+                        del _GLOBAL_BLAME_CACHE[rel]
+                if rel not in self._blame_cache:
+                    self._blame_cache[rel] = self._blame_file(file_path)
 
             cache = self._blame_cache[rel]
             if not cache:
@@ -345,6 +390,26 @@ class MultiFactorDeadnessScorer:
             return 0.0
         except Exception:
             return self._factor_git_log_fallback(sym.name, rel)
+
+    def prefetch_blame_data(self, max_workers: int = 10) -> None:
+        """Pre-fetch git blame data for all source files in parallel."""
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        files_to_blame = []
+        for f in self.all_file_paths:
+            rel = self._rel_path(str(f))
+            if rel not in self._blame_cache:
+                files_to_blame.append(f)
+        if not files_to_blame:
+            return
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            future_map = {pool.submit(self._blame_file, f): f for f in files_to_blame}
+            for future in as_completed(future_map):
+                f = future_map[future]
+                rel = self._rel_path(str(f))
+                try:
+                    self._blame_cache[rel] = future.result()
+                except Exception:
+                    pass
 
     def _blame_file(self, file_path: Path) -> dict[int, float]:
         """Run git blame on a file and return {line_number: age_days}."""
@@ -368,6 +433,9 @@ class MultiFactorDeadnessScorer:
                     current_line += 1
                 elif line.startswith("boundary"):
                     pass
+            # Seed global cache
+            global _GLOBAL_BLAME_CACHE
+            _GLOBAL_BLAME_CACHE[self._rel_path(str(file_path))] = (_time.time(), line_dates)
             return line_dates
         except Exception:
             return {}
