@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.2.1 (2026-06-24)
+- Made watchdog as a required dependency to fix the bug on deadpush watch command
+
 ## 0.2.0 (2026-06-22)
 
 - Initial public release.

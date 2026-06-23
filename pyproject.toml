@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "deadpush"
-version = "0.2.0"
+version = "0.2.1"
 description = "Guardrails for the vibe coding era — reachability-based dead code detection + semantic debris detection with pre-push git hooks"
 readme = "README.md"
 license = {text = "MIT"}
@@ -32,12 +32,12 @@ dependencies = [
     "tree-sitter-javascript>=0.23.0",
     "tree-sitter-java>=0.23.0",
     "pathspec>=0.12.1",
+    "watchdog>=4.0.0",
 ]
 
 [project.optional-dependencies]
 rich = ["rich>=13.7.0"]
 anthropic = ["anthropic>=0.45.0"]
-watch = ["watchdog>=4.0.0"]
 dev = ["pytest>=8.0", "ruff>=0.4", "rich>=13.7.0", "watchdog>=4.0.0"]
 
 [project.scripts]
