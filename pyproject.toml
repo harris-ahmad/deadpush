@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "deadpush"
-version = "0.1.0"
+version = "0.2.0"
 description = "Guardrails for the vibe coding era — reachability-based dead code detection + semantic debris detection with pre-push git hooks"
 readme = "README.md"
 license = {text = "MIT"}
@@ -45,6 +45,9 @@ deadpush = "deadpush.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/harris-ahmad/deadpush"
+Source = "https://github.com/harris-ahmad/deadpush"
+"Bug Tracker" = "https://github.com/harris-ahmad/deadpush/issues"
+Documentation = "https://github.com/harris-ahmad/deadpush#readme"
 
 [tool.hatch.build.targets.wheel]
 packages = ["deadpush"]

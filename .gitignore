@@ -151,6 +151,9 @@ activemq-data/
 .env
 .envrc
 .venv
+.deadpush/
+.deadpush-quarantine/
+.deadpush-archive/
 env/
 venv/
 ENV/
