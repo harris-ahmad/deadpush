@@ -799,20 +799,21 @@ class McpServer:
         }, "Server running.")
 
     def _tool_get_safety_score(self, args: dict[str, Any]) -> dict[str, Any]:
-        # Check default and hardened log locations
+        # Check both default and hardened state directories for safety_score.json
         candidates = [
-            Path.home() / ".deadpush" / "guardian.log",
-            Path("/var/db/deadpush/guardian.log"),
+            Path.home() / ".deadpush" / "safety_score.json",
+            Path("/var/db/deadpush/safety_score.json"),
         ]
         score = "No background guardian running (start with deadpush protect --daemon)"
-        for log in candidates:
-            if log.exists():
+        for path in candidates:
+            if path.exists():
                 try:
-                    lines = log.read_text(errors="ignore").strip().splitlines()[-20:]
-                    for ln in reversed(lines):
-                        if "Safety" in ln or "Score:" in ln or "Status:" in ln:
-                            score = ln.strip()
-                            break
+                    import json
+                    data = json.loads(path.read_text(encoding="utf-8"))
+                    score_val = data.get("score")
+                    if score_val is not None:
+                        status = "🟢 Excellent" if score_val >= 90 else "🟡 Good" if score_val >= 70 else "🟠 Caution" if score_val >= 50 else "🔴 At Risk"
+                        score = f"Score: {score_val}/100 | Status: {status} | Updated: {data.get('last_updated', 'unknown')}"
                 except Exception:
                     pass
                 break

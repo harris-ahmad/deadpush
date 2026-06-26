@@ -50,17 +50,20 @@ from urllib.parse import urlparse, parse_qs
 # =============================================================================
 # Logging
 # =============================================================================
+from logging.handlers import RotatingFileHandler
+
 def setup_logging(log_file: Optional[Path] = None, level=logging.INFO, daemon: bool = False, hardened: bool = False):
     """Setup logging.
 
     In daemon mode: ONLY file logging (headless/silent on stdout/stderr).
     Foreground: file + console.
+    Uses RotatingFileHandler (10MB × 5 files) to prevent unbounded growth.
     """
     if log_file is None:
         log_file = _state_dir(hardened) / "guardian.log"
         log_file.parent.mkdir(parents=True, exist_ok=True)
 
-    handlers = [logging.FileHandler(log_file)]
+    handlers = [RotatingFileHandler(log_file, maxBytes=10_000_000, backupCount=5, encoding="utf-8")]
     if not daemon:
         handlers.append(logging.StreamHandler(sys.stdout))
 
@@ -345,7 +348,7 @@ class SessionSafetyScore:
     - get_activity_level() and get_session_summary() used in logs + status cmd
     """
 
-    def __init__(self):
+    def __init__(self, hardened: bool = False):
         self.score = 100
         self.incidents = []
         self.recent_window = 60  # seconds
@@ -353,6 +356,11 @@ class SessionSafetyScore:
         self.events_count = 0
         self.session_start = datetime.now()
         self.recent_paths: list[str] = []  # last ~10 distinct-ish paths touched
+        self.hardened = hardened
+
+    def _score_path(self) -> Path:
+        """Path to the safety score JSON file."""
+        return _state_dir(self.hardened) / "safety_score.json"
 
     def mark_clean_shutdown(self):
         """Mark clean shutdown so restart doesn't apply penalty.
@@ -374,6 +382,38 @@ class SessionSafetyScore:
             tmp = path.with_suffix(".tmp")
             tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
             tmp.replace(path)
+        except Exception:
+            pass
+
+    def save_score(self):
+        """Persist current score to JSON file for MCP server to read."""
+        path = self._score_path()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            import json
+            data = {
+                "score": self.score,
+                "event_count": self.events_count,
+                "guardian_pid": os.getpid(),
+                "last_updated": datetime.now().isoformat(),
+                "clean_shutdown": False,
+            }
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            tmp.replace(path)
+        except Exception:
+            pass
+
+    def load_score(self):
+        """Load score from JSON file on startup."""
+        path = self._score_path()
+        if not path.exists():
+            return
+        try:
+            import json
+            data = json.loads(path.read_text(encoding="utf-8"))
+            self.score = data.get("score", 100)
+            self.events_count = data.get("event_count", 0)
         except Exception:
             pass
 
@@ -405,6 +445,7 @@ class SessionSafetyScore:
             # Very bursty - many agents firing at once
             self.score = max(0, self.score - 5)
 
+        self.save_score()
         return self.score
 
     def get_status(self) -> str:
@@ -962,7 +1003,8 @@ class GuardianHandler(FileSystemEventHandler or object):
         self.logger = logger or logging.getLogger("deadpush.guardian")
         self.detector = DebrisDetector(config)
         self.quarantine = QuarantineManager(config.repo_root)
-        self.safety_score = SessionSafetyScore()
+        self.safety_score = SessionSafetyScore(hardened=hardened)
+        self.safety_score.load_score()
         self.session_mgr = SessionManager()
 
         # Rate limiting for multi-agent scenarios
