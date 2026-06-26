@@ -39,6 +39,7 @@ from .ui import (
     print_blocking_warning,
     print_error,
     print_header,
+    print_info,
     print_scan_summary,
     print_success,
     print_warning,
@@ -563,14 +564,15 @@ def cmd_debris():
 def cmd_watch():
     """Watch the repository for new debris in real time (great while vibe coding)."""
     from .watch import start_watch
-    start_watch()
+    start_watch(repo_root=Path.cwd())
 
 
 @main.command("guard")
 @click.option("--no-intervention", is_flag=True, help="Warning mode only (no blocking/quarantine)")
 @click.option("--daemon", is_flag=True, help="Run as background daemon")
 @click.option("--strict", is_flag=True, help="Enable strict intervention mode")
-def cmd_guard(no_intervention, daemon, strict):
+@click.option("--hardened", is_flag=True, help="Run as _deadpush user (privilege separation)")
+def cmd_guard(no_intervention, daemon, strict, hardened):
     """
     Start the AI Agent Guardian.
 
@@ -578,13 +580,14 @@ def cmd_guard(no_intervention, daemon, strict):
     """
     from .guard import run_guardian
     intervention = not no_intervention
-    run_guardian(intervention=intervention, daemon=daemon, strict=strict)
+    run_guardian(intervention=intervention, daemon=daemon, strict=strict, hardened=hardened)
 
 
 @main.command("protect")
 @click.option("--enable", is_flag=True, help="Enable persistent background guardian (auto-starts daemon after setup)")
 @click.option("--daemon", is_flag=True, help="Start the guardian as a persistent background daemon after performing full setup")
-def cmd_protect(enable, daemon):
+@click.option("--hardened", is_flag=True, help="Run as _deadpush user (privilege separation)")
+def cmd_protect(enable, daemon, hardened):
     """
     One-command setup to protect your vibe coding workflow.
 
@@ -601,15 +604,27 @@ def cmd_protect(enable, daemon):
 
     start_background = bool(enable or daemon)
 
+    # If hardened mode, do the one-time privilege separation setup first
+    if hardened:
+        print("\n[0/4] Setting up hardened environment (privilege separation)...")
+        from .guard import setup_hardened_environment
+        try:
+            summary = setup_hardened_environment(config.repo_root, auto_load=start_background)
+            print(summary)
+        except Exception as e:
+            print_warning(f"Hardened environment setup failed: {e}")
+            print_warning("Try running with sudo directly, or check system logs.")
+            return
+
     print_header("deadpush Protect", "One-command setup for AI Agent Guardian (persistent background protection)")
 
-    # 1. Install git hooks (pre-push + pre-commit)
-    print("\n[1/3] Installing git hooks (pre-push + pre-commit)...")
+    # 1. Install git hooks (pre-push + pre-commit + post-commit)
+    print("\n[1/3] Installing git hooks (pre-push, pre-commit, post-commit)...")
     try:
         from .hooks import install_hook
         install_hook(config.repo_root)
     except Exception as e:
-        print_warning(f"Git hook installation issue: {e}")
+        print_warning(f"Pre-push hook installation issue: {e}")
         print_warning("  (Tip: ensure this is a git repo with .git/hooks/)")
     try:
         from .hooks import install_precommit_hook
@@ -618,11 +633,37 @@ def cmd_protect(enable, daemon):
     except Exception as e:
         print_warning(f"Pre-commit hook installation issue: {e}")
     try:
+        from .hooks import install_postcommit_hook
+        install_postcommit_hook(config.repo_root)
+        print("  Also installed post-commit guardrail hook (catches --no-verify bypass).")
+    except Exception as e:
+        print_warning(f"Post-commit hook installation issue: {e}")
+    try:
+        from .hooks import verify_hooks_installed
+        problems = verify_hooks_installed(config.repo_root)
+        if problems:
+            print_warning(f"  Hook verification issues: {', '.join(problems)}")
+            print_warning("  Re-run `deadpush protect` to repair hooks.")
+        else:
+            print_success("  All git guardrail hooks verified (checksums OK).")
+    except Exception as e:
+        print_warning(f"Hook verification skipped: {e}")
+    try:
         from .hooks import setup_mcp_discovery
         setup_mcp_discovery(config.repo_root)
         print("  Agent auto-discovery configured (.cursor/mcp.json, .vscode/mcp.json).")
     except Exception as e:
         print_warning(f"MCP discovery setup issue: {e}")
+
+    # GitHub Actions server-side guard (must be committed to take effect)
+    try:
+        from .hooks import setup_github_guard_action
+        action_path = setup_github_guard_action(config.repo_root)
+        if action_path:
+            from .hooks import _make_immutable
+            _make_immutable(action_path)
+    except Exception as e:
+        print_warning(f"GitHub Action guard setup issue: {e}")
 
     # 2. Generate + merge smart ignore patterns into the real ignore files
     #    (this is the key hands-off part - users no longer have to manually curate)
@@ -662,13 +703,47 @@ def cmd_protect(enable, daemon):
 
         # Auto-start helpers for reboot survival (AGENT priority 2)
         try:
-            from .guard import run_guardian, setup_autostart
-            autostart_info = setup_autostart(config.repo_root)
+            from .guard import run_guardian, setup_autostart, _scoped_plist_path
+            autostart_info = setup_autostart(config.repo_root, hardened=hardened)
             if autostart_info:
                 print("\n[Auto-start for reboots]")
                 print(autostart_info)
         except Exception as e:
             print_warning(f"Autostart helper generation skipped (non-fatal): {e}")
+
+        # In hardened mode, the daemon was already loaded by setup_hardened_environment().
+        # In default mode, bootstrap the launchd plist so guardian runs under launchd.
+        if not hardened:
+            plist_path = _scoped_plist_path(config.repo_root)
+            _bootstrapped = False
+            if plist_path.exists():
+                try:
+                    import subprocess, os
+                    uid = os.getuid()
+                    result = subprocess.run(
+                        ["launchctl", "bootstrap", f"gui/{uid}", str(plist_path)],
+                        capture_output=True, text=True, timeout=10,
+                    )
+                    if result.returncode == 0:
+                        _bootstrapped = True
+                    else:
+                        _bootstrapped = True
+                except Exception:
+                    pass
+
+            # If bootstrap failed or on non-macOS, fall back to direct daemon launch
+            if not _bootstrapped:
+                print("  (launchd bootstrap unavailable — starting guardian directly)")
+                try:
+                    run_guardian(intervention=True, daemon=True, strict=False, hardened=hardened)
+                except SystemExit:
+                    pass
+                except Exception as e:
+                    print_warning(f"Daemon launch had issue (try `deadpush guard --daemon`): {e}")
+            else:
+                print_success("✅ Guardian launched under launchd (auto-restarts if killed).")
+        else:
+            print_success("✅ Guardian running as _deadpush under launchd.")
 
         print_success("✅ Protection setup + daemon launch complete!")
 
@@ -684,16 +759,7 @@ def cmd_protect(enable, daemon):
         print("  - get_status   : current guardrail configuration")
         print("")
         print("Agents can now safely write code without you in the loop, while the background")
-        print("guardian (started above) continues its FS watching + Safety Score.")
-
-        # Launch the main background guardian
-        try:
-            from .guard import run_guardian
-            run_guardian(intervention=True, daemon=True, strict=False)
-        except SystemExit:
-            pass
-        except Exception as e:
-            print_warning(f"Daemon launch had issue (try `deadpush guard --daemon`): {e}")
+        print("guardian (launchd-managed) continues its FS watching + Safety Score.")
     else:
         print_success("Protection setup complete (hooks + ignores).")
         print("Guardian NOT started in background.")
@@ -1176,19 +1242,24 @@ def cmd_scan(entry, depth, fmt, output, no_rich, check_imports, aggressive, show
 # Status command (polish / usability)
 # =============================================================================
 @main.command("status")
-def cmd_status():
+@click.option("--hardened", is_flag=True, help="Show status of a hardened guardian")
+def cmd_status(hardened):
     """Show whether the guardian is running, latest Safety Score, recent incidents, and session info.
 
     This is the primary way to check on your always-on protector without reading logs manually.
     """
-    from .guard import DaemonManager
-    pid_dir = Path.home() / ".deadpush"
-    pidfile = pid_dir / "guardian.pid"
-    lockfile = pid_dir / "guardian.lock"
+    from .config import load_config
+    from .guard import DaemonManager, _scoped_pidfile, _scoped_lockfile, _scoped_portfile, _state_dir
+
+    config = load_config()
+    repo_root = config.repo_root
+    pid_dir = _state_dir(hardened)
+    pidfile = _scoped_pidfile(repo_root, hardened)
+    lockfile = _scoped_lockfile(repo_root, hardened)
     dm = DaemonManager(pidfile, lockfile)
     running = dm.is_running()
 
-    print_header("deadpush Status", "AI Agent Guardian - persistent background protection")
+    print_header("deadpush Status", f"AI Agent Guardian - {repo_root.name}")
 
     if running:
         try:
@@ -1197,7 +1268,7 @@ def cmd_status():
         except Exception:
             print_success("🟢 Guardian is RUNNING")
     else:
-        print_warning("🔴 Guardian is NOT currently running.")
+        print_warning(f"🔴 Guardian is NOT currently running for {repo_root.name}.")
         print("   Start it with the hands-off command:")
         print("     deadpush protect --daemon")
         print("   Or:")
@@ -1241,7 +1312,9 @@ def cmd_status():
     print("  - Full scan: deadpush scan")
 
     # Show control interface if running
-    port_file = Path.home() / ".deadpush" / "guardian.control.port"
+    port_file = _scoped_portfile(repo_root, hardened)
+    if not port_file.exists() and hardened:
+        port_file = config.repo_root / ".guardian" / "guardian.control.port"
     if port_file.exists():
         try:
             port = port_file.read_text().strip()
@@ -1374,6 +1447,47 @@ def cmd_hooks_run_precommit():
     config = load_config()
     from .hooks import run_precommit_guardrails
     passed, violations = run_precommit_guardrails(config.repo_root)
+    sys.exit(0 if passed else 1)
+
+
+@cmd_hooks.command("install-postcommit")
+def cmd_hooks_install_postcommit():
+    """Install the post-commit guardrail hook.
+
+    Reverts commits containing dangerous code even if --no-verify was used.
+    """
+    config = load_config()
+    try:
+        from .hooks import install_postcommit_hook
+        install_postcommit_hook(config.repo_root)
+        print_success("Post-commit guardrail hook installed.")
+    except Exception as e:
+        print_error(f"Failed to install post-commit hook: {e}")
+
+
+@cmd_hooks.command("run-postcommit")
+def cmd_hooks_run_postcommit():
+    """Run guardrails on the last commit's files (called by the post-commit hook).
+
+    Exits with code 1 if violations found and commit was reverted.
+    """
+    config = load_config()
+    from .hooks import run_postcommit_guardrails
+    passed, violations = run_postcommit_guardrails(config.repo_root)
+    sys.exit(0 if passed else 1)
+
+
+@cmd_hooks.command("run-prepush")
+def cmd_hooks_run_prepush():
+    """Run guardrails on commits being pushed (called by the pre-push hook).
+
+    Reads stdin (standard pre-push format) to determine the commit range
+    and checks all files in those commits for violations.
+    Exits with code 1 if violations are found, blocking the push.
+    """
+    config = load_config()
+    from .hooks import run_prepush_guardrails
+    passed, violations = run_prepush_guardrails(config.repo_root)
     sys.exit(0 if passed else 1)
 
 
@@ -1561,7 +1675,9 @@ def _write_toml(path: Path, data: dict) -> None:
 
 
 @main.command("mcp")
-def cmd_mcp():
+@click.option("--danger", is_flag=True, help="⚠️  Allow guardrail weakening (enable set_guardrail_level, add_allowed_pattern, reset_runtime_config, ignore_path). Only use this if you understand the risks.")
+@click.option("--hardened", is_flag=True, help="Connect to a hardened guardian")
+def cmd_mcp(danger, hardened):
     """Start the Model Context Protocol server for AI agent integration.
 
     Runs over stdio. Any MCP-compatible agent (Cursor, Claude Desktop, etc.)
@@ -1574,10 +1690,282 @@ def cmd_mcp():
       - quarantine_list / quarantine_restore: manage quarantined files
       - get_feedback / get_status / get_safety_score
 
+    By default, guardrail-softening tools (set_guardrail_level, add_allowed_pattern,
+    reset_runtime_config, ignore_path) are disabled. Use --danger to enable them
+    (you accept the security risk).
+
     All tools return structured JSON. Configure your agent to run: deadpush mcp
     """
     from .mcp_server import run_mcp
-    run_mcp()
+    run_mcp(danger_mode=danger, hardened=hardened)
+
+
+@main.command("unfreeze")
+@click.option("--hardened", is_flag=True, help="Target a hardened guardian")
+def cmd_unfreeze(hardened):
+    """Clear the MCP suspension flag and restore normal operation.
+
+    When the guardian detects an agent actively fighting guardrails (score ≤ 5),
+    it suspends MCP access. Run this command to re-enable it.
+    """
+    from .config import load_config
+    from .guard import _scoped_suspend_file
+
+    config = load_config()
+    suspend_file = _scoped_suspend_file(config.repo_root, hardened)
+    if suspend_file.exists():
+        suspend_file.unlink()
+        print("MCP suspension cleared. Agents can now use `deadpush mcp` again.")
+    else:
+        print("No suspension flag found. MCP is already active.")
+
+
+@main.command("stop")
+@click.option("--hardened", is_flag=True, help="Stop a hardened guardian")
+@click.option("--force", is_flag=True, help="Force cleanup of stale lock/PID files (use if guardian crashed)")
+def cmd_stop(hardened, force):
+    """Stop the deadpush guardian and clean up.
+
+    Sends SIGTERM to the guardian (which saves safety score with a clean-shutdown
+    marker so restart doesn't trigger the "killed by agent" penalty), unloads the
+    launchd plist, kills shadow processes, removes immutable flags from hooks,
+    and cleans up PID / lock files.
+    """
+    import os
+    import signal
+    import subprocess
+    import time
+
+    from .config import load_config
+    from .guard import (
+        _scoped_pidfile,
+        _scoped_lockfile,
+        _scoped_portfile,
+        _scoped_plist_label,
+        _scoped_plist_path,
+        _shadow_tag,
+    )
+    from .hooks import _make_mutable
+
+    config = load_config()
+    repo_root = config.repo_root
+    pidfile = _scoped_pidfile(repo_root, hardened)
+    lockfile = _scoped_lockfile(repo_root, hardened)
+    plist_label = _scoped_plist_label(repo_root)
+    plist_path = _scoped_plist_path(repo_root, hardened)
+    portfile = _scoped_portfile(repo_root, hardened)
+    shadow_tag = _shadow_tag(repo_root)
+
+    # Force cleanup mode: just remove all state files and exit
+    if force:
+        from .guard import DaemonManager
+        dm = DaemonManager(pidfile, lockfile)
+        dm.force_cleanup()
+        # Also clean up plist and shared port
+        if hardened:
+            try:
+                subprocess.run(["sudo", "rm", "-f", str(plist_path)], capture_output=True, timeout=10)
+                subprocess.run(["sudo", "rm", "-f", str(repo_root / ".guardian" / "guardian.control.port")], capture_output=True, timeout=10)
+            except Exception:
+                pass
+        else:
+            if plist_path.exists():
+                plist_path.unlink()
+            shared_port = repo_root / ".guardian" / "guardian.control.port"
+            if shared_port.exists():
+                shared_port.unlink()
+        print("Forced cleanup complete. All guardian state removed.")
+        return
+
+    guardian_killed = False
+    shadow_killed = False
+
+    # 1. Kill shadow processes first (they re-spawn the guardian)
+    if not hardened:
+        try:
+            r = subprocess.run(
+                ["pgrep", "-f", shadow_tag],
+                capture_output=True, text=True, timeout=5,
+            )
+            if r.returncode == 0:
+                pids = [int(p) for p in r.stdout.strip().splitlines() if p.strip()]
+                for pid in pids:
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                        shadow_killed = True
+                    except OSError:
+                        pass
+                if shadow_killed:
+                    print(f"  Killed {len(pids)} shadow process(es)")
+                time.sleep(0.2)
+        except Exception:
+            pass
+
+    # 2. Kill guardian via PID file
+    guardian_pid = None
+    if hardened:
+        try:
+            r = subprocess.run(
+                ["sudo", "cat", str(pidfile)],
+                capture_output=True, text=True, timeout=5,
+            )
+            if r.returncode == 0 and r.stdout.strip():
+                guardian_pid = int(r.stdout.strip())
+        except Exception:
+            pass
+    elif pidfile.exists():
+        try:
+            guardian_pid = int(pidfile.read_text().strip())
+        except (ValueError, OSError):
+            pass
+
+    if guardian_pid:
+        try:
+            if hardened:
+                r = subprocess.run(
+                    ["sudo", "kill", "-0", str(guardian_pid)],
+                    capture_output=True, timeout=5,
+                )
+                if r.returncode != 0:
+                    raise OSError("not running")
+                subprocess.run(
+                    ["sudo", "kill", str(guardian_pid)],
+                    capture_output=True, timeout=5,
+                )
+            else:
+                os.kill(guardian_pid, 0)  # check alive
+                os.kill(guardian_pid, signal.SIGTERM)
+            # Wait briefly so shutdown handler runs mark_clean_shutdown()
+            for _ in range(10):
+                try:
+                    if hardened:
+                        r = subprocess.run(
+                            ["sudo", "kill", "-0", str(guardian_pid)],
+                            capture_output=True, timeout=5,
+                        )
+                        if r.returncode != 0:
+                            break
+                    else:
+                        os.kill(guardian_pid, 0)
+                    time.sleep(0.2)
+                except OSError:
+                    break
+            else:
+                # Force kill if still alive
+                try:
+                    if hardened:
+                        subprocess.run(
+                            ["sudo", "kill", "-9", str(guardian_pid)],
+                            capture_output=True, timeout=5,
+                        )
+                    else:
+                        os.kill(guardian_pid, signal.SIGKILL)
+                except OSError:
+                    pass
+            guardian_killed = True
+            print(f"  Guardian PID {guardian_pid} stopped")
+        except OSError:
+            print(f"  Guardian PID {guardian_pid} not running (stale PID file)")
+
+    # 3. Kill any remaining deadpush guard processes not caught above
+    if not guardian_killed:
+        try:
+            pgrep_cmd = ["sudo", "pgrep"] if hardened else ["pgrep"]
+            r = subprocess.run(
+                pgrep_cmd + ["-f", "-x", r"python.*-m deadpush\.cli guard"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if r.returncode == 0:
+                pids = [int(p) for p in r.stdout.strip().splitlines() if p.strip()]
+                my_pid = os.getpid()
+                for pid in pids:
+                    if hardened or pid != my_pid:
+                        try:
+                            if hardened:
+                                subprocess.run(
+                                    ["sudo", "kill", str(pid)],
+                                    capture_output=True, timeout=5,
+                                )
+                            else:
+                                os.kill(pid, signal.SIGTERM)
+                            guardian_killed = True
+                        except OSError:
+                            pass
+                if guardian_killed:
+                    print(f"  Killed {len(pids)} remaining guardian process(es)")
+        except Exception:
+            pass
+
+    # 4. Launchctl bootout (unload plist, prevents re-spawn)
+    try:
+        if hardened:
+            r = subprocess.run(
+                ["sudo", "launchctl", "bootout", "system", plist_label],
+                capture_output=True, text=True, timeout=10,
+            )
+        else:
+            uid = os.getuid()
+            r = subprocess.run(
+                ["launchctl", "bootout", f"gui/{uid}/{plist_label}"],
+                capture_output=True, text=True, timeout=10,
+            )
+        if r.returncode == 0:
+            print("  launchd plist unloaded")
+        elif "not found" in r.stderr.lower() or "does not exist" in r.stderr.lower():
+            pass  # not loaded — fine
+        else:
+            print(f"  launchctl bootout: {r.stderr.strip()}")
+    except Exception:
+        pass
+
+    # 5. Remove the plist from LaunchAgents / LaunchDaemons
+    try:
+        if hardened:
+            r = subprocess.run(["sudo", "test", "-e", str(plist_path)], capture_output=True, timeout=5)
+            if r.returncode == 0:
+                subprocess.run(["sudo", "rm", str(plist_path)], capture_output=True, text=True, timeout=10)
+                print(f"  Removed {plist_path.name}")
+        elif plist_path.exists():
+            plist_path.unlink()
+            print(f"  Removed {plist_path.name}")
+    except OSError as e:
+        print(f"  Could not remove plist: {e}")
+
+    # 6. Clean up PID / lock / port files
+    for f in [pidfile, lockfile, portfile]:
+        try:
+            if hardened:
+                subprocess.run(["sudo", "rm", "-f", str(f)], capture_output=True, text=True, timeout=10)
+            elif f.exists():
+                f.unlink()
+        except OSError:
+            pass
+
+    # 6b. Clean up shared port file (hardened mode)
+    if hardened:
+        shared_port = repo_root / ".guardian" / "guardian.control.port"
+        try:
+            subprocess.run(["sudo", "rm", "-f", str(shared_port)], capture_output=True, text=True, timeout=10)
+        except OSError:
+            pass
+
+    # 7. Remove immutable flag from git hooks
+    try:
+        hooks_dir = config.repo_root / ".git" / "hooks"
+        if hooks_dir.exists():
+            for hook in hooks_dir.iterdir():
+                if hook.is_file() and not hook.name.endswith(".sample"):
+                    _make_mutable(hook)
+            print(f"  Removed immutable flag from hooks")
+    except Exception:
+        pass
+
+    # 8. Print summary
+    if guardian_killed or shadow_killed:
+        print("\nGuardian stopped. You can restart it later with:")
+        print("  deadpush protect")
+    else:
+        print("No guardian was running.")
 
 
 if __name__ == "__main__":

@@ -69,6 +69,13 @@ def print_error(message: str) -> None:
         print(f"❌ {message}")
 
 
+def print_info(message: str) -> None:
+    if RICH_AVAILABLE:
+        console.print(f"[bold blue]ℹ️  {message}[/bold blue]")
+    else:
+        print(f"ℹ️  {message}")
+
+
 def create_debris_table(debris: list[DebrisFile]) -> Table | str:
     if not RICH_AVAILABLE:
         return "\n".join([f"  - {d.path} ({d.category})" for d in debris])

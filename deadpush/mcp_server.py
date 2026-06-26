@@ -14,6 +14,8 @@ import difflib
 import json
 import re
 import sys
+import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
@@ -21,6 +23,7 @@ from typing import Any, Callable
 from .intercept import InterceptDaemon, GuardrailResult, Violation
 from .intercept import _run_guardrails, _check_sensitive_write, _check_destructive_changes, STAGING_DIR, FEEDBACK_DIR
 from .config import load_config
+from .guard import _scoped_suspend_file
 from .rules import RuntimeConfig
 
 
@@ -57,13 +60,34 @@ def _text(text: str) -> dict[str, Any]:
 class McpServer:
     """MCP server exposing all deadpush capabilities as agent-native tools."""
 
-    def __init__(self, repo_root: str | Path | None = None):
+    def __init__(self, repo_root: str | Path | None = None, danger_mode: bool = False):
         self.repo_root = Path(repo_root).resolve() if repo_root else Path.cwd().resolve()
         self.config = load_config(explicit_root=self.repo_root)
         self.runtime = RuntimeConfig(self.repo_root)
         self.daemon = InterceptDaemon(self.repo_root, self.config)
         self.daemon.runtime = self.runtime
         self._stdio_broken = False
+        self.danger_mode = danger_mode
+        self.suspend_file: Path | None = None
+        self.suspended = False
+
+    def _start_suspension_watch(self):
+        if self.suspend_file is None:
+            return
+        def _watch():
+            while not self.suspended:
+                try:
+                    if self.suspend_file and self.suspend_file.exists():
+                        self.suspended = True
+                        if not self._stdio_broken:
+                            print("Suspension file detected — shutting down MCP server.",
+                                  file=sys.stderr)
+                        break
+                except Exception:
+                    pass
+                time.sleep(10)
+        t = threading.Thread(target=_watch, daemon=True, name="mcp-suspension-watch")
+        t.start()
 
     # -----------------------------------------------------------------------
     # Feedback helpers
@@ -661,6 +685,9 @@ class McpServer:
             return _err(str(e))
 
     def _tool_quarantine_restore(self, args: dict[str, Any]) -> dict[str, Any]:
+        err = self._check_danger("restore a quarantined file")
+        if err:
+            return err
         name = args.get("name", "")
         if not name:
             return _err("name is required")
@@ -772,24 +799,43 @@ class McpServer:
         }, "Server running.")
 
     def _tool_get_safety_score(self, args: dict[str, Any]) -> dict[str, Any]:
-        pid_dir = Path.home() / ".deadpush"
-        log = pid_dir / "guardian.log"
+        # Check default and hardened log locations
+        candidates = [
+            Path.home() / ".deadpush" / "guardian.log",
+            Path("/var/db/deadpush/guardian.log"),
+        ]
         score = "No background guardian running (start with deadpush protect --daemon)"
-        if log.exists():
-            try:
-                lines = log.read_text(errors="ignore").strip().splitlines()[-20:]
-                for ln in reversed(lines):
-                    if "Safety" in ln or "Score:" in ln or "Status:" in ln:
-                        score = ln.strip()
-                        break
-            except Exception:
-                pass
+        for log in candidates:
+            if log.exists():
+                try:
+                    lines = log.read_text(errors="ignore").strip().splitlines()[-20:]
+                    for ln in reversed(lines):
+                        if "Safety" in ln or "Score:" in ln or "Status:" in ln:
+                            score = ln.strip()
+                            break
+                except Exception:
+                    pass
+                break
         return _ok({"safety_score": score}, "Safety score retrieved.")
 
     def _tool_get_runtime_config(self, args: dict[str, Any]) -> dict[str, Any]:
         return _ok(self.runtime.to_dict(), "Runtime configuration.")
 
+    def _check_danger(self, action: str) -> dict[str, Any] | None:
+        """Require danger mode for guardrail-softening actions. Returns error dict or None."""
+        if not self.danger_mode:
+            return _err(
+                f"Cannot {action} in normal mode — this weakens security.\n"
+                f"If you really need this, ask your user to run:\n"
+                f"  deadpush mcp --danger\n"
+                f"Then retry."
+            )
+        return None
+
     def _tool_add_allowed_pattern(self, args: dict[str, Any]) -> dict[str, Any]:
+        err = self._check_danger("add an allowed pattern")
+        if err:
+            return err
         pattern = args.get("pattern", "")
         desc = args.get("description", "")
         if not pattern:
@@ -801,6 +847,9 @@ class McpServer:
             return _err(f"Invalid regex: {e}")
 
     def _tool_remove_allowed_pattern(self, args: dict[str, Any]) -> dict[str, Any]:
+        err = self._check_danger("remove an allowed pattern")
+        if err:
+            return err
         pattern = args.get("pattern", "")
         if not pattern:
             return _err("pattern is required")
@@ -809,6 +858,9 @@ class McpServer:
         return _err(f"Pattern not found: {pattern}")
 
     def _tool_ignore_path(self, args: dict[str, Any]) -> dict[str, Any]:
+        err = self._check_danger("ignore a path")
+        if err:
+            return err
         path = args.get("path", "")
         if not path:
             return _err("path is required")
@@ -820,6 +872,14 @@ class McpServer:
         level = args.get("level", "")
         if not category or not level:
             return _err("category and level are required")
+        if level in ("off", "warn") and not self.danger_mode:
+            return _err(
+                f"Cannot set guardrail '{category}' to '{level}' in normal mode — this weakens security.\n"
+                f"Only hardening (warn → block, off → warn/block) is allowed.\n"
+                f"To soften, ask your user to run:\n"
+                f"  deadpush mcp --danger\n"
+                f"Then retry."
+            )
         try:
             self.runtime.set_guardrail_level(category, level)
             return _ok({"category": category, "level": level}, f"Guardrail '{category}' set to '{level}'.")
@@ -827,6 +887,9 @@ class McpServer:
             return _err(str(e))
 
     def _tool_reset_runtime_config(self, args: dict[str, Any]) -> dict[str, Any]:
+        err = self._check_danger("reset runtime config")
+        if err:
+            return err
         self.runtime.reset()
         return _ok({}, "Runtime config reset to defaults.")
 
@@ -878,6 +941,9 @@ class McpServer:
         import re
         self.runtime.add_allowed_pattern(re.escape(path) + "\\Z", f"Sensitive write bypass for {path}")
         return _ok({"path": path}, f"Sensitive write for '{path}' allowed. Added to allowlist.")
+        # Note: allow_sensitive_write is intentionally NOT danger-gated — it only
+        # allows writing to specific sensitive config paths, it doesn't disable
+        # security categories. The agent can opt into writing deploy.yml etc.
 
     def _tool_adjudicate_finding(self, args: dict[str, Any]) -> dict[str, Any]:
         category = args.get("category", "")
@@ -920,6 +986,9 @@ class McpServer:
         }, f"Finding presented for adjudication ({category}: {description[:60]}).")
 
     def _tool_learn_false_positive(self, args: dict[str, Any]) -> dict[str, Any]:
+        err = self._check_danger("teach a false positive pattern")
+        if err:
+            return err
         category = args.get("category", "")
         pattern = args.get("pattern", "")
         reason = args.get("reason", "")
@@ -1030,6 +1099,9 @@ class McpServer:
                 self._send(msg_id, None)
                 break
 
+            if self.suspended:
+                break
+
             if method:
                 result = self._handle_request(method, params)
                 if result is not None:
@@ -1049,10 +1121,30 @@ class McpServer:
             self._stdio_broken = True
 
 
-def run_mcp():
+def run_mcp(danger_mode: bool = False, hardened: bool = False):
     """Entry point for the MCP server (deadpush mcp)."""
     config = load_config()
-    server = McpServer(config.repo_root)
+
+    # Detect hardened guardian: if the shared port file exists under the repo,
+    # the guardian is running as _deadpush and state lives in /var/db/deadpush/.
+    # The --hardened flag can also be passed explicitly.
+    if hardened or (config.repo_root / ".guardian" / "guardian.control.port").exists():
+        hardened = True
+
+    # Check for suspension flag (set by guardian when score ≤ 5).
+    # In normal mode, refuse to start. Danger mode overrides.
+    suspend_file = _scoped_suspend_file(config.repo_root, hardened)
+    if suspend_file.exists() and not danger_mode:
+        reason = suspend_file.read_text(encoding="utf-8").strip()
+        print(f"❌ deadpush MCP is suspended.\n\n{reason}\n\n"
+              f"Your AI agent was blocked from weakening guardrails repeatedly.\n"
+              f"To re-enable MCP access, run:\n\n    deadpush mcp --danger\n\n"
+              f"This allows the agent to use MCP tools again.\n",
+              file=sys.stderr)
+        return
+    server = McpServer(config.repo_root, danger_mode=danger_mode)
+    server.suspend_file = suspend_file
+    server._start_suspension_watch()
     try:
         server.run()
     except KeyboardInterrupt:

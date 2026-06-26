@@ -484,6 +484,90 @@ def _apply_guardrail_level(result: GuardrailResult, violations: list[Violation],
         result.violations.extend(violations)
 
 
+# Extensions scanned by git hooks and unified enforcement
+_ENFORCEABLE_EXTENSIONS = frozenset({
+    ".py", ".js", ".ts", ".jsx", ".tsx", ".rs", ".go", ".java", ".rb", ".php",
+    ".sh", ".bash", ".yaml", ".yml", ".json", ".toml", ".md",
+})
+
+
+def enforce_content(
+    rel_path: str,
+    source: str,
+    config: DeadpushConfig,
+    runtime: RuntimeConfig | None = None,
+    *,
+    old_source: str | None = None,
+) -> GuardrailResult:
+    """Unified enforcement kernel for MCP, guardian, and git hooks.
+
+    Checks blocked filenames (case-insensitive), LLM context files, and all
+    content guardrails with runtime level overrides applied.
+    """
+    result = GuardrailResult()
+    rel = rel_path.replace("\\", "/")
+
+    if config.is_blocked(rel):
+        result.reject(Violation("blocked_file", f"File {rel} is blocked by config", 0, "critical"))
+        return result
+
+    from .debris import LLM_CONTEXT_FILES
+
+    name_lower = Path(rel).name.lower()
+    if name_lower in LLM_CONTEXT_FILES:
+        result.reject(Violation(
+            "debris",
+            f"Known LLM/AI coding assistant context file: {Path(rel).name}",
+            0,
+            "critical",
+        ))
+        return result
+
+    suffix = Path(rel).suffix.lower()
+
+    learned = _load_learned_patterns(config.repo_root)
+    suppressed_desc: set[str] = set()
+    for entry in learned.get("patterns", []):
+        if entry.get("pattern"):
+            suppressed_desc.add(entry["pattern"])
+
+    _apply_guardrail_level(result, _check_prompt_injection(source, runtime), runtime, "prompt_injection")
+    _apply_guardrail_level(result, _check_hardcoded_secrets(source, runtime, rel_path=rel), runtime, "secret")
+    _apply_guardrail_level(result, _check_security(source, runtime, rel_path=rel), runtime, "security")
+
+    result.violations = [v for v in result.violations if v.description not in suppressed_desc]
+
+    _apply_guardrail_level(result, _check_sensitive_write(source, rel, config, runtime), runtime, "sensitive")
+    destructive_level = runtime.get_guardrail_level("destructive") if runtime else "warn"
+    for v in _check_destructive_changes(source, rel, config.repo_root, runtime, _old_source=old_source):
+        if destructive_level == "block":
+            result.reject(v)
+        else:
+            result.violations.append(v)
+
+    _apply_guardrail_level(result, _check_debris_patterns(source, suffix, runtime), runtime, "debris")
+    _apply_guardrail_level(result, _check_layer_violations(source, rel, config, runtime), runtime, "layer")
+    _apply_guardrail_level(result, _check_dependency_integrity(source, rel, config.repo_root, runtime), runtime, "dependency")
+
+    return result
+
+
+def violations_from_result(rel_path: str, result: GuardrailResult) -> list[dict[str, Any]]:
+    """Flatten a GuardrailResult into violation dicts for git hook output."""
+    if result.allowed:
+        return []
+    return [
+        {
+            "file": rel_path,
+            "line": v.line,
+            "category": v.category,
+            "description": v.description,
+            "severity": v.severity,
+        }
+        for v in result.violations
+    ]
+
+
 def _run_guardrails(
     staged_path: Path,
     staging_dir: Path,
@@ -505,15 +589,15 @@ def _run_guardrails(
         _rel_path_override: Optional explicit relative path (bypasses staging_dir
                            computation for the real-time guardian).
     """
-    result = GuardrailResult()
-
     try:
         source = staged_path.read_text(encoding="utf-8", errors="ignore")
     except Exception:
+        result = GuardrailResult()
         result.reject(Violation("internal", "Could not read staged file", 0, "high"))
         return result
 
     rel = _rel_path_override if _rel_path_override is not None else _get_file_rel(staged_path, staging_dir)
+    result = enforce_content(rel, source, config, runtime, old_source=_old_source)
 
     # Compute diff
     if _old_source is not None:
@@ -535,39 +619,6 @@ def _run_guardrails(
             ))
         except Exception:
             result.diff = ""
-
-    suffix = Path(rel).suffix.lower()
-
-    # Suppress violations that match learned false positive patterns
-    learned = _load_learned_patterns(config.repo_root)
-    suppressed_desc: set[str] = set()
-    for entry in learned.get("patterns", []):
-        if entry.get("pattern"):
-            suppressed_desc.add(entry["pattern"])
-
-    # Security checks — level-aware (with path context for test/mock lowering)
-    _apply_guardrail_level(result, _check_prompt_injection(source, runtime), runtime, "prompt_injection")
-    _apply_guardrail_level(result, _check_hardcoded_secrets(source, runtime, rel_path=rel), runtime, "secret")
-    _apply_guardrail_level(result, _check_security(source, runtime, rel_path=rel), runtime, "security")
-
-    # Filter out learned false positive violations
-    result.violations = [v for v in result.violations if v.description not in suppressed_desc]
-
-    # Config / destructive checks
-    _apply_guardrail_level(result, _check_sensitive_write(source, rel, config, runtime), runtime, "sensitive")
-    destructive_level = runtime.get_guardrail_level("destructive") if runtime else "warn"
-    for v in _check_destructive_changes(source, rel, config.repo_root, runtime, _old_source=_old_source):
-        if destructive_level == "block":
-            result.reject(v)
-        else:
-            result.violations.append(v)
-
-    # Soft checks (warn level by default)
-    _apply_guardrail_level(result, _check_debris_patterns(source, suffix, runtime), runtime, "debris")
-    _apply_guardrail_level(result, _check_layer_violations(source, rel, config, runtime), runtime, "layer")
-
-    # Dependency integrity check
-    _apply_guardrail_level(result, _check_dependency_integrity(source, rel, config.repo_root, runtime), runtime, "dependency")
 
     return result
 

@@ -16,15 +16,16 @@ REPO_ROOT = str(Path(__file__).resolve().parent.parent)
 VENV_PY = str(Path(REPO_ROOT) / ".venv" / "bin" / "python3")
 
 
-def _spawn_mcp_server(repo_root: Path):
+def _spawn_mcp_server(repo_root: Path, *, danger: bool = False):
     """Launch MCP server as a subprocess and return stdin/stdout."""
+    danger_arg = "True" if danger else "False"
     proc = subprocess.Popen(
         [VENV_PY, "-c", f"""
 import sys, os
 sys.path.insert(0, {json.dumps(REPO_ROOT)})
 os.environ['PYTHONPATH'] = {json.dumps(REPO_ROOT)}
 from deadpush.mcp_server import McpServer
-server = McpServer()
+server = McpServer(repo_root=r'{repo_root}', danger_mode={danger_arg})
 server.run()
 """],
         stdin=subprocess.PIPE,
@@ -100,7 +101,7 @@ class TestMcpProtocol:
 
 class TestMcpConfigTools:
     def test_add_and_get_allowed_pattern(self, temp_repo):
-        proc = _spawn_mcp_server(temp_repo)
+        proc = _spawn_mcp_server(temp_repo, danger=True)
         try:
             _send(proc, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
             proc.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n")
@@ -124,7 +125,7 @@ class TestMcpConfigTools:
             proc.wait(timeout=5)
 
     def test_remove_allowed_pattern(self, temp_repo):
-        proc = _spawn_mcp_server(temp_repo)
+        proc = _spawn_mcp_server(temp_repo, danger=True)
         try:
             _send(proc, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
             proc.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n")
@@ -148,7 +149,7 @@ class TestMcpConfigTools:
             proc.wait(timeout=5)
 
     def test_set_guardrail_level(self, temp_repo):
-        proc = _spawn_mcp_server(temp_repo)
+        proc = _spawn_mcp_server(temp_repo, danger=True)
         try:
             _send(proc, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
             proc.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n")
@@ -168,7 +169,7 @@ class TestMcpConfigTools:
             proc.wait(timeout=5)
 
     def test_ignore_path(self, temp_repo):
-        proc = _spawn_mcp_server(temp_repo)
+        proc = _spawn_mcp_server(temp_repo, danger=True)
         try:
             _send(proc, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
             proc.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n")
@@ -183,7 +184,7 @@ class TestMcpConfigTools:
             proc.wait(timeout=5)
 
     def test_reset_runtime_config(self, temp_repo):
-        proc = _spawn_mcp_server(temp_repo)
+        proc = _spawn_mcp_server(temp_repo, danger=True)
         try:
             _send(proc, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
             proc.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n")

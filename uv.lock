@@ -75,7 +75,7 @@ wheels = [
 
 [[package]]
 name = "deadpush"
-version = "0.1.0"
+version = "0.2.1"
 source = { editable = "." }
 dependencies = [
     { name = "click" },
@@ -88,6 +88,7 @@ dependencies = [
     { name = "tree-sitter-python" },
     { name = "tree-sitter-rust" },
     { name = "tree-sitter-typescript" },
+    { name = "watchdog" },
 ]
 
 [package.optional-dependencies]
@@ -102,9 +103,6 @@ dev = [
 ]
 rich = [
     { name = "rich" },
-]
-watch = [
-    { name = "watchdog" },
 ]
 
 [package.metadata]
@@ -124,10 +122,10 @@ requires-dist = [
     { name = "tree-sitter-python", specifier = ">=0.23.0" },
     { name = "tree-sitter-rust", specifier = ">=0.23.0" },
     { name = "tree-sitter-typescript", specifier = ">=0.23.0" },
+    { name = "watchdog", specifier = ">=4.0.0" },
     { name = "watchdog", marker = "extra == 'dev'", specifier = ">=4.0.0" },
-    { name = "watchdog", marker = "extra == 'watch'", specifier = ">=4.0.0" },
 ]
-provides-extras = ["rich", "anthropic", "watch", "dev"]
+provides-extras = ["rich", "anthropic", "dev"]
 
 [[package]]
 name = "distro"

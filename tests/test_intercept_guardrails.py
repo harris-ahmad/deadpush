@@ -25,6 +25,7 @@ from deadpush.intercept import (
     _check_destructive_changes,
     _check_dependency_integrity,
     _run_guardrails,
+    enforce_content,
     STAGING_DIR,
     FEEDBACK_DIR,
     QUARANTINE_DIR,
@@ -254,6 +255,26 @@ class TestRunGuardrails:
         result = _run_guardrails(f, staging, config)
         # Should not crash — empty file should be clean
         assert result.allowed is True
+
+
+class TestEnforceContent:
+    def test_blocked_file_case_insensitive(self, temp_dir):
+        config = Config(repo_root=temp_dir)
+        result = enforce_content("CLAUDE.md", "# instructions\n", config)
+        assert result.allowed is False
+        assert any(v.category == "blocked_file" for v in result.violations)
+
+    def test_llm_context_filename_blocked(self, temp_dir):
+        config = Config(repo_root=temp_dir)
+        result = enforce_content("agents.md", "# agent rules\n", config)
+        assert result.allowed is False
+
+    def test_shell_execution_blocked(self, temp_dir):
+        config = Config(repo_root=temp_dir)
+        source = "import subprocess\nsubprocess.run('ls', shell=True)\n"
+        result = enforce_content("debug.py", source, config)
+        assert result.allowed is False
+        assert any(v.category == "security" for v in result.violations)
 
 
 # ======================================================================

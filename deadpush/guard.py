@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import atexit
 import fcntl
+import functools
+import hashlib
 import logging
 import os
 import signal
@@ -48,14 +50,14 @@ from urllib.parse import urlparse, parse_qs
 # =============================================================================
 # Logging
 # =============================================================================
-def setup_logging(log_file: Optional[Path] = None, level=logging.INFO, daemon: bool = False):
+def setup_logging(log_file: Optional[Path] = None, level=logging.INFO, daemon: bool = False, hardened: bool = False):
     """Setup logging.
 
     In daemon mode: ONLY file logging (headless/silent on stdout/stderr).
     Foreground: file + console.
     """
     if log_file is None:
-        log_file = Path.home() / ".deadpush" / "guardian.log"
+        log_file = _state_dir(hardened) / "guardian.log"
         log_file.parent.mkdir(parents=True, exist_ok=True)
 
     handlers = [logging.FileHandler(log_file)]
@@ -79,6 +81,8 @@ class DaemonManager:
     def __init__(self, pidfile: Path, lockfile: Optional[Path] = None):
         self.pidfile = pidfile
         self.lockfile = lockfile or pidfile.with_suffix(".lock")
+        self.startfile = pidfile.with_suffix(".start")
+        self.holderfile = pidfile.with_suffix(".holder")
         self.lock_fd = None
         self.logger = logging.getLogger("deadpush.guardian")
 
@@ -87,6 +91,10 @@ class DaemonManager:
         try:
             self.lock_fd = open(self.lockfile, "w")
             fcntl.flock(self.lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            # Store holder PID in lock file for diagnostics
+            self.lock_fd.seek(0)
+            self.lock_fd.write(str(os.getpid()))
+            self.lock_fd.flush()
             return True
         except (IOError, OSError):
             if self.lock_fd:
@@ -97,6 +105,10 @@ class DaemonManager:
         pid = os.getpid()
         with self.pidfile.open("w") as f:
             f.write(str(pid))
+        # Store process start time (monotonic nanoseconds since boot)
+        start_time = time.clock_gettime(time.CLOCK_MONOTONIC)
+        with self.startfile.open("w") as f:
+            f.write(str(start_time))
         self.logger.info(f"Daemon started with PID {pid}")
 
     def cleanup(self):
@@ -106,16 +118,37 @@ class DaemonManager:
                 self.lock_fd.close()
             except Exception:
                 pass
-        if self.pidfile.exists():
+        for f in (self.pidfile, self.lockfile, self.startfile, self.holderfile):
+            if f.exists():
+                try:
+                    f.unlink()
+                except Exception:
+                    pass
+
+    def force_cleanup(self):
+        """Force remove all daemon state files (for stale lock recovery)."""
+        for f in (self.pidfile, self.lockfile, self.startfile, self.holderfile):
+            if f.exists():
+                try:
+                    f.unlink()
+                except Exception:
+                    pass
+        if self.lock_fd:
             try:
-                self.pidfile.unlink()
+                self.lock_fd.close()
             except Exception:
                 pass
-        if self.lockfile.exists():
-            try:
-                self.lockfile.unlink()
-            except Exception:
-                pass
+        self.lock_fd = None
+
+    def get_holder_pid(self) -> Optional[int]:
+        """Get PID of current lock holder, if any."""
+        if not self.lockfile.exists():
+            return None
+        try:
+            with self.lockfile.open() as f:
+                return int(f.read().strip())
+        except (OSError, ValueError):
+            return None
 
     def is_running(self) -> bool:
         if not self.pidfile.exists():
@@ -124,9 +157,49 @@ class DaemonManager:
             with self.pidfile.open() as f:
                 pid = int(f.read().strip())
             os.kill(pid, 0)
-            return True
         except (OSError, ValueError):
             return False
+
+        # Verify process start time matches our recorded start time
+        # to prevent false positive from PID reuse
+        if not self.startfile.exists():
+            # No start time recorded (old PID file) - conservative: assume running
+            return True
+        try:
+            with self.startfile.open() as f:
+                recorded_start = float(f.read().strip())
+        except (OSError, ValueError):
+            return True
+
+        # Get actual process start time via ps
+        try:
+            r = subprocess.run(
+                ["ps", "-o", "etimes=", "-p", str(pid)],
+                capture_output=True, text=True, timeout=5,
+            )
+            if r.returncode != 0:
+                return False
+            elapsed = int(r.stdout.strip())
+            current_monotonic = time.clock_gettime(time.CLOCK_MONOTONIC)
+            actual_start = current_monotonic - elapsed
+            # Allow 2 second tolerance for clock resolution differences
+            if abs(actual_start - recorded_start) > 2:
+                return False
+        except Exception:
+            return True  # Conservative: assume running if check fails
+
+        # Additional verification: check command line contains deadpush
+        try:
+            r = subprocess.run(
+                ["ps", "-o", "command=", "-p", str(pid)],
+                capture_output=True, text=True, timeout=5,
+            )
+            if r.returncode == 0 and "deadpush" not in r.stdout:
+                return False
+        except Exception:
+            pass
+
+        return True
 
 
 # =============================================================================
@@ -280,6 +353,29 @@ class SessionSafetyScore:
         self.events_count = 0
         self.session_start = datetime.now()
         self.recent_paths: list[str] = []  # last ~10 distinct-ish paths touched
+
+    def mark_clean_shutdown(self):
+        """Mark clean shutdown so restart doesn't apply penalty.
+
+        Saves score with clean_shutdown=True. On next load, the penalty for
+        PID mismatch is skipped.
+        """
+        path = self._score_path()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            import json
+            data = {
+                "score": self.score,
+                "event_count": self.events_count,
+                "guardian_pid": os.getpid(),
+                "last_updated": datetime.now().isoformat(),
+                "clean_shutdown": True,
+            }
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            tmp.replace(path)
+        except Exception:
+            pass
 
     def report_incident(self, severity: int, reason: str, filepath: str = ""):
         now = datetime.now()
@@ -778,14 +874,17 @@ class GuardianControlServer:
     DEFAULT_PORT = 14242
     PORT_RANGE = 5  # try up to 5 ports
 
-    def __init__(self, guardian_handler, port: int | None = None):
+    def __init__(self, guardian_handler, port: int | None = None, repo_root: Path | None = None, hardened: bool = False):
         self.guardian_handler = guardian_handler
         self.requested_port = port or self.DEFAULT_PORT
         self.port = None
         self.httpd = None
         self.thread = None
         self.logger = logging.getLogger("deadpush.guardian")
-        self.port_file = Path.home() / ".deadpush" / "guardian.control.port"
+        if repo_root:
+            self.port_file = _scoped_portfile(repo_root, hardened)
+        else:
+            self.port_file = _state_dir(hardened) / "guardian.control.port"
 
     def start(self):
         if self.httpd:
@@ -854,10 +953,12 @@ class GuardianHandler(FileSystemEventHandler or object):
     - Block-level violations → quarantine + git restore + structured feedback
     """
 
-    def __init__(self, config, intervention: bool = True, strict_mode: bool = False, logger=None):
+    def __init__(self, config, intervention: bool = True, strict_mode: bool = False, daemon: bool = False, logger=None, hardened: bool = False):
         self.config = config
         self.intervention = intervention
         self.strict_mode = strict_mode
+        self.daemon = daemon
+        self.hardened = hardened
         self.logger = logger or logging.getLogger("deadpush.guardian")
         self.detector = DebrisDetector(config)
         self.quarantine = QuarantineManager(config.repo_root)
@@ -868,6 +969,9 @@ class GuardianHandler(FileSystemEventHandler or object):
         self.last_intervention_ts = 0.0
         self.cooldown_seconds = 0.5  # Aggressive but not spammy
 
+        # Shadow process (watching for crashes)
+        self.shadow_process: subprocess.Popen | None = None
+
     def on_created(self, event):
         if event.is_directory:
             return
@@ -877,6 +981,70 @@ class GuardianHandler(FileSystemEventHandler or object):
         if event.is_directory:
             return
         self._evaluate(Path(event.src_path), event_type="modified")
+
+    # ------------------------------------------------------------------
+    # Shadow process lifecycle
+    # ------------------------------------------------------------------
+    def _start_shadow(self):
+        if not self.daemon:
+            return
+        if self.shadow_process is not None and self._shadow_alive():
+            return
+        pidfile = _scoped_pidfile(self.config.repo_root, self.hardened)
+        respawn_cmd = [sys.executable, "-m", "deadpush.cli", "guard", "--daemon"]
+        proc = start_shadow_process(os.getpid(), pidfile, respawn_cmd, self.config.repo_root)
+        if proc is not None:
+            self.shadow_process = proc
+            self.logger.info("Shadow process started (will re-spawn guardian on crash)")
+
+    def _shadow_alive(self) -> bool:
+        if self.shadow_process is None:
+            return False
+        return self.shadow_process.poll() is None
+
+    def _check_shadow(self):
+        if not self.daemon:
+            return
+        if self.shadow_process is None:
+            self._start_shadow()
+        elif not self._shadow_alive():
+            self.logger.warning("Shadow process died, restarting...")
+            self._start_shadow()
+
+    # ------------------------------------------------------------------
+    # MCP suspension (disables agent's MCP access when score is critical)
+    # ------------------------------------------------------------------
+    def _suspend_mcp(self, reason: str):
+        """Write a suspension flag that the MCP server checks at startup."""
+        suspend_file = _scoped_suspend_file(self.config.repo_root, self.hardened)
+        try:
+            suspend_file.parent.mkdir(parents=True, exist_ok=True)
+            suspend_file.write_text(reason, encoding="utf-8")
+            self.logger.warning(f"MCP suspended: {reason}")
+        except Exception as e:
+            self.logger.error(f"Failed to write MCP suspension file: {e}")
+
+    def _unsuspend_mcp(self):
+        """Remove the suspension flag so MCP can start again."""
+        suspend_file = _scoped_suspend_file(self.config.repo_root, self.hardened)
+        try:
+            if suspend_file.exists():
+                suspend_file.unlink()
+                self.logger.info("MCP unsuspended")
+        except Exception as e:
+            self.logger.error(f"Failed to remove MCP suspension file: {e}")
+
+    def _check_suspension(self):
+        """Periodic check: suspend MCP if score <= 5, unsuspend if recovered."""
+        if self.safety_score.score <= 5:
+            suspend_file = _scoped_suspend_file(self.config.repo_root, self.hardened)
+            if not suspend_file.exists():
+                self._suspend_mcp(
+                    f"Safety score dropped to {self.safety_score.score}/100. "
+                    "Agent weakened guardrails repeatedly."
+                )
+        elif self.safety_score.score > 10:
+            self._unsuspend_mcp()
 
     # ------------------------------------------------------------------
     # Git helpers for old-source retrieval and file restoration
@@ -1110,20 +1278,221 @@ class GuardianHandler(FileSystemEventHandler or object):
 
 
 # =============================================================================
+# State directory management
+# =============================================================================
+
+_HARDENED_STATE_DIR = Path("/var/db/deadpush")
+
+
+def _state_dir(hardened: bool = False) -> Path:
+    """Get the state directory for a repo.
+    
+    Args:
+        hardened: If True, returns /var/db/deadpush (requires root/_deadpush).
+                  If False, returns ~/.deadpush (user-writable).
+    """
+    if hardened:
+        return _HARDENED_STATE_DIR
+    return Path.home() / ".deadpush"
+
+
+def _is_hardened(hardened: bool = False) -> bool:
+    """Check if running in hardened mode.
+    
+    Args:
+        hardened: Explicit hardened flag.
+    """
+    return hardened
+
+
+# =============================================================================
+# Repo-scoped resource helpers
+# =============================================================================
+@functools.lru_cache(maxsize=16)
+def _repo_id(repo_root: str) -> str:
+    """Short deterministic hash from repo root path."""
+    return hashlib.sha256(repo_root.encode()).hexdigest()[:12]
+
+
+def _scoped_pidfile(repo_root: Path, hardened: bool = False) -> Path:
+    return _state_dir(hardened) / f"guardian.{_repo_id(str(repo_root))}.pid"
+
+
+def _scoped_lockfile(repo_root: Path, hardened: bool = False) -> Path:
+    return _state_dir(hardened) / f"guardian.{_repo_id(str(repo_root))}.lock"
+
+
+def _scoped_portfile(repo_root: Path, hardened: bool = False) -> Path:
+    return _state_dir(hardened) / f"guardian.control.port.{_repo_id(str(repo_root))}"
+
+
+def _scoped_suspend_file(repo_root: Path, hardened: bool = False) -> Path:
+    return _state_dir(hardened) / f"mcp_suspended.{_repo_id(str(repo_root))}"
+
+
+def _scoped_plist_label(repo_root: Path) -> str:
+    return f"com.deadpush.guardian.{_repo_id(str(repo_root))}"
+
+
+def _scoped_plist_path(repo_root: Path, hardened: bool = False) -> Path:
+    if hardened:
+        return Path("/Library/LaunchDaemons") / f"com.deadpush.guardian.{_repo_id(str(repo_root))}.plist"
+    return Path.home() / "Library" / "LaunchAgents" / f"com.deadpush.guardian.{_repo_id(str(repo_root))}.plist"
+
+
+# =============================================================================
+# Shadow Process — Re-spawns guardian if it crashes
+# =============================================================================
+
+_SHADOW_SCRIPT = r"""import os, sys, time, signal, subprocess
+guardian_pid = int(sys.argv[1])
+pidfile = sys.argv[2]
+respawn_cmd = sys.argv[3:]
+shadow_pidfile = sys.argv[4]
+# TAG: {tag}
+
+def _handle_exit(signum, frame):
+    os._exit(0)
+
+signal.signal(signal.SIGTERM, _handle_exit)
+signal.signal(signal.SIGINT, _handle_exit)
+
+# Write our own PID file for coordination
+with open(shadow_pidfile, "w") as f:
+    f.write(str(os.getpid()))
+
+failure_count = 0
+base_backoff = 3
+max_backoff = 60
+max_failures = 10
+
+def _is_guardian_alive(pid):
+    # Check if guardian process is actually alive and is a deadpush process.
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    # Verify it's a deadpush process via ps
+    try:
+        r = subprocess.run(
+            ["ps", "-o", "command=", "-p", str(pid)],
+            capture_output=True, text=True, timeout=5,
+        )
+        return r.returncode == 0 and "deadpush" in r.stdout
+    except Exception:
+        return True  # Conservative: assume alive if check fails
+
+def _read_pidfile():
+    try:
+        with open(pidfile) as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+
+while True:
+    # Check if guardian is alive
+    if _is_guardian_alive(guardian_pid):
+        failure_count = 0
+        time.sleep(3)
+        continue
+
+    # Guardian appears dead - re-read PID file in case it was restarted
+    new_pid = _read_pidfile()
+    if new_pid and new_pid != guardian_pid and _is_guardian_alive(new_pid):
+        guardian_pid = new_pid
+        failure_count = 0
+        time.sleep(3)
+        continue
+
+    # Guardian is dead - attempt respawn
+    failure_count += 1
+    if failure_count > max_failures:
+        # Too many failures - exit to avoid spam
+        os._exit(1)
+
+    # Exponential backoff
+    backoff = min(base_backoff * (2 ** (failure_count - 1)), max_backoff)
+    time.sleep(backoff)
+
+    # Final check before respawning
+    if _is_guardian_alive(guardian_pid):
+        failure_count = 0
+        continue
+    new_pid = _read_pidfile()
+    if new_pid and new_pid != guardian_pid and _is_guardian_alive(new_pid):
+        guardian_pid = new_pid
+        failure_count = 0
+        continue
+
+    # Respawn guardian
+    pid = os.fork()
+    if pid == 0:
+        # Child: execute guardian
+        os.execvp(respawn_cmd[0], respawn_cmd)
+        os._exit(1)
+    else:
+        # Parent: update guardian_pid to new child
+        guardian_pid = pid
+"""
+
+_SHADOW_TAG_PREFIX = "deadpush_shadow_watch."
+
+
+def _shadow_tag(repo_root: Path) -> str:
+    return f"{_SHADOW_TAG_PREFIX}{_repo_id(str(repo_root))}"
+
+
+def start_shadow_process(guardian_pid: int, pidfile: Path, respawn_cmd: list[str], repo_root: Path) -> subprocess.Popen | None:
+    """Launch a shadow subprocess that re-spawns the guardian if it dies.
+
+    Only starts if no shadow is already running for this repo (checked via pgrep).
+    """
+    tag = _shadow_tag(repo_root)
+    shadow_pidfile = pidfile.with_suffix(".shadow")
+    try:
+        r = subprocess.run(
+            ["pgrep", "-f", tag],
+            capture_output=True, text=True, timeout=5,
+        )
+        if r.returncode == 0:
+            pids = [int(p) for p in r.stdout.strip().splitlines() if p.strip()]
+            # Filter out our own PID if we're somehow in the list
+            my_pid = os.getpid()
+            pids = [pid for pid in pids if pid != my_pid]
+            if pids:
+                return None  # already running
+    except Exception:
+        pass
+
+    script = _SHADOW_SCRIPT.replace("{tag}", tag)
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, "-c", script, str(guardian_pid), str(pidfile)] + respawn_cmd + [str(shadow_pidfile)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        return proc
+    except Exception as e:
+        return None
+
+
+# =============================================================================
 # Main Runner with Improved Daemon Support
 # =============================================================================
-def run_guardian(intervention: bool = True, daemon: bool = False, strict: bool = False):
+def run_guardian(intervention: bool = True, daemon: bool = False, strict: bool = False, hardened: bool = False):
     if not WATCHDOG_AVAILABLE:
         print("Error: watchdog package required. pip install deadpush[watch]")
         return
 
     config = load_config()
-    logger = setup_logging(daemon=daemon)
 
-    pid_dir = Path.home() / ".deadpush"
-    pid_dir.mkdir(parents=True, exist_ok=True)
-    pidfile = pid_dir / "guardian.pid"
-    lockfile = pid_dir / "guardian.lock"
+    logger = setup_logging(daemon=daemon, hardened=hardened)
+
+    _state_dir(hardened).mkdir(parents=True, exist_ok=True)
+    pidfile = _scoped_pidfile(config.repo_root, hardened)
+    lockfile = _scoped_lockfile(config.repo_root, hardened)
 
     daemon_mgr = DaemonManager(pidfile, lockfile)
 
@@ -1135,19 +1504,18 @@ def run_guardian(intervention: bool = True, daemon: bool = False, strict: bool =
         logger.error("Could not acquire lock. Another instance may be running.")
         return
 
-    handler = GuardianHandler(config, intervention=intervention, strict_mode=strict, logger=logger)
+    # Start shadow process (re-spawns guardian if it crashes)
+    # Not needed in hardened mode — launchd handles restart via KeepAlive
+    shadow_proc = None
+    if not hardened:
+        # We'll create handler after fork, but start shadow here since it runs
+        # in a new session and is immune to fork issues
+        pass  # Shadow will be started post-fork in the child
 
-    # Start the Local Control Interface so AI agents can query/interact autonomously
-    # (status, quarantine list, safety score, light analysis, safe restores).
-    # Works for both foreground `guard` and `--daemon`.
-    control_server = GuardianControlServer(handler)
-    control_server.start()
-    if control_server.port:
-        logger.info(f"Local control interface on http://127.0.0.1:{control_server.port} (port file: {control_server.port_file})")
-        logger.info("AI agents can now query the guardian autonomously (GET /status, /quarantine-list, etc.)")
-        atexit.register(control_server.stop)
-    else:
-        logger.warning("Local control interface could not be started (agents can fall back to `deadpush status` / CLI)")
+    # Create the Local Control Interface object (don't start it yet)
+    # We'll create the handler and control_server after fork to avoid
+    # FD/thread inheritance issues
+    control_server = None
 
     if daemon:
         logger.info("Starting in DAEMON mode...")
@@ -1161,8 +1529,7 @@ def run_guardian(intervention: bool = True, daemon: bool = False, strict: bool =
             os.chdir("/")
             os.umask(0)
 
-            # Headless daemon: ensure no stray output to terminal (even if stdio inherited).
-            # Logging is already file-only because daemon=True was passed to setup_logging.
+            # Headless daemon: ensure no stray output to terminal
             try:
                 sys.stdout.flush()
                 sys.stderr.flush()
@@ -1172,8 +1539,31 @@ def run_guardian(intervention: bool = True, daemon: bool = False, strict: bool =
                 os.dup2(devnull.fileno(), sys.stdout.fileno())
                 os.dup2(devnull.fileno(), sys.stderr.fileno())
 
+            # Close all inherited FDs except stdio (0,1,2)
+            import resource
+            max_fd = resource.getrlimit(resource.RLIMIT_NOFILE)[0]
+            if max_fd == resource.RLIM_INFINITY:
+                max_fd = 1024
+            for fd in range(3, max_fd):
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+
             daemon_mgr.write_pid()
             atexit.register(daemon_mgr.cleanup)
+
+            # NOW create handler and control_server with fresh logging
+            logger = setup_logging(daemon=True, hardened=hardened)
+            handler = GuardianHandler(config, intervention=intervention, strict_mode=strict, daemon=daemon, logger=logger, hardened=hardened)
+            control_server = GuardianControlServer(handler, repo_root=config.repo_root, hardened=hardened)
+
+            # Start shadow process in the final daemon process (post-fork)
+            if not hardened:
+                handler._start_shadow()
+
+            # Start control server in the final daemon process (post-fork)
+            _start_control_server(control_server, logger, config.repo_root, hardened)
 
             _run_observer(handler, logger)
         except Exception as e:
@@ -1183,7 +1573,37 @@ def run_guardian(intervention: bool = True, daemon: bool = False, strict: bool =
         logger.info("Starting in FOREGROUND mode...")
         daemon_mgr.write_pid()
         atexit.register(daemon_mgr.cleanup)
+
+        handler = GuardianHandler(config, intervention=intervention, strict_mode=strict, daemon=daemon, logger=logger, hardened=hardened)
+        control_server = GuardianControlServer(handler, repo_root=config.repo_root, hardened=hardened)
+
+        # Start shadow process
+        if not hardened:
+            handler._start_shadow()
+
+        _start_control_server(control_server, logger, config.repo_root, hardened)
+
         _run_observer(handler, logger)
+
+
+def _start_control_server(control_server, logger, repo_root, hardened):
+    """Start the local HTTP control interface and log its status.
+    Safe to call after daemon fork (no threading before fork)."""
+    control_server.start()
+    if control_server.port:
+        logger.info(f"Local control interface on http://127.0.0.1:{control_server.port} (port file: {control_server.port_file})")
+        logger.info("AI agents can now query the guardian autonomously (GET /status, /quarantine-list, etc.)")
+        atexit.register(control_server.stop)
+        if hardened:
+            try:
+                shared_port = repo_root / ".guardian" / "guardian.control.port"
+                shared_port.parent.mkdir(parents=True, exist_ok=True)
+                shared_port.write_text(str(control_server.port))
+                atexit.register(lambda p=shared_port: p.unlink(missing_ok=True))
+            except Exception:
+                pass
+    else:
+        logger.warning("Local control interface could not be started (agents can fall back to `deadpush status` / CLI)")
 
 
 def _run_observer(handler: GuardianHandler, logger):
@@ -1201,6 +1621,10 @@ def _run_observer(handler: GuardianHandler, logger):
 
     def shutdown(signum, frame):
         logger.info("Guardian shutting down gracefully...")
+        try:
+            handler.safety_score.mark_clean_shutdown()
+        except Exception:
+            pass
         if 'observer' in locals() and observer:
             try:
                 observer.stop()
@@ -1229,7 +1653,9 @@ def _run_observer(handler: GuardianHandler, logger):
                     logger.info(f"Safety Score: {handler.safety_score.get_summary()}")
                     backoff = 1  # reset on healthy start
 
-                time.sleep(2)
+                handler._check_shadow()
+                handler._check_suspension()
+                time.sleep(1)
             except Exception as e:
                 logger.error(f"Watcher error (auto-recovering in {backoff}s): {e}")
                 if observer:
@@ -1272,13 +1698,14 @@ def _run_observer(handler: GuardianHandler, logger):
 # Basic Auto-Start Support (systemd user / launchd)
 # Called / documented from protect for "survive reboots with minimal intervention"
 # =============================================================================
-def setup_autostart(repo_root: Path) -> str:
+def setup_autostart(repo_root: Path, hardened: bool = False) -> str:
     """Generate OS-specific auto-start configuration for the guardian daemon.
 
     This helps fulfill "survive across sessions/reboots with minimal user intervention".
 
-    - On Linux: writes ~/.config/systemd/user/deadpush-guardian.service
-    - On macOS: writes ~/Library/LaunchAgents/com.deadpush.guardian.plist
+    - On Linux: writes ~/.config/systemd/user/deadpush-guardian.<repoid>.service
+    - On macOS: writes ~/Library/LaunchAgents/com.deadpush.guardian.<repoid>.plist
+    - In hardened mode: writes to system paths for the _deadpush user.
 
     Returns a string with the file path + exact commands the user should run to enable it.
     Safe to call multiple times (idempotent overwrite).
@@ -1286,66 +1713,86 @@ def setup_autostart(repo_root: Path) -> str:
     """
     import sys as _sys
     home = Path.home()
-    exe = _sys.executable  # use the exact python that has deadpush installed
+    exe = _sys.executable
+    rid = _repo_id(str(repo_root))
 
     if _sys.platform.startswith("linux"):
-        unit_dir = home / ".config" / "systemd" / "user"
-        unit_dir.mkdir(parents=True, exist_ok=True)
-        unit_path = unit_dir / "deadpush-guardian.service"
+        if hardened:
+            unit_dir = Path("/etc/systemd/system")
+            unit_dir.mkdir(parents=True, exist_ok=True)
+            user_part = ""
+            env_line = f'Environment="PATH=/usr/local/bin:/usr/bin:/bin:{home}/.local/bin"'
+            wanted_by = "multi-user.target"
+        else:
+            unit_dir = home / ".config" / "systemd" / "user"
+            unit_dir.mkdir(parents=True, exist_ok=True)
+            user_part = "--user"
+            env_line = f'Environment="PATH=/usr/local/bin:/usr/bin:/bin:{home}/.local/bin"'
+            wanted_by = "default.target"
+        unit_path = unit_dir / f"deadpush-guardian.{rid}.service"
         content = f"""[Unit]
-Description=deadpush AI Agent Guardian - persistent background protection for vibe coding
+Description=deadpush AI Agent Guardian ({rid}) - persistent background protection
 After=network.target
 
 [Service]
 Type=simple
-ExecStart={exe} -m deadpush.cli guard --daemon
+ExecStart={exe} -m deadpush.cli guard --daemon{' --hardened' if hardened else ''}
 Restart=always
 RestartSec=5
 WorkingDirectory={repo_root}
-# Nice low priority so it doesn't interfere with agents
 Nice=10
-# Inherit PATH so 'deadpush' etc work if needed
-Environment="PATH=/usr/local/bin:/usr/bin:/bin:{home}/.local/bin"
+{env_line}
+{'User=_deadpush' if hardened else ''}
 
 [Install]
-WantedBy=default.target
+WantedBy={wanted_by}
 """
         unit_path.write_text(content)
-        return f"""Linux systemd --user unit written:
+        return f"""Linux{' systemd system' if hardened else ' systemd --user'} unit written:
   {unit_path}
 
-To enable auto-start on login / reboot (run these once):
-  systemctl --user daemon-reload
-  systemctl --user enable --now deadpush-guardian.service
+To enable auto-start{' on boot' if hardened else ' on login / reboot'} (run these once):
+  systemctl{'' if hardened else ' --user'} daemon-reload
+  systemctl{'' if hardened else ' --user'} enable --now deadpush-guardian.{rid}.service
 
 Useful commands:
-  systemctl --user status deadpush-guardian.service
-  journalctl --user -u deadpush-guardian -f   # live logs (file logs also at ~/.deadpush/guardian.log)
-  systemctl --user stop deadpush-guardian.service
+  systemctl{'' if hardened else ' --user'} status deadpush-guardian.{rid}.service
+  journalctl{'' if hardened else ' --user'} -u deadpush-guardian.{rid} -f
+  systemctl{'' if hardened else ' --user'} stop deadpush-guardian.{rid}.service
 """
 
     elif _sys.platform == "darwin":
-        plist_dir = home / "Library" / "LaunchAgents"
-        plist_dir.mkdir(parents=True, exist_ok=True)
-        plist_path = plist_dir / "com.deadpush.guardian.plist"
-        log_dir = home / ".deadpush"
+        plist_label = _scoped_plist_label(repo_root)
+        plist_path = _scoped_plist_path(repo_root, hardened)
+        log_dir = _state_dir(hardened)
         log_dir.mkdir(parents=True, exist_ok=True)
+        hardened_args = ""
+        user_name = ""
+        if hardened:
+            hardened_args = "\n        <string>--hardened</string>"
+            user_name = """    <key>UserName</key>
+    <string>_deadpush</string>
+"""
         content = f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.deadpush.guardian</string>
+    <string>{plist_label}</string>
     <key>ProgramArguments</key>
     <array>
         <string>{exe}</string>
         <string>-m</string>
         <string>deadpush.cli</string>
         <string>guard</string>
-        <string>--daemon</string>
+        <string>--daemon</string>{hardened_args}
     </array>
     <key>WorkingDirectory</key>
-    <string>{repo_root}</string>
+    <string>{repo_root}</string>{user_name}
+    <key>WatchPaths</key>
+    <array>
+        <string>{repo_root}/.git/HEAD</string>
+    </array>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
@@ -1356,23 +1803,23 @@ Useful commands:
     <key>ThrottleInterval</key>
     <integer>10</integer>
     <key>StandardOutPath</key>
-    <string>{log_dir}/guardian.launchd.out.log</string>
+    <string>{log_dir}/guardian.{rid}.launchd.out.log</string>
     <key>StandardErrorPath</key>
-    <string>{log_dir}/guardian.launchd.err.log</string>
+    <string>{log_dir}/guardian.{rid}.launchd.err.log</string>
 </dict>
 </plist>
 """
         plist_path.write_text(content)
-        return f"""macOS launchd plist written:
+        return f"""macOS{' LaunchDaemon' if hardened else ' LaunchAgent'} plist written:
   {plist_path}
 
-To load (start now + on login/reboot):
-  launchctl load {plist_path}
+To load (start now + on{' boot' if hardened else ' login/reboot'}):
+  {'sudo launchctl load -w' if hardened else 'launchctl load'} {plist_path}
 
 To unload / stop:
-  launchctl unload {plist_path}
+  {'sudo launchctl unload -w' if hardened else 'launchctl unload'} {plist_path}
 
-Logs: tail -f {log_dir}/guardian.launchd.*.log
+Logs: tail -f {log_dir}/guardian.{rid}.launchd.*.log
 (Also file logs at {log_dir}/guardian.log )
 """
 
@@ -1384,3 +1831,123 @@ You can still achieve "survive reboot" by:
   - Or cron with @reboot (advanced).
 See `deadpush guard --daemon` for the core persistent mode.
 """
+
+
+# =============================================================================
+# Hardened environment setup (privilege separation)
+# =============================================================================
+def setup_hardened_environment(repo_root: Path, auto_load: bool = True) -> str:
+    """One-time sudo setup for hardened mode: create _deadpush user, state
+    directory, repo ACLs, install daemon plist, and load it.
+
+    Uses ``sudo`` for every privileged operation. The user will be prompted
+    for their password once (then cached for 5 minutes on macOS).
+
+    Returns a multi-line summary of what was done.
+    """
+    import os
+    import pwd
+    import grp
+    import subprocess
+    import sys as _sys
+
+    lines = []
+
+    def _sudo(cmd, check=True, timeout=60):
+        full = ["sudo"] + cmd
+        r = subprocess.run(full, capture_output=True, text=True, timeout=timeout)
+        if check and r.returncode != 0:
+            raise RuntimeError(f"{' '.join(full)} failed: {r.stderr.strip()}")
+        return r
+
+    # 1. Create _deadpush group (dedicated, minimal privileges)
+    try:
+        grp.getgrnam("_deadpush")
+        lines.append("Group _deadpush already exists")
+    except KeyError:
+        if _sys.platform == "darwin":
+            _sudo(["dscl", ".", "-create", "/Groups/_deadpush", "PrimaryGroupID", "499"])
+            lines.append("Created _deadpush group (GID 499)")
+        else:
+            _sudo(["groupadd", "--system", "_deadpush"])
+            lines.append("Created _deadpush system group")
+
+    # 2. Create _deadpush user (platform-specific)
+    try:
+        pwd.getpwnam("_deadpush")
+        lines.append("User _deadpush already exists")
+    except KeyError:
+        if _sys.platform == "darwin":
+            _sudo([
+                "dscl", ".", "-create", "/Users/_deadpush",
+                "UniqueID", "499",
+                "PrimaryGroupID", "499",  # Use _deadpush group, not wheel
+                "NFSHomeDirectory", "/var/empty",
+                "UserShell", "/usr/bin/false",
+                "RealName", "deadpush Guardian",
+            ])
+            lines.append("Created _deadpush user (UID 499, system account)")
+        else:
+            _sudo([
+                "useradd", "--system", "--no-create-home",
+                "--shell", "/usr/sbin/nologin",
+                "--home-dir", "/var/empty",
+                "--gid", "_deadpush",
+                "_deadpush",
+            ])
+            lines.append("Created _deadpush system user")
+
+    # 3. Create state directory
+    state = _HARDENED_STATE_DIR
+    _sudo(["mkdir", "-p", str(state)])
+    _sudo(["chown", "_deadpush:_deadpush", str(state)])
+    _sudo(["chmod", "0700", str(state)])
+    lines.append(f"Created state dir {state}")
+
+    # 4. Set ACL on repo so _deadpush can read the tree
+    if _sys.platform == "darwin":
+        r = _sudo(
+            ["chmod", "+a",
+             f"_deadpush allow list,readattr,readsecurity,search,read,readattr,readextattr,file_inherit,directory_inherit",
+             str(repo_root)],
+            check=False, timeout=15,
+        )
+        if r.returncode == 0:
+            lines.append(f"Granted _deadpush read access to {repo_root} (ACL)")
+
+        guardian_dir = repo_root / ".guardian"
+        guardian_dir.mkdir(parents=True, exist_ok=True)
+        _sudo([
+            "chmod", "+a",
+            f"_deadpush allow write,append,add_file,add_subdirectory,delete_child,file_inherit,directory_inherit",
+            str(guardian_dir),
+        ])
+        lines.append(f"Granted _deadpush write access to {guardian_dir} (ACL)")
+    else:
+        _sudo(["setfacl", "-R", "-m", "u:_deadpush:rx", str(repo_root)])
+        guardian_dir = repo_root / ".guardian"
+        guardian_dir.mkdir(parents=True, exist_ok=True)
+        _sudo(["setfacl", "-R", "-m", "u:_deadpush:rwx", str(guardian_dir)])
+        lines.append("Set ACLs via setfacl")
+
+    # 5. Write plist / systemd unit in hardened mode
+    autostart_info = setup_autostart(repo_root, hardened=True)
+    _ = autostart_info  # we already wrote the unit, just use it
+    lines.append("Generated daemon configuration")
+
+    # 6. Load the daemon
+    if auto_load:
+        if _sys.platform == "darwin":
+            plist_path = _scoped_plist_path(repo_root, hardened=True)
+            _sudo(["launchctl", "load", "-w", str(plist_path)])
+            lines.append(f"Loaded launchd daemon: {plist_path}")
+        elif _sys.platform.startswith("linux"):
+            rid = _repo_id(str(repo_root))
+            _sudo(["systemctl", "daemon-reload"])
+            _sudo(["systemctl", "enable", "--now", f"deadpush-guardian.{rid}.service"])
+            lines.append("Enabled and started systemd service")
+
+    lines.append("")
+    lines.append("Hardened mode setup complete.")
+    lines.append("The guardian now runs as _deadpush — the AI agent cannot kill or modify it.")
+    return "\n".join(lines)

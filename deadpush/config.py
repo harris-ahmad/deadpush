@@ -171,14 +171,18 @@ class Config:
         return pathspec.PathSpec.from_lines("gitwildmatch", patterns)
 
     def is_blocked(self, rel_path: str) -> bool:
-        """Check if a relative file path matches any blocked file/pattern."""
+        """Check if a relative file path matches any blocked file/pattern.
+
+        Case-insensitive (matches across platforms and agent casing whims).
+        """
         rp = rel_path.replace("\\", "/")
         name = Path(rp).name
-        if name in self.block.blocked_files:
+        if name.lower() in (b.lower() for b in self.block.blocked_files):
             return True
         from fnmatch import fnmatch
         for pat in self.block.blocked_patterns:
-            if fnmatch(rp, pat) or fnmatch(name, pat):
+            pat_lower = pat.lower()
+            if fnmatch(rp.lower(), pat_lower) or fnmatch(name.lower(), pat_lower):
                 return True
         return False
 

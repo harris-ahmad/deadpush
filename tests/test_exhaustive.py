@@ -57,6 +57,34 @@ server.run()
         proc.kill()
 
 
+@pytest.fixture
+def mcp_danger_proc(temp_repo: Path) -> Generator[subprocess.Popen, None, None]:
+    """MCP server with danger_mode enabled (for config-softening tool tests)."""
+    proc = subprocess.Popen(
+        [VENV_PY, "-u", "-c", f"""
+import sys, os
+sys.path.insert(0, {json.dumps(REPO_ROOT)})
+os.environ['PYTHONPATH'] = {json.dumps(REPO_ROOT)}
+from deadpush.mcp_server import McpServer
+server = McpServer(repo_root=r'{temp_repo}', danger_mode=True)
+server.run()
+"""],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        cwd=str(temp_repo),
+    )
+    _send(proc, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+    _write_raw(proc, {"jsonrpc": "2.0", "method": "notifications/initialized"})
+    yield proc
+    try:
+        _send(proc, {"jsonrpc": "2.0", "id": 999, "method": "shutdown", "params": {}})
+        proc.wait(timeout=5)
+    except Exception:
+        proc.kill()
+
+
 def _send(proc: subprocess.Popen, msg: dict[str, Any]) -> dict[str, Any]:
     """Send JSON-RPC message and read one response line (for request-type msgs)."""
     line = json.dumps(msg) + "\n"
@@ -449,10 +477,10 @@ class TestLearningLoop:
         assert "scoring" in data
         assert "certainty_levels" in data["scoring"]
 
-    def test_learn_false_positive_persists(self, mcp_proc, temp_repo):
+    def test_learn_false_positive_persists(self, mcp_danger_proc, temp_repo):
         """learn_false_positive stores pattern → subsequent matching is suppressed."""
         # Learn that 'safe_eval' is a false positive
-        resp = _call(mcp_proc, "learn_false_positive", {
+        resp = _call(mcp_danger_proc, "learn_false_positive", {
             "category": "security",
             "pattern": "safe_eval",
             "reason": "safe_eval is a test helper that validates input before eval",
@@ -467,7 +495,7 @@ class TestLearningLoop:
         assert any("safe_eval" in p["pattern"] for p in data["patterns"])
 
         # Write a file with 'safe_eval' — should be suppressed
-        resp = _call(mcp_proc, "write_file", {"path": "src/learned_test.py", "content": "safe_eval(user_input)\n"})
+        resp = _call(mcp_danger_proc, "write_file", {"path": "src/learned_test.py", "content": "safe_eval(user_input)\n"})
         result = _assert_ok(resp)
         # If suppression works, there should be no security violation for this
         security_vs = [v for v in result["violations"] if v["category"] == "security"]
@@ -622,44 +650,44 @@ class TestConfigurationTools:
         assert "guardrail_levels" in data
         assert "ignored_paths" in data
 
-    def test_add_allowed_pattern(self, mcp_proc):
-        resp = _call(mcp_proc, "add_allowed_pattern", {"pattern": "safe_eval_data"})
+    def test_add_allowed_pattern(self, mcp_danger_proc):
+        resp = _call(mcp_danger_proc, "add_allowed_pattern", {"pattern": "safe_eval_data"})
         _assert_ok(resp)
-        resp = _call(mcp_proc, "get_runtime_config", {})
+        resp = _call(mcp_danger_proc, "get_runtime_config", {})
         data = _assert_ok(resp)
         patterns = [p["pattern"] for p in data["allowed_patterns"]]
         assert "safe_eval_data" in patterns
 
-    def test_remove_allowed_pattern(self, mcp_proc):
-        _call(mcp_proc, "add_allowed_pattern", {"pattern": "temp_pat"})
-        resp = _call(mcp_proc, "remove_allowed_pattern", {"pattern": "temp_pat"})
+    def test_remove_allowed_pattern(self, mcp_danger_proc):
+        _call(mcp_danger_proc, "add_allowed_pattern", {"pattern": "temp_pat"})
+        resp = _call(mcp_danger_proc, "remove_allowed_pattern", {"pattern": "temp_pat"})
         _assert_ok(resp)
-        resp = _call(mcp_proc, "get_runtime_config", {})
+        resp = _call(mcp_danger_proc, "get_runtime_config", {})
         data = _assert_ok(resp)
         patterns = {p["pattern"] for p in data["allowed_patterns"]}
         assert "temp_pat" not in patterns
 
-    def test_ignore_path(self, mcp_proc):
-        resp = _call(mcp_proc, "ignore_path", {"path": "generated/"})
+    def test_ignore_path(self, mcp_danger_proc):
+        resp = _call(mcp_danger_proc, "ignore_path", {"path": "generated/"})
         _assert_ok(resp)
-        resp = _call(mcp_proc, "get_runtime_config", {})
+        resp = _call(mcp_danger_proc, "get_runtime_config", {})
         data = _assert_ok(resp)
         assert "generated/" in data.get("ignored_paths", [])
 
-    def test_set_guardrail_level_and_reset(self, mcp_proc):
+    def test_set_guardrail_level_and_reset(self, mcp_danger_proc):
         # Set debris to off
-        resp = _call(mcp_proc, "set_guardrail_level", {"category": "debris", "level": "off"})
+        resp = _call(mcp_danger_proc, "set_guardrail_level", {"category": "debris", "level": "off"})
         _assert_ok(resp)
 
-        resp = _call(mcp_proc, "get_runtime_config", {})
+        resp = _call(mcp_danger_proc, "get_runtime_config", {})
         data = _assert_ok(resp)
         assert data["guardrail_levels"]["debris"] == "off"
 
         # Reset
-        resp = _call(mcp_proc, "reset_runtime_config", {})
+        resp = _call(mcp_danger_proc, "reset_runtime_config", {})
         _assert_ok(resp)
 
-        resp = _call(mcp_proc, "get_runtime_config", {})
+        resp = _call(mcp_danger_proc, "get_runtime_config", {})
         data = _assert_ok(resp)
         assert data["guardrail_levels"]["debris"] != "off" or data["guardrail_levels"] is not None
 
@@ -684,14 +712,14 @@ class TestQuarantine:
             entries = list(quarantine_dir.iterdir())
             assert len(entries) >= 0  # At minimum doesn't crash
 
-    def test_quarantine_lifecycle(self, mcp_proc, temp_repo):
+    def test_quarantine_lifecycle(self, mcp_danger_proc, temp_repo):
         """Full quarantine lifecycle: block → list → restore → verify restored."""
         # Block a file
-        _call(mcp_proc, "write_file", {"path": "src/lifecycle.py", "content": "eval('x')\n"})
+        _call(mcp_danger_proc, "write_file", {"path": "src/lifecycle.py", "content": "eval('x')\n"})
         time.sleep(0.3)
 
         # List quarantine — should find our entry
-        resp = _call(mcp_proc, "quarantine_list", {"limit": 20})
+        resp = _call(mcp_danger_proc, "quarantine_list", {"limit": 20})
         data = _assert_ok(resp)
         assert len(data["entries"]) > 0
 
@@ -703,7 +731,7 @@ class TestQuarantine:
                 break
         if entry is not None:
             name = entry.get("quarantined_name", entry.get("name", ""))
-            resp = _call(mcp_proc, "quarantine_restore", {"name": name})
+            resp = _call(mcp_danger_proc, "quarantine_restore", {"name": name})
             _assert_ok(resp)
             # Original file should be restored from git
             original = temp_repo / "src" / "lifecycle.py"
@@ -812,9 +840,9 @@ class TestEdgeCases:
         data2 = _assert_ok(resp2)
         assert "feedback" in data2 or "entries" in data2
 
-    def test_invalid_regex_pattern_error(self, mcp_proc):
+    def test_invalid_regex_pattern_error(self, mcp_danger_proc):
         """add_allowed_pattern with invalid regex returns error."""
-        resp = _call(mcp_proc, "add_allowed_pattern", {"pattern": "[invalid", "description": "bad"})
+        resp = _call(mcp_danger_proc, "add_allowed_pattern", {"pattern": "[invalid", "description": "bad"})
         assert resp["success"] is False
         assert "Invalid regex" in resp.get("error", "")
 

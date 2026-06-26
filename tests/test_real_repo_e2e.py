@@ -87,6 +87,34 @@ server.run()
         proc.kill()
 
 
+@pytest.fixture(scope="module")
+def mcp_danger(real_repo: Path) -> Generator[subprocess.Popen, None, None]:
+    """MCP server with danger_mode for tests that soften guardrails."""
+    proc = subprocess.Popen(
+        [VENV_PY, "-u", "-c", f"""
+import sys, os
+sys.path.insert(0, {json.dumps(REPO_ROOT)})
+os.environ['PYTHONPATH'] = {json.dumps(REPO_ROOT)}
+from deadpush.mcp_server import McpServer
+server = McpServer(repo_root=r'{real_repo}', danger_mode=True)
+server.run()
+"""],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        cwd=str(real_repo),
+    )
+    _send(proc, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+    _write_raw(proc, {"jsonrpc": "2.0", "method": "notifications/initialized"})
+    yield proc
+    try:
+        _send(proc, {"jsonrpc": "2.0", "id": 999, "method": "shutdown", "params": {}})
+        proc.wait(timeout=5)
+    except Exception:
+        proc.kill()
+
+
 # ======================================================================
 # Helpers
 # ======================================================================
@@ -429,9 +457,9 @@ class TestLearningLoop:
         assert "adjudication_prompt" in data
         assert "scoring" in data
 
-    def test_learn_false_positive_persists(self, mcp, real_repo):
+    def test_learn_false_positive_persists(self, mcp_danger, real_repo):
         """Learn a pattern → written to disk → future suppression."""
-        resp = _call(mcp, "learn_false_positive", {
+        resp = _call(mcp_danger, "learn_false_positive", {
             "category": "security",
             "pattern": "safeEval is a sandboxed evaluator",
             "reason": "safeEval function is wrapped and validates input before evaluation",

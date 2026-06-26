@@ -50,7 +50,7 @@ class DebrisEventHandler(FileSystemEventHandler):
         code_exts = get_supported_extensions()
         if path.suffix.lower() not in code_exts | {".md", ".txt", ".env", ".toml", ".yaml", ".yml", ".json"}:
             return
-        if any(x in str(path) for x in ["__pycache__", ".git", "node_modules", ".deadpush-archive"]):
+        if any(x in str(path) for x in ["__pycache__", ".git", "node_modules", ".deadpush", ".deadpush-quarantine", ".deadpush-archive"]):
             return
 
         try:
@@ -72,12 +72,12 @@ class DebrisEventHandler(FileSystemEventHandler):
             pass  # Never crash the watcher
 
 
-def start_watch(callback: Callable | None = None):
+def start_watch(callback: Callable | None = None, repo_root: Path | None = None):
     if not WATCHDOG_AVAILABLE:
         print_error("Watch mode requires 'watchdog'. Install with: pip install deadpush[watch]")
         return
 
-    config = load_config()
+    config = load_config(explicit_root=repo_root)
     print_success(f"Watching {config.repo_root} for new debris... (Ctrl+C to stop)")
 
     if callback is None:
