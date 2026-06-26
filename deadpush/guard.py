@@ -576,6 +576,28 @@ class GuardianControlHandler(BaseHTTPRequestHandler):
     def _get_handler(self):
         return self.control_server.guardian_handler if self.control_server else None
 
+    def _verify_token(self) -> bool:
+        """Verify Bearer token if token authentication is enabled."""
+        server_token = self.control_server.token if self.control_server else None
+        if not server_token:
+            return True  # No token required
+        auth_header = self.headers.get("Authorization", "")
+        if not auth_header.startswith("Bearer "):
+            return False
+        provided_token = auth_header[7:]  # Remove "Bearer " prefix
+        return provided_token == server_token
+
+    def _require_auth(self) -> bool:
+        """Check auth and send 401 if failed. Returns True if authorized."""
+        if not self._verify_token():
+            self.send_response(401)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("WWW-Authenticate", 'Bearer realm="deadpush guardian"')
+            self.end_headers()
+            self.wfile.write(b'{"error": "unauthorized", "message": "Bearer token required"}')
+            return False
+        return True
+
     # ------------------------------------------------------------------
     # Dashboard helpers
     # ------------------------------------------------------------------
@@ -749,6 +771,8 @@ class GuardianControlHandler(BaseHTTPRequestHandler):
             self._send_json({"error": "unknown dashboard page"}, 404)
 
     def do_GET(self):
+        if not self._require_auth():
+            return
         parsed = urlparse(self.path)
         qs = parse_qs(parsed.query)
         path = parsed.path.rstrip("/")
@@ -841,6 +865,8 @@ class GuardianControlHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_POST(self):
+        if not self._require_auth():
+            return
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/")
 
@@ -915,13 +941,15 @@ class GuardianControlServer:
     DEFAULT_PORT = 14242
     PORT_RANGE = 5  # try up to 5 ports
 
-    def __init__(self, guardian_handler, port: int | None = None, repo_root: Path | None = None, hardened: bool = False):
+    def __init__(self, guardian_handler, port: int | None = None, repo_root: Path | None = None, hardened: bool = False, token: str | None = None):
         self.guardian_handler = guardian_handler
         self.requested_port = port or self.DEFAULT_PORT
         self.port = None
         self.httpd = None
         self.thread = None
         self.logger = logging.getLogger("deadpush.guardian")
+        self.token = token
+        self.require_auth = token is not None
         if repo_root:
             self.port_file = _scoped_portfile(repo_root, hardened)
         else:
