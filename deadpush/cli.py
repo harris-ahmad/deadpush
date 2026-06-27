@@ -1972,6 +1972,173 @@ if __name__ == "__main__":
     main()
 
 
+@main.command("uninstall")
+@click.option("--hardened", is_flag=True, help="Uninstall hardened guardian (requires sudo)")
+@click.option("--force", is_flag=True, help="Force removal without confirmation")
+def cmd_uninstall(hardened, force):
+    """Completely uninstall deadpush guardian and clean up all state.
+
+    Removes:
+    - Guardian process and launchd service
+    - PID, lock, port files
+    - Safety score and log files
+    - Launchd plist
+    - Shared port file (hardened)
+    - Hardened: _deadpush user, group, ACLs, state directory
+
+    Use --force to skip confirmation prompt.
+    """
+    from .config import load_config
+    from .guard import (
+        _scoped_pidfile, _scoped_lockfile, _scoped_portfile,
+        _scoped_plist_label, _scoped_plist_path, _state_dir,
+        _HARDENED_STATE_DIR
+    )
+    from .hooks import _make_mutable
+    import subprocess
+    import os
+    import shutil
+
+    if hardened:
+        from .guard import _use_hardened
+        _use_hardened()
+
+    config = load_config()
+    repo_root = config.repo_root
+
+    pidfile = _scoped_pidfile(repo_root, hardened)
+    lockfile = _scoped_lockfile(repo_root, hardened)
+    portfile = _scoped_portfile(repo_root, hardened)
+    plist_label = _scoped_plist_label(repo_root)
+    plist_path = _scoped_plist_path(repo_root, hardened)
+    state_dir = _state_dir(hardened)
+    shared_port_file = repo_root / ".guardian" / "guardian.control.port"
+
+    if not force:
+        mode = "hardened" if hardened else "default"
+        confirm = input(f"Uninstall deadpush ({mode} mode) for {repo_root}? This will stop the guardian, remove the launchd service, and delete all state. Continue? [y/N]: ")
+        if confirm.lower() != "y":
+            print("Aborted.")
+            return
+
+    print_header("deadpush Uninstall", f"Removing guardian for {repo_root.name}")
+
+    # 1. Stop guardian (reuse stop logic)
+    print("\n[1/6] Stopping guardian...")
+    from .guard import DaemonManager
+    dm = DaemonManager(_scoped_pidfile(repo_root, hardened), _scoped_lockfile(repo_root, hardened))
+    if dm.is_running():
+        # Try graceful stop first
+        try:
+            pid = int(pidfile.read_text().strip()) if pidfile.exists() else None
+            if pid:
+                if hardened:
+                    subprocess.run(["sudo", "kill", str(pid)], capture_output=True, timeout=10)
+                else:
+                    os.kill(pid, 15)  # SIGTERM
+                # Wait for graceful shutdown
+                import time
+                for _ in range(10):
+                    try:
+                        os.kill(pid, 0)
+                        time.sleep(0.2)
+                    except OSError:
+                        break
+                else:
+                    if hardened:
+                        subprocess.run(["sudo", "kill", "-9", str(pid)], capture_output=True, timeout=5)
+                    else:
+                        os.kill(pid, 9)
+        except Exception:
+            pass
+        dm.force_cleanup()
+        print("  Guardian stopped")
+
+    # 2. Unload launchd
+    print("[2/6] Unloading launchd service...")
+    if hardened:
+        subprocess.run(["sudo", "launchctl", "bootout", "system", plist_label], capture_output=True, timeout=10)
+    else:
+        uid = os.getuid()
+        subprocess.run(["launchctl", "bootout", f"gui/{uid}/{plist_label}"], capture_output=True, timeout=10)
+    print("  Launchd service unloaded")
+
+    # 3. Remove plist
+    print("[3/6] Removing plist...")
+    if hardened:
+        subprocess.run(["sudo", "rm", "-f", str(plist_path)], capture_output=True, timeout=10)
+    elif plist_path.exists():
+        plist_path.unlink()
+    print(f"  Removed {plist_path.name}")
+
+    # 4. Clean up state files
+    print("[4/6] Cleaning state files...")
+    for f in [pidfile, lockfile, portfile]:
+        if hardened:
+            subprocess.run(["sudo", "rm", "-f", str(f)], capture_output=True, timeout=10)
+        elif f.exists():
+            f.unlink()
+
+    # Shared port file
+    shared_port = repo_root / ".guardian" / "guardian.control.port"
+    if hardened:
+        subprocess.run(["sudo", "rm", "-f", str(shared_port)], capture_output=True, timeout=10)
+    elif shared_port.exists():
+        shared_port.unlink()
+
+    # State directory
+    if hardened:
+        if state_dir.exists():
+            subprocess.run(["sudo", "rm", "-rf", str(state_dir)], capture_output=True, timeout=10)
+            print(f"  Removed {state_dir}")
+    else:
+        if state_dir.exists():
+            shutil.rmtree(state_dir)
+            print(f"  Removed {state_dir}")
+
+    # 5. Remove hardened user/group and ACLs
+    if hardened:
+        print("[5/6] Removing hardened user, group, and ACLs...")
+        # Remove ACLs from repo
+        subprocess.run(["sudo", "chmod", "-R", "-N", str(repo_root)], capture_output=True, timeout=30)
+        # Remove .guardian dir ACLs
+        guardian_dir = repo_root / ".guardian"
+        if guardian_dir.exists():
+            subprocess.run(["sudo", "chmod", "-R", "-N", str(guardian_dir)], capture_output=True, timeout=10)
+        # Remove user and group
+        subprocess.run(["sudo", "dscl", ".", "-delete", "/Users/_deadpush"], capture_output=True, timeout=10)
+        subprocess.run(["sudo", "dscl", ".", "-delete", "/Groups/_deadpush"], capture_output=True, timeout=10)
+        print("  Removed _deadpush user and group, cleared ACLs")
+    else:
+        # Remove immutable flags from hooks
+        try:
+            hooks_dir = config.repo_root / ".git" / "hooks"
+            if hooks_dir.exists():
+                for hook in hooks_dir.iterdir():
+                    if hook.is_file() and not hook.name.endswith(".sample"):
+                        _make_mutable(hook)
+                print("  Removed immutable flags from hooks")
+        except Exception:
+            pass
+
+    # 6. Remove .guardian directory if empty
+    print("[6/6] Cleaning up...")
+    guardian_dir = repo_root / ".guardian"
+    if guardian_dir.exists():
+        try:
+            if not any(guardian_dir.iterdir()):
+                guardian_dir.rmdir()
+                print("  Removed empty .guardian directory")
+        except Exception:
+            pass
+
+    print()
+    print_success(f"deadpush ({'hardened' if hardened else 'default'} mode) uninstalled completely.")
+    print("You can reinstall with: deadpush protect" + (" --hardened" if hardened else ""))
+
+    return 0
+
+
 @main.command("doctor")
 @click.option("--hardened", is_flag=True, help="Check hardened guardian")
 def cmd_doctor(hardened):
