@@ -2292,3 +2292,165 @@ def cmd_doctor(hardened):
         print_error("Some checks failed. Run 'deadpush protect' to repair.")
 
     return 0 if all_ok else 1
+
+
+@main.command("init")
+@click.option("--mode", type=click.Choice(["default", "hardened"]), default="default", help="Protection mode: default (user-level) or hardened (privilege separation)")
+@click.option("--daemon/--no-daemon", default=True, help="Start guardian daemon after setup")
+@click.option("--force", is_flag=True, help="Skip confirmations")
+def cmd_init(mode, daemon, force):
+    """Guided first-time setup for deadpush.
+
+    Walks through:
+    1. Detects OS and repo
+    2. Chooses protection mode (default vs hardened)
+    3. Installs git hooks (pre-push, pre-commit, post-commit)
+    4. Updates smart ignore files (.cursorignore, .claudeignore, .gitignore)
+    5. Sets up GitHub Actions guard (optional)
+    6. Generates autostart config (launchd/systemd)
+    7. Starts guardian daemon (optional)
+    8. Runs health check (doctor)
+
+    Run this once per repo, then walk away.
+    """
+    from .config import load_config
+    from .guard import setup_autostart, setup_hardened_environment, run_guardian
+    from .hooks import (
+        install_hook, install_precommit_hook, install_postcommit_hook,
+        verify_hooks_installed, setup_mcp_discovery, setup_github_guard_action
+    )
+
+    config = load_config()
+    repo_root = config.repo_root
+
+    print_header("deadpush Init", f"Guided setup for {repo_root.name}")
+    print(f"Mode: {mode}")
+    print(f"Daemon: {'yes' if daemon else 'no'}")
+    print()
+
+    if not force:
+        confirm = input(f"Initialize deadpush ({mode}) for {repo_root}? [Y/n]: ")
+        if confirm.lower() == "n":
+            print("Aborted.")
+            return
+
+    # 1. Install git hooks
+    print("\n[1/7] Installing git hooks...")
+    try:
+        install_hook(repo_root)
+        print("  pre-push hook installed")
+    except Exception as e:
+        print_warning(f"pre-push hook issue: {e}")
+    try:
+        install_precommit_hook(repo_root)
+        print("  pre-commit hook installed")
+    except Exception as e:
+        print_warning(f"pre-commit hook issue: {e}")
+    try:
+        install_postcommit_hook(repo_root)
+        print("  post-commit hook installed (catches --no-verify bypass)")
+    except Exception as e:
+        print_warning(f"post-commit hook issue: {e}")
+
+    try:
+        problems = verify_hooks_installed(repo_root)
+        if problems:
+            print_warning(f"Hook verification issues: {', '.join(problems)}")
+        else:
+            print_success("  All git guardrail hooks verified (checksums OK)")
+    except Exception as e:
+        print_warning(f"Hook verification skipped: {e}")
+
+    try:
+        setup_mcp_discovery(repo_root)
+        print("  Agent auto-discovery configured (.cursor/mcp.json, .vscode/mcp.json)")
+    except Exception as e:
+        print_warning(f"MCP discovery setup issue: {e}")
+
+    # 2. GitHub Actions guard
+    print("\n[2/7] Setting up GitHub Actions guard...")
+    try:
+        action_path = setup_github_guard_action(repo_root)
+        if action_path:
+            print(f"  Created {action_path}")
+    except Exception as e:
+        print_warning(f"GitHub Action guard setup issue: {e}")
+
+    # 3. Smart ignore files
+    print("\n[3/7] Updating smart ignore files...")
+    try:
+        from .cli import _run_full_analysis, _auto_merge_ignore_files
+        result = _run_full_analysis(config)
+        debris = result.get("debris", [])
+        suggestions = {str(Path(d.path).name) for d in debris if d.category in ("llm_context_file", "vibe_scratchpad", "hardcoded_secret", "chat_export", "duplicate_file")}
+        core_patterns = {
+            "claude.md", ".cursorrules", ".claude_instructions", ".copilot-instructions.md",
+            "windsurf_rules.md", "agents.md", "llm_context.txt", "ai_prompt.md",
+            ".deadpush-autoignore", ".deadpush-quarantine/", ".deadpush-archive/",
+            "**/scratch*.md", "**/temp*.py", "**/tmp*.go", "**/playground.*",
+            "node_modules/", "__pycache__/", ".venv/", "venv/", "target/", "dist/",
+        }
+        to_merge = suggestions | core_patterns
+        _auto_merge_ignore_files(repo_root, to_merge)
+        print_success("  Smart ignores merged/updated")
+    except Exception as e:
+        print_warning(f"  Ignore file update skipped: {e}")
+
+    # 4. Hardened setup or autostart
+    print("\n[4/7] Configuring persistence...")
+    if mode == "hardened":
+        print("  Setting up hardened environment (requires sudo)...")
+        try:
+            summary = setup_hardened_environment(repo_root, auto_load=daemon)
+            print(summary)
+        except Exception as e:
+            print_error(f"Hardened setup failed: {e}")
+            print_warning("Try running with sudo directly: sudo deadpush init --mode hardened")
+            return 1
+    else:
+        try:
+            autostart_info = setup_autostart(repo_root, hardened=False)
+            if autostart_info:
+                print(autostart_info)
+        except Exception as e:
+            print_warning(f"Autostart helper skipped: {e}")
+
+    # 5. Start daemon if requested
+    if daemon:
+        print("\n[5/7] Starting guardian daemon...")
+        if mode == "hardened":
+            print_success("Hardened guardian already loaded via launchd")
+        else:
+            try:
+                run_guardian(intervention=True, daemon=True, strict=False)
+            except SystemExit:
+                pass
+            except Exception as e:
+                print_warning(f"Daemon launch issue: {e}")
+
+    # 6. Health check
+    print("\n[6/7] Running health check...")
+    from .cli import cmd_doctor
+    try:
+        ctx = click.get_current_context()
+        ctx.invoke(cmd_doctor, hardened=(mode == "hardened"))
+    except Exception as e:
+        print_warning(f"Health check failed: {e}")
+
+    # 7. Summary
+    print("\n[7/7] Setup complete!")
+    print_success(f"deadpush ({mode}) initialized for {repo_root.name}")
+    print()
+    print("Next steps:")
+    if daemon:
+        print("  Guardian is running in background. Use 'deadpush status' to check.")
+    else:
+        print("  Start guardian with: deadpush protect --daemon")
+    print("  Configure your AI agent to use: deadpush mcp")
+    print("  View dashboard at: http://127.0.0.1:<port>/dashboard")
+
+    return 0
+
+
+if __name__ == "__main__":
+    main()
