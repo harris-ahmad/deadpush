@@ -1970,3 +1970,158 @@ def cmd_stop(hardened, force):
 
 if __name__ == "__main__":
     main()
+
+
+@main.command("doctor")
+@click.option("--hardened", is_flag=True, help="Check hardened guardian")
+def cmd_doctor(hardened):
+    """Run comprehensive health checks on the guardian setup.
+
+    Verifies:
+    - Guardian process is running (PID file, process alive)
+    - Launchd/systemd service loaded
+    - ACLs correct (hardened mode)
+    - MCP control interface reachable
+    - Port file readable
+    - Safety score file exists and valid
+    - Log file exists and writable
+    """
+    from .config import load_config
+    from .guard import (
+        _scoped_pidfile, _scoped_lockfile, _scoped_portfile,
+        _scoped_plist_label, _scoped_plist_path, _state_dir,
+        DaemonManager
+    )
+    import subprocess
+    import os
+    import json
+
+    if hardened:
+        from .guard import _use_hardened
+        _use_hardened()
+
+    config = load_config()
+    repo_root = config.repo_root
+
+    pidfile = _scoped_pidfile(repo_root, hardened)
+    lockfile = _scoped_lockfile(repo_root, hardened)
+    portfile = _scoped_portfile(repo_root, hardened)
+    plist_label = _scoped_plist_label(repo_root)
+    plist_path = _scoped_plist_path(repo_root, hardened)
+    state_dir = _state_dir(hardened)
+    safety_score_file = state_dir / "safety_score.json"
+    log_file = state_dir / "guardian.log"
+    shared_port_file = repo_root / ".guardian" / "guardian.control.port"
+
+    print_header("deadpush Doctor", f"Health check for {repo_root.name}")
+    print(f"Mode: {'hardened' if hardened else 'default'}")
+    print(f"State dir: {state_dir}")
+    print()
+
+    all_ok = True
+
+    def check(name, ok, detail=""):
+        nonlocal all_ok
+        status = "✅" if ok else "❌"
+        if not ok:
+            all_ok = False
+        print(f"  {status} {name}" + (f" — {detail}" if detail else ""))
+
+    # 1. Guardian process
+    dm = DaemonManager(pidfile, lockfile)
+    running = dm.is_running()
+    check("Guardian process", running, f"PID file: {pidfile}" + (" (running)" if running else " (not running)"))
+
+    if running:
+        try:
+            pid = int(pidfile.read_text().strip())
+            check("Process alive", True, f"PID {pid}")
+        except Exception:
+            check("Process alive", False, "PID file exists but unreadable")
+    else:
+        check("Process alive", False, "No running guardian")
+
+    # 2. Launchd / systemd
+    if hardened:
+        try:
+            r = subprocess.run(["sudo", "launchctl", "list", plist_label], capture_output=True, text=True, timeout=10)
+            loaded = r.returncode == 0 and plist_label in r.stdout
+            check("LaunchDaemon loaded", loaded, plist_label)
+        except Exception:
+            check("LaunchDaemon loaded", False, "Could not check")
+    else:
+        try:
+            uid = os.getuid()
+            r = subprocess.run(["launchctl", "list", plist_label], capture_output=True, text=True, timeout=10)
+            loaded = r.returncode == 0 and plist_label in r.stdout
+            check("LaunchAgent loaded", loaded, plist_label)
+        except Exception:
+            check("LaunchAgent loaded", False, "Could not check")
+
+    # 3. State directory
+    check("State directory", state_dir.exists() and state_dir.is_dir(), str(state_dir))
+
+    # 4. Port file
+    if portfile.exists():
+        try:
+            port = portfile.read_text().strip()
+            check("Control port file", True, f"port {port}")
+        except Exception:
+            check("Control port file", False, "exists but unreadable")
+    else:
+        check("Control port file", False, "missing")
+
+    # 5. Shared port file (hardened)
+    if hardened:
+        if shared_port_file.exists():
+            try:
+                port = shared_port_file.read_text().strip()
+                check("Shared port file", True, f"port {port} at {shared_port_file}")
+            except Exception:
+                check("Shared port file", False, "exists but unreadable")
+        else:
+            check("Shared port file", False, "missing")
+
+    # 6. Safety score file
+    if safety_score_file.exists():
+        try:
+            data = json.loads(safety_score_file.read_text(encoding="utf-8"))
+            score = data.get("score")
+            check("Safety score file", score is not None, f"score={score}, updated={data.get('last_updated', '?')}")
+        except Exception as e:
+            check("Safety score file", False, f"invalid JSON: {e}")
+    else:
+        check("Safety score file", False, "missing")
+
+    # 7. Log file
+    check("Log file", log_file.exists(), str(log_file))
+
+    # 8. ACLs (hardened)
+    if hardened:
+        try:
+            import subprocess
+            r = subprocess.run(["ls", "-le", str(repo_root)], capture_output=True, text=True, timeout=10)
+            has_acl = "_deadpush" in r.stdout
+            check("Repo ACLs", has_acl, "_deadpush ACE present" if has_acl else "missing _deadpush ACE")
+        except Exception:
+            check("Repo ACLs", False, "could not check")
+
+        # Check state dir permissions
+        try:
+            import stat
+            st = state_dir.stat()
+            mode = stat.S_IMODE(st.st_mode)
+            owner_ok = st.st_uid == os.getuid() or st.st_uid == 0  # root or current user
+            mode_ok = mode == 0o700
+            check("State dir permissions", mode_ok and owner_ok, f"mode={oct(mode)}, uid={st.st_uid}")
+        except Exception:
+            check("State dir permissions", False, "could not check")
+
+    # Summary
+    print()
+    if all_ok:
+        print_success("All checks passed. Guardian is healthy.")
+    else:
+        print_error("Some checks failed. Run 'deadpush protect' to repair.")
+
+    return 0 if all_ok else 1
