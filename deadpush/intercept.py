@@ -1,24 +1,19 @@
 """
-Pre-write file interception daemon.
+Guardrail checkers and enforcement kernel for deadpush.
 
-Agents write to .deadpush/staging/ instead of directly to the project.
-The daemon watches staging, runs guardrails, and either:
-  - Approves: moves the file to the real project path
-  - Blocks:   moves to quarantine + writes structured feedback the agent can read
+The watchdog-based guardian (not staging) is the primary intercept mechanism.
+This module provides the guardrail checkers, the enforcement content pipeline,
+and InterceptDaemon.write_file() for MCP agents that want sync feedback.
 """
 
 from __future__ import annotations
 
-import atexit
 import difflib
 import json
-import os
 import re
 import shutil
-import sys
-import time
-import threading
-from datetime import datetime, timezone
+import subprocess
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -26,7 +21,6 @@ from .config import Config as DeadpushConfig
 from .rules import RuntimeConfig
 
 
-STAGING_DIR = ".deadpush/staging"
 FEEDBACK_DIR = ".deadpush/feedback"
 QUARANTINE_DIR = ".deadpush-quarantine"
 GUARDRAIL_DIR = ".deadpush"
@@ -50,7 +44,6 @@ _LEARNED_PATTERNS: dict[str, list[dict[str, Any]]] | None = None
 
 
 def _is_test_or_mock(rel_path: str) -> bool:
-    """Check if a file path indicates test/mock/debug context."""
     lower = rel_path.lower()
     for indicator in _TEST_DIR_INDICATORS:
         if indicator in lower:
@@ -63,7 +56,6 @@ def _is_test_or_mock(rel_path: str) -> bool:
 
 
 def _load_learned_patterns(repo_root: Path) -> dict[str, list[dict[str, Any]]]:
-    """Load agent-taught false positive patterns."""
     global _LEARNED_PATTERNS
     if _LEARNED_PATTERNS is not None:
         return _LEARNED_PATTERNS
@@ -79,7 +71,6 @@ def _load_learned_patterns(repo_root: Path) -> dict[str, list[dict[str, Any]]]:
 
 
 def _save_learned_patterns(repo_root: Path) -> None:
-    """Persist learned false positive patterns."""
     global _LEARNED_PATTERNS
     if _LEARNED_PATTERNS is None:
         return
@@ -89,7 +80,6 @@ def _save_learned_patterns(repo_root: Path) -> None:
 
 
 def _is_suppressed(category: str, description: str, repo_root: Path) -> bool:
-    """Check if a pattern has been learned as a false positive."""
     learned = _load_learned_patterns(repo_root)
     for entry in learned.get("patterns", []):
         if entry.get("category") != category:
@@ -100,9 +90,7 @@ def _is_suppressed(category: str, description: str, repo_root: Path) -> bool:
 
 
 def _learn_false_positive(category: str, pattern: str, reason: str, repo_root: Path) -> None:
-    """Record a false positive pattern learned from the agent."""
     learned = _load_learned_patterns(repo_root)
-    # Deduplicate
     for existing in learned["patterns"]:
         if existing.get("category") == category and existing.get("pattern") == pattern:
             existing["count"] = existing.get("count", 1) + 1
@@ -122,7 +110,7 @@ def _learn_false_positive(category: str, pattern: str, reason: str, repo_root: P
 # ---------------------------------------------------------------------------
 
 class Violation:
-    """A single guardrail violation found in a staged file."""
+    """A single guardrail violation found in a file."""
 
     def __init__(self, category: str, description: str, line: int = 0, severity: str = "medium", uncertainty: str = ""):
         self.category = category
@@ -144,7 +132,7 @@ class Violation:
 
 
 class GuardrailResult:
-    """Result of checking a staged file against all guardrails."""
+    """Result of checking a file against all guardrails."""
 
     def __init__(self):
         self.allowed = True
@@ -168,7 +156,6 @@ class GuardrailResult:
 # ---------------------------------------------------------------------------
 
 def _check_prompt_injection(source: str, runtime: RuntimeConfig | None = None) -> list[Violation]:
-    """Check for AI prompt injection / system prompt remnants."""
     violations: list[Violation] = []
     level = runtime.get_guardrail_level("prompt_injection") if runtime else "block"
     if level == "off":
@@ -197,7 +184,6 @@ def _check_prompt_injection(source: str, runtime: RuntimeConfig | None = None) -
 
 
 def _check_security(source: str, runtime: RuntimeConfig | None = None, rel_path: str | None = None) -> list[Violation]:
-    """Check for security-sensitive operations."""
     violations: list[Violation] = []
     level = runtime.get_guardrail_level("security") if runtime else "block"
     if level == "off":
@@ -316,6 +302,10 @@ def _check_hardcoded_secrets(source: str, runtime: RuntimeConfig | None = None, 
     return violations
 
 
+# ---------------------------------------------------------------------------
+# Sensitive write checker
+# ---------------------------------------------------------------------------
+
 def _check_sensitive_write(source: str, rel_path: str, config: DeadpushConfig, runtime: RuntimeConfig | None = None) -> list[Violation]:
     """Block writes to sensitive config files (CI/CD, deployment, Docker, etc.)."""
     violations: list[Violation] = []
@@ -333,16 +323,16 @@ def _check_sensitive_write(source: str, rel_path: str, config: DeadpushConfig, r
     return violations
 
 
+# ---------------------------------------------------------------------------
+# Destructive change checker
+# ---------------------------------------------------------------------------
+
 def _check_destructive_changes(
     source: str, rel_path: str, repo_root: Path,
     runtime: RuntimeConfig | None = None,
     _old_source: str | None = None,
 ) -> list[Violation]:
-    """Check if the write would destroy existing content (near-empty rewrites, massive deletions).
-
-    _old_source: optional pre-write content (used by the real-time guardian where
-                 the file has already been overwritten by the agent).
-    """
+    """Check if the write would destroy existing content (near-empty rewrites, massive deletions)."""
     violations: list[Violation] = []
     level = runtime.get_guardrail_level("destructive") if runtime else "warn"
     if level == "off":
@@ -362,7 +352,6 @@ def _check_destructive_changes(
     old_lines = old_content.splitlines()
     new_lines = source.splitlines()
 
-    # Near-empty write to a previously substantial file
     if len(old_lines) > 20 and len(new_lines) < 3:
         violations.append(Violation(
             "destructive",
@@ -370,7 +359,6 @@ def _check_destructive_changes(
             0, "high" if level == "block" else "medium"
         ))
 
-    # >50% line reduction
     if old_lines and len(new_lines) < len(old_lines) * 0.5 and len(old_lines) > 10:
         violations.append(Violation(
             "destructive",
@@ -382,100 +370,10 @@ def _check_destructive_changes(
 
 
 # ---------------------------------------------------------------------------
-# Feedback writer
-# ---------------------------------------------------------------------------
-
-def _write_feedback(feedback_dir: Path, file_rel: str, result: GuardrailResult):
-    """Write structured feedback the coding agent can read."""
-    feedback = {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "file": file_rel,
-        "status": "blocked" if not result.allowed else "approved",
-        "acknowledged": False,
-        "violations": [v.to_dict() for v in result.violations],
-        "diff": result.diff,
-        "message": _generate_message(file_rel, result),
-    }
-    feedback_dir.mkdir(parents=True, exist_ok=True)
-    # Use filename-based feedback so the agent can correlate
-    safe_name = file_rel.replace("/", "__").replace("\\", "__")
-    feedback_path = feedback_dir / f"{safe_name}.json"
-    feedback_path.write_text(json.dumps(feedback, indent=2), encoding="utf-8")
-
-    # Also write a human-readable markdown version
-    md = _feedback_to_markdown(file_rel, result)
-    md_path = feedback_dir / f"{safe_name}.md"
-    md_path.write_text(md, encoding="utf-8")
-
-
-def _generate_message(file_rel: str, result: GuardrailResult) -> str:
-    if result.allowed:
-        return f"Your change to {file_rel} was approved."
-    parts = []
-    for v in result.violations:
-        parts.append(f"- {v.description} (line {v.line}, severity: {v.severity})")
-    return (
-        f"Your change to {file_rel} was BLOCKED due to {len(result.violations)} violation(s):\n"
-        + "\n".join(parts)
-        + f"\n\nReview the violations above, fix your code, and try again. "
-        f"The previous attempt has been quarantined."
-    )
-
-
-def _feedback_to_markdown(file_rel: str, result: GuardrailResult) -> str:
-    lines = [
-        f"# deadpush Guardrail Feedback",
-        f"",
-        f"**File:** `{file_rel}`",
-        f"**Status:** {'✅ Approved' if result.allowed else '❌ Blocked'}",
-        f"**Time:** {datetime.now(timezone.utc).isoformat()}",
-        f"",
-    ]
-    if result.violations:
-        lines.append("## Violations")
-        lines.append("")
-        for v in result.violations:
-            lines.append(f"### {v.category} (severity: {v.severity})")
-            lines.append(f"- **Line:** {v.line}")
-            lines.append(f"- **Description:** {v.description}")
-            lines.append("")
-    if result.diff:
-        lines.append("## Diff")
-        lines.append("")
-        lines.append("```diff")
-        lines.append(result.diff.rstrip("\n"))
-        lines.append("```")
-        lines.append("")
-    if not result.allowed:
-        lines.append("## What to do")
-        lines.append("")
-        lines.append("1. Read each violation above carefully.")
-        lines.append("2. Fix the issue in your code.")
-        lines.append("3. Re-write the file to `.deadpush/staging/` for re-check.")
-        lines.append("")
-        lines.append("Do not ignore these guardrails — they protect the codebase from harmful patterns.")
-    return "\n".join(lines)
-
-
-# ---------------------------------------------------------------------------
 # Full guardrail check pipeline
 # ---------------------------------------------------------------------------
 
-def _get_file_rel(staged_path: Path, staging_dir: Path) -> str:
-    """Get the relative path within staging, which mirrors the project layout."""
-    try:
-        return str(staged_path.relative_to(staging_dir))
-    except ValueError:
-        return staged_path.name
-
-
 def _apply_guardrail_level(result: GuardrailResult, violations: list[Violation], runtime: RuntimeConfig | None, category: str) -> None:
-    """Apply violations according to the guardrail level for the given category.
-
-    block → reject (prevents write)
-    warn  → append (reports but allows write)
-    off   → already filtered by the checker, nothing to do
-    """
     level = runtime.get_guardrail_level(category) if runtime else "block"
     if level == "block":
         for v in violations:
@@ -484,7 +382,6 @@ def _apply_guardrail_level(result: GuardrailResult, violations: list[Violation],
         result.violations.extend(violations)
 
 
-# Extensions scanned by git hooks and unified enforcement
 _ENFORCEABLE_EXTENSIONS = frozenset({
     ".py", ".js", ".ts", ".jsx", ".tsx", ".rs", ".go", ".java", ".rb", ".php",
     ".sh", ".bash", ".yaml", ".yml", ".json", ".toml", ".md",
@@ -499,11 +396,7 @@ def enforce_content(
     *,
     old_source: str | None = None,
 ) -> GuardrailResult:
-    """Unified enforcement kernel for MCP, guardian, and git hooks.
-
-    Checks blocked filenames (case-insensitive), LLM context files, and all
-    content guardrails with runtime level overrides applied.
-    """
+    """Unified enforcement kernel for MCP, guardian, and git hooks."""
     result = GuardrailResult()
     rel = rel_path.replace("\\", "/")
 
@@ -553,7 +446,6 @@ def enforce_content(
 
 
 def violations_from_result(rel_path: str, result: GuardrailResult) -> list[dict[str, Any]]:
-    """Flatten a GuardrailResult into violation dicts for git hook output."""
     if result.allowed:
         return []
     return [
@@ -569,47 +461,52 @@ def violations_from_result(rel_path: str, result: GuardrailResult) -> list[dict[
 
 
 def _run_guardrails(
-    staged_path: Path,
-    staging_dir: Path,
+    path: Path,
+    repo_root: Path,
     config: DeadpushConfig,
     runtime: RuntimeConfig | None = None,
     *,
-    _old_source: str | None = None,
-    _rel_path_override: str | None = None,
+    old_source: str | None = None,
+    rel_path_override: str | None = None,
 ) -> GuardrailResult:
-    """Run all guardrail checks on a staged file.
+    """Run all guardrail checks on a file.
 
     Args:
-        staged_path: Path to the file to check.
-        staging_dir: Base directory for computing the relative path
-                     (pass repo_root when checking a file at its real path).
+        path: Path to the file to check.
+        repo_root: Repository root directory (for computing relative path).
         config: Deadpush configuration.
         runtime: Optional runtime config for level overrides.
-        _old_source: Optional pre-write content (for real-time guardian flow).
-        _rel_path_override: Optional explicit relative path (bypasses staging_dir
-                           computation for the real-time guardian).
+        old_source: Optional pre-write content (for diff computation).
+        rel_path_override: Optional explicit relative path.
     """
     try:
-        source = staged_path.read_text(encoding="utf-8", errors="ignore")
+        source = path.read_text(encoding="utf-8", errors="ignore")
     except Exception:
         result = GuardrailResult()
-        result.reject(Violation("internal", "Could not read staged file", 0, "high"))
+        result.reject(Violation("internal", "Could not read file", 0, "high"))
         return result
 
-    rel = _rel_path_override if _rel_path_override is not None else _get_file_rel(staged_path, staging_dir)
-    result = enforce_content(rel, source, config, runtime, old_source=_old_source)
+    if rel_path_override is not None:
+        rel = rel_path_override
+    else:
+        try:
+            rel = path.relative_to(repo_root).as_posix()
+        except ValueError:
+            result = GuardrailResult()
+            result.reject(Violation("security", f"Path traversal blocked: {path}", 0, "critical"))
+            return result
+    result = enforce_content(rel, source, config, runtime, old_source=old_source)
 
-    # Compute diff
-    if _old_source is not None:
+    if old_source is not None:
         result.diff = "".join(difflib.unified_diff(
-            _old_source.splitlines(keepends=True),
+            old_source.splitlines(keepends=True),
             source.splitlines(keepends=True),
             fromfile=f"a/{rel}",
             tofile=f"b/{rel}",
         ))
     else:
         try:
-            dest = _get_dest_path(staged_path, staging_dir, config.repo_root)
+            dest = repo_root / rel
             old = dest.read_text(encoding="utf-8", errors="ignore") if dest.exists() else ""
             result.diff = "".join(difflib.unified_diff(
                 old.splitlines(keepends=True),
@@ -623,424 +520,133 @@ def _run_guardrails(
     return result
 
 
-def _get_dest_path(staged_path: Path, staging_dir: Path, repo_root: Path) -> Path:
-    """Determine the real project path for a staged file."""
-    rel = _get_file_rel(staged_path, staging_dir)
-    return (repo_root / rel).resolve()
+# ---------------------------------------------------------------------------
+# Feedback writer
+# ---------------------------------------------------------------------------
+
+def _write_feedback(feedback_dir: Path, rel_path: str, result: GuardrailResult) -> Path | None:
+    """Write structured feedback so the agent can self-correct."""
+    safe_name = rel_path.replace("/", "__").replace("\\", "__")
+    feedback_dir.mkdir(parents=True, exist_ok=True)
+
+    status = "blocked" if not result.allowed else "approved"
+    feedback = {
+        "file": rel_path,
+        "status": status,
+        "violations": [v.to_dict() for v in result.violations],
+        "diff": result.diff,
+        "timestamp": datetime.now().isoformat(),
+        "acknowledged": False,
+    }
+
+    json_path = feedback_dir / f"{safe_name}.json"
+    json_path.write_text(json.dumps(feedback, indent=2), encoding="utf-8")
+
+    md_path = feedback_dir / f"{safe_name}.md"
+    md_content = _format_feedback_md(feedback)
+    md_path.write_text(md_content, encoding="utf-8")
+
+    return json_path
 
 
-def _approve(staged_path: Path, staging_dir: Path, repo_root: Path, feedback_dir: Path):
-    """Move file from staging to the real project path."""
-    dest = _get_dest_path(staged_path, staging_dir, repo_root)
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    shutil.move(str(staged_path), str(dest))
-
-    # Clean up empty staging directories
-    _clean_empty_dirs(staging_dir)
-
-    result = GuardrailResult()
-    result.allowed = True
-    _write_feedback(feedback_dir, _get_file_rel(staged_path, staging_dir), result)
-
-
-def _block(staged_path: Path, staging_dir: Path, repo_root: Path, feedback_dir: Path, result: GuardrailResult):
-    """Move file to quarantine and write feedback."""
-    quarantine_dir = repo_root / QUARANTINE_DIR
-    quarantine_dir.mkdir(parents=True, exist_ok=True)
-
-    rel = _get_file_rel(staged_path, staging_dir)
-    safe_name = rel.replace("/", "__").replace("\\", "__")
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    quarantined = quarantine_dir / f"{timestamp}_{safe_name}"
-    shutil.move(str(staged_path), str(quarantined))
-
-    # Write .reason file compatible with QuarantineManager
-    reason = result.violations[0].description if result.violations else "guardrail violation"
-    reason_path = quarantined.with_name(quarantined.name + ".reason")
-    try:
-        reason_path.write_text(
-            f"Quarantined at {datetime.now()}\n"
-            f"Reason: {reason}\n"
-            f"Original path: {repo_root / rel}\n"
-        )
-    except Exception:
-        pass
-
-    _clean_empty_dirs(staging_dir)
-    _write_feedback(feedback_dir, rel, result)
-
-
-def _clean_empty_dirs(path: Path):
-    """Remove empty subdirectories under path."""
-    for dirpath, dirnames, filenames in os.walk(str(path), topdown=False):
-        if not dirnames and not filenames and dirpath != str(path):
-            try:
-                os.rmdir(dirpath)
-            except OSError:
-                pass
+def _format_feedback_md(feedback: dict[str, Any]) -> str:
+    """Format feedback as markdown for agent consumption."""
+    lines = [
+        f"# deadpush Guardrail Feedback",
+        f"",
+        f"- **File**: `{feedback.get('file', 'unknown')}`",
+        f"- **Status**: {feedback['status']}",
+        f"- **Time**: {feedback.get('timestamp', 'unknown')}",
+        f"",
+    ]
+    if feedback.get("violations"):
+        lines.append("## Violations")
+        lines.append("")
+        for v in feedback["violations"]:
+            lines.append(f"- **{v['category']}** (line {v.get('line', '?')}, {v.get('severity', '?')}): {v['description']}")
+        lines.append("")
+    if feedback.get("diff"):
+        lines.append("## Diff")
+        lines.append("")
+        lines.append("```diff")
+        lines.append(feedback["diff"])
+        lines.append("```")
+        lines.append("")
+    lines.append("---")
+    lines.append("*To acknowledge this feedback, call `acknowledge_feedback` with the safe filename.*")
+    lines.append("")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
-# Watcher thread
-# ---------------------------------------------------------------------------
-
-try:
-    from watchdog.observers import Observer
-    from watchdog.events import FileSystemEventHandler
-
-    class _StagingHandler(FileSystemEventHandler):
-        """Watchdog event handler that marks files as pending."""
-
-        def __init__(self, on_file_event):
-            self.on_file_event = on_file_event
-            self._debounce: dict[Path, float] = {}
-            self._lock = threading.Lock()
-
-        def on_created(self, event):
-            if not event.is_directory:
-                self._note(Path(event.src_path))
-
-        def on_modified(self, event):
-            if not event.is_directory:
-                self._note(Path(event.src_path))
-
-        def on_moved(self, event):
-            if not event.is_directory:
-                self._note(Path(event.dest_path))
-
-        def _note(self, path: Path):
-            with self._lock:
-                self._debounce[path] = time.time()
-
-        def pop_stable(self, min_age: float = 0.3) -> list[Path]:
-            """Return paths whose mtime has been stable for min_age seconds."""
-            now = time.time()
-            ready: list[Path] = []
-            with self._lock:
-                for p, t in list(self._debounce.items()):
-                    try:
-                        mtime = p.stat().st_mtime
-                        if now - mtime >= min_age and now - t >= min_age:
-                            ready.append(p)
-                            del self._debounce[p]
-                    except OSError:
-                        del self._debounce[p]
-            return ready
-
-    WATCHDOG_AVAILABLE = True
-except ImportError:
-    WATCHDOG_AVAILABLE = False
-
-
-class StagingWatcher(threading.Thread):
-    """Watches .deadpush/staging/ for new files and processes them.
-
-    Uses watchdog file system notifications when available, with a polling
-    fallback. File stability is verified via mtime (not the old size-poll hack).
-    """
-
-    STABILITY_SECONDS = 0.3
-
-    def __init__(self, repo_root: Path, config: DeadpushConfig, poll_interval: float = 0.5):
-        super().__init__(daemon=True)
-        self.repo_root = repo_root
-        self.config = config
-        self.staging_dir = repo_root / STAGING_DIR
-        self.feedback_dir = repo_root / FEEDBACK_DIR
-        self.poll_interval = poll_interval
-        self._stop_event = threading.Event()
-        self._processed: set[Path] = set()
-        self._handler: Any = None
-
-    def run(self):
-        self.staging_dir.mkdir(parents=True, exist_ok=True)
-        if WATCHDOG_AVAILABLE:
-            self._run_with_watchdog()
-        else:
-            self._run_polling()
-
-    def stop(self):
-        self._stop_event.set()
-
-    # ---- watchdog path ----
-
-    def _run_with_watchdog(self):
-        """Use watchdog Observer for instant file notifications."""
-        self._handler = _StagingHandler(self._on_watchdog_event)
-        observer = Observer()
-        observer.schedule(self._handler, str(self.staging_dir), recursive=True)
-        observer.start()
-        try:
-            while not self._stop_event.is_set():
-                for p in self._handler.pop_stable(self.STABILITY_SECONDS):
-                    self._process_file(p)
-                if not self._stop_event.is_set():
-                    self._stop_event.wait(0.1)
-        finally:
-            observer.stop()
-            observer.join()
-
-    def _on_watchdog_event(self, path: Path):
-        """Called when watchdog detects a file event (already handled by _StagingHandler)."""
-
-    # ---- polling fallback ----
-
-    def _run_polling(self):
-        """Fallback: poll staging directory periodically."""
-        while not self._stop_event.is_set():
-            self._scan_staging()
-            if not self._stop_event.is_set():
-                self._stop_event.wait(self.poll_interval)
-
-    def _scan_staging(self):
-        """Find unprocessed files in staging that pass mtime stability."""
-        if not self.staging_dir.exists():
-            return
-        now = time.time()
-        for staged_path in sorted(self.staging_dir.rglob("*")):
-            if not staged_path.is_file():
-                continue
-            if staged_path in self._processed:
-                continue
-            try:
-                if now - staged_path.stat().st_mtime < self.STABILITY_SECONDS:
-                    continue
-            except OSError:
-                continue
-            self._process_file(staged_path)
-
-    # ---- shared processing logic ----
-
-    def _process_file(self, staged_path: Path):
-        """Run guardrails and approve/block a single staged file."""
-        if staged_path in self._processed or not staged_path.is_file():
-            return
-        self._processed.add(staged_path)
-        rel = _get_file_rel(staged_path, self.staging_dir)
-
-        # Skip hidden files — write feedback explaining why
-        if staged_path.name.startswith("."):
-            staged_path.unlink(missing_ok=True)
-            result = GuardrailResult()
-            result.reject(Violation("debris", "Hidden/dot-file written to staging was removed (not allowed)", 0, "low"))
-            _write_feedback(self.feedback_dir, rel, result)
-            return
-
-        result = _run_guardrails(staged_path, self.staging_dir, self.config)
-
-        if result.allowed:
-            _approve(staged_path, self.staging_dir, self.repo_root, self.feedback_dir)
-        else:
-            _block(staged_path, self.staging_dir, self.repo_root, self.feedback_dir, result)
-
-
-# ---------------------------------------------------------------------------
-# HTTP API server (optional, for agents that prefer REST)
-# ---------------------------------------------------------------------------
-
-HTTP_PORT = 9876
-
-
-class WriteAPIHandler:
-    """Simple HTTP request handler for agent file writes."""
-
-    def __init__(self, repo_root: Path, config: DeadpushConfig):
-        self.repo_root = repo_root
-        self.config = config
-        self.staging_dir = repo_root / STAGING_DIR
-        self.feedback_dir = repo_root / FEEDBACK_DIR
-
-    def handle_write(self, rel_path: str, content: str) -> dict[str, Any]:
-        """Handle a file write request from an agent."""
-        staging_path = (self.staging_dir / rel_path).resolve()
-        staging_path.parent.mkdir(parents=True, exist_ok=True)
-        staging_path.write_text(content, encoding="utf-8")
-
-        result = _run_guardrails(staging_path, self.staging_dir, self.config, self.runtime)
-
-        if result.allowed:
-            _approve(staging_path, self.staging_dir, self.repo_root, self.feedback_dir)
-        else:
-            _block(staging_path, self.staging_dir, self.repo_root, self.feedback_dir, result)
-            # Clean up the staging file since it was already moved
-            staging_path.unlink(missing_ok=True)
-
-        return result.to_dict()
-
-
-def _run_http_server(repo_root: Path, config: DeadpushConfig):
-    """Run a minimal HTTP server for agent writes."""
-    import http.server
-    import urllib.parse
-
-    handler = WriteAPIHandler(repo_root, config)
-
-    class _Handler(http.server.BaseHTTPRequestHandler):
-        def do_POST(self):
-            if self.path != "/write":
-                self.send_response(404)
-                self.end_headers()
-                return
-
-            content_length = int(self.headers.get("Content-Length", 0))
-            body = self.rfile.read(content_length)
-            try:
-                data = json.loads(body)
-                rel_path = data.get("path", "")
-                content = data.get("content", "")
-                if not rel_path:
-                    self._json(400, {"error": "path is required"})
-                    return
-                result = handler.handle_write(rel_path, content)
-                self._json(200 if result.get("allowed") else 422, result)
-            except Exception as e:
-                self._json(500, {"error": str(e)})
-
-        def _json(self, status: int, data: dict):
-            self.send_response(status)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps(data).encode("utf-8"))
-
-        def log_message(self, fmt, *args):
-            pass  # quiet
-
-    server = http.server.HTTPServer(("127.0.0.1", HTTP_PORT), _Handler)
-    server.serve_forever()
-
-
-# ---------------------------------------------------------------------------
-# Public API
+# InterceptDaemon — public API for MCP agents needing sync feedback
 # ---------------------------------------------------------------------------
 
 class InterceptDaemon:
-    """Pre-write file interception daemon.
+    """File interception daemon for MCP agents that want sync guardrail feedback.
 
-    Watches .deadpush/staging/ for agent writes. Runs guardrails on each file.
-    Approves safe files (moves to project root) or blocks dangerous ones
-    (quarantines + writes structured feedback).
+    write_file() writes directly to the real path and runs guardrails.
+    If violations block the write, the file is quarantined and restored from git.
+    The watchdog-based guardian provides the same enforcement for all other writes.
     """
 
     def __init__(self, repo_root: str | Path, config: DeadpushConfig | None = None):
         self.repo_root = Path(repo_root).resolve()
         self.config = config or DeadpushConfig(repo_root=self.repo_root)
         self.runtime: RuntimeConfig | None = None
-        self.staging_dir = self.repo_root / STAGING_DIR
-        self.feedback_dir = self.repo_root / FEEDBACK_DIR
-        self.watcher: StagingWatcher | None = None
-        self.http_thread: threading.Thread | None = None
-
-    def start(self, http: bool = False):
-        """Start the staging watcher (and optionally the HTTP API)."""
-        self.staging_dir.mkdir(parents=True, exist_ok=True)
-
-        self.watcher = StagingWatcher(self.repo_root, self.config)
-        self.watcher.start()
-
-        if http:
-            self.http_thread = threading.Thread(
-                target=_run_http_server,
-                args=(self.repo_root, self.config),
-                daemon=True,
-            )
-            self.http_thread.start()
-
-    def stop(self):
-        """Stop the interception daemon."""
-        if self.watcher:
-            self.watcher.stop()
 
     def write_file(self, rel_path: str, content: str) -> GuardrailResult:
-        """Write a file through the interception pipeline (bypass staging dir).
+        """Write a file directly and run guardrails. Returns sync feedback.
 
-        Agents can call this directly for inline writes.
+        If violations block the write, the file is quarantined and restored
+        from git (or deleted if new). The watchdog guardian covers all other writes.
         """
-        staging_path = (self.staging_dir / rel_path).resolve()
-        staging_path.parent.mkdir(parents=True, exist_ok=True)
-        staging_path.write_text(content, encoding="utf-8")
+        dest = (self.repo_root / rel_path).resolve()
+        # Reject path traversal
+        try:
+            dest.relative_to(self.repo_root)
+        except ValueError:
+            result = GuardrailResult()
+            result.reject(Violation("security", f"Path traversal blocked: {rel_path}", 0, "critical"))
+            return result
 
-        result = _run_guardrails(staging_path, self.staging_dir, self.config, self.runtime)
+        old_source = dest.read_text(encoding="utf-8", errors="ignore") if dest.exists() else ""
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(content, encoding="utf-8")
 
-        if result.allowed:
-            _approve(staging_path, self.staging_dir, self.repo_root, self.feedback_dir)
-        else:
-            _block(staging_path, self.staging_dir, self.repo_root, self.feedback_dir, result)
-            staging_path.unlink(missing_ok=True)
+        result = _run_guardrails(dest, self.repo_root, self.config, self.runtime, old_source=old_source)
+
+        if not result.allowed:
+            self._quarantine_and_restore(dest, rel_path, result)
+            _write_feedback(self.repo_root / FEEDBACK_DIR, rel_path, result)
 
         return result
 
+    def _quarantine_and_restore(self, dest: Path, rel_path: str, result: GuardrailResult):
+        """Move file to quarantine and restore from git if available."""
+        quarantine_dir = self.repo_root / QUARANTINE_DIR
+        quarantine_dir.mkdir(parents=True, exist_ok=True)
+        safe_name = rel_path.replace("/", "__").replace("\\", "__")
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        quarantined = quarantine_dir / f"{timestamp}_{safe_name}"
 
-# ---------------------------------------------------------------------------
-# CLI entry point (mirrors guard.run_guardian pattern)
-# ---------------------------------------------------------------------------
+        if dest.exists():
+            shutil.move(str(dest), str(quarantined))
 
-def run_intercept(daemon: bool = False, http: bool = False):
-    """Start the intercept daemon (foreground or daemon mode)."""
-    from .config import load_config
-    from .guard import DaemonManager, setup_logging
+        reason = result.violations[0].description if result.violations else "guardrail violation"
+        (quarantined.with_name(quarantined.name + ".reason")).write_text(
+            f"Quarantined at {datetime.now()}\n"
+            f"Reason: {reason}\n"
+            f"Original path: {dest}\n"
+        )
 
-    config = load_config()
-    logger = setup_logging(daemon=daemon)
-
-    pid_dir = Path.home() / ".deadpush"
-    pid_dir.mkdir(parents=True, exist_ok=True)
-    pidfile = pid_dir / "intercept.pid"
-    lockfile = pid_dir / "intercept.lock"
-
-    daemon_mgr = DaemonManager(pidfile, lockfile)
-
-    if daemon_mgr.is_running():
-        logger.warning("Intercept daemon is already running. Use `deadpush intercept --stop` first.")
-        return
-
-    if not daemon_mgr.acquire_lock():
-        logger.error("Could not acquire lock. Another instance may be running.")
-        return
-
-    staging_dir = config.repo_root / STAGING_DIR
-    feedback_dir = config.repo_root / FEEDBACK_DIR
-
-    logger.info("Starting intercept daemon")
-    logger.info(f"  Staging:  {staging_dir}")
-    logger.info(f"  Feedback: {feedback_dir}")
-    logger.info(f"  HTTP API: {'enabled on :9876' if http else 'disabled'}")
-
-    if daemon:
-        logger.info("Starting in DAEMON mode...")
         try:
-            if os.fork() > 0:
-                sys.exit(0)
-            os.setsid()
-            if os.fork() > 0:
-                sys.exit(0)
-            os.chdir("/")
-            os.umask(0)
-            try:
-                sys.stdout.flush()
-                sys.stderr.flush()
-            except Exception:
-                pass
-            with open(os.devnull, "w") as devnull:
-                os.dup2(devnull.fileno(), sys.stdout.fileno())
-                os.dup2(devnull.fileno(), sys.stderr.fileno())
-        except Exception as e:
-            logger.error(f"Daemon fork failed: {e}")
-            daemon_mgr.cleanup()
-            return
-
-    daemon_mgr.write_pid()
-    atexit.register(daemon_mgr.cleanup)
-
-    intercept = InterceptDaemon(config.repo_root, config)
-    intercept.start(http=http)
-    logger.info(f"Intercept daemon ready (PID {os.getpid()})")
-
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        intercept.stop()
-        daemon_mgr.cleanup()
-        logger.info("Intercept daemon stopped.")
+            git_show = subprocess.run(
+                ["git", "show", f"HEAD:{rel_path}"],
+                capture_output=True, text=True,
+                cwd=str(self.repo_root),
+            )
+            if git_show.returncode == 0 and git_show.stdout:
+                dest.write_text(git_show.stdout, encoding="utf-8")
+        except Exception:
+            pass

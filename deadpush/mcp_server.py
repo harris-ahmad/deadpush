@@ -14,6 +14,7 @@ import difflib
 import json
 import re
 import sys
+import tempfile
 import threading
 import time
 from datetime import datetime
@@ -21,7 +22,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .intercept import InterceptDaemon, GuardrailResult, Violation
-from .intercept import _run_guardrails, _check_sensitive_write, _check_destructive_changes, STAGING_DIR, FEEDBACK_DIR
+from .intercept import _run_guardrails, FEEDBACK_DIR
 from .config import load_config
 from .guard import _scoped_suspend_file
 from .rules import RuntimeConfig
@@ -557,16 +558,18 @@ class McpServer:
         content = args.get("content", "")
         if not path:
             return _err("path is required")
-        staging_dir = self.daemon.staging_dir
+        rel = path.replace("\\", "/")
         try:
-            staging_path = (staging_dir / path).resolve()
-            staging_path.parent.mkdir(parents=True, exist_ok=True)
-            staging_path.write_text(content, encoding="utf-8")
-            result = _run_guardrails(staging_path, staging_dir, self.config, self.runtime)
-            staging_path.unlink(missing_ok=True)
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=Path(path).suffix, delete=False, dir=str(self.repo_root)
+            ) as f:
+                f.write(content)
+                tmp_path = Path(f.name)
+            result = _run_guardrails(tmp_path, self.repo_root, self.config, self.runtime, rel_path_override=rel)
         except Exception:
-            staging_path.unlink(missing_ok=True)
             return _err("Could not process file")
+        finally:
+            tmp_path.unlink(missing_ok=True)
         violations = [{"category": v.category, "description": v.description, "line": v.line, "severity": v.severity} for v in result.violations]
         return _ok({"path": path, "would_block": len(violations) > 0, "violations": violations},
                     f"{'Would be blocked' if violations else 'Would be approved'} ({len(violations)} violation(s)).")
@@ -763,7 +766,6 @@ class McpServer:
             return _err("path is required")
         if not content:
             return _err("content is required")
-        # Write to staging through the daemon's pipeline
         result = self.daemon.write_file(path, content)
         # Acknowledge any previous feedback for this file
         safe_name = path.replace("/", "__").replace("\\", "__")
@@ -792,7 +794,6 @@ class McpServer:
         agent_md = self.repo_root / "AGENT.md"
         return _ok({
             "repo_root": str(self.repo_root),
-            "staging_dir": str(self.repo_root / STAGING_DIR),
             "feedback_dir": str(self.repo_root / FEEDBACK_DIR),
             "agent_onboarding": str(agent_md) if agent_md.exists() else None,
             "tools": [t["name"] for t in self._tools_list()],
@@ -899,16 +900,18 @@ class McpServer:
         content = args.get("content", "")
         if not path:
             return _err("path is required")
-        staging_dir = self.daemon.staging_dir
-        staging_path = (staging_dir / path).resolve()
-        staging_path.parent.mkdir(parents=True, exist_ok=True)
+        rel = path.replace("\\", "/")
         try:
-            staging_path.write_text(content, encoding="utf-8")
-            result = _run_guardrails(staging_path, staging_dir, self.config, self.runtime)
-            staging_path.unlink(missing_ok=True)
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=Path(path).suffix, delete=False, dir=str(self.repo_root)
+            ) as f:
+                f.write(content)
+                tmp_path = Path(f.name)
+            result = _run_guardrails(tmp_path, self.repo_root, self.config, self.runtime, rel_path_override=rel)
         except Exception:
-            staging_path.unlink(missing_ok=True)
             return _err("Could not process file")
+        finally:
+            tmp_path.unlink(missing_ok=True)
 
         # Compute diff against existing file
         dest = (self.repo_root / path).resolve()
@@ -1067,8 +1070,6 @@ class McpServer:
 
     def run(self):
         """Read JSON-RPC requests from stdin and respond on stdout."""
-        self.daemon.start(http=False)
-
         for line in sys.stdin:
             if self._stdio_broken:
                 break

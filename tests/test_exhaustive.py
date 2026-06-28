@@ -912,7 +912,6 @@ class TestEdgeCases:
         resp = _call(mcp_proc, "get_status", {})
         data = _assert_ok(resp)
         assert "repo_root" in data
-        assert "staging_dir" in data
         assert "feedback_dir" in data
         assert "tools" in data
         assert "write_file" in data["tools"]
