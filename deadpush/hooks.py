@@ -537,6 +537,37 @@ def verify_hooks_installed(repo_root: Path) -> list[str]:
     return problems
 
 
+def uninstall_deadpush_hooks(repo_root: Path) -> list[str]:
+    """Remove deadpush-installed hooks (checksum-verified). Returns removed hook names."""
+    removed: list[str] = []
+    hooks_dir = repo_root / ".git" / "hooks"
+    checksums_dir = repo_root / ".deadpush" / "hooks"
+    for name in ("pre-push", "pre-commit", "post-commit"):
+        hook_path = hooks_dir / name
+        checksum_file = checksums_dir / f"{name}.sha256"
+        if not hook_path.exists():
+            continue
+        if checksum_file.exists():
+            try:
+                expected = checksum_file.read_text(encoding="utf-8").strip()
+                actual = hashlib.sha256(hook_path.read_text(encoding="utf-8").encode()).hexdigest()
+                if actual != expected:
+                    continue  # don't remove user-owned hooks
+            except Exception:
+                continue
+        elif "deadpush" not in hook_path.read_text(encoding="utf-8", errors="ignore"):
+            continue
+        _make_mutable(hook_path)
+        hook_path.unlink(missing_ok=True)
+        checksum_file.unlink(missing_ok=True)
+        cmd_shim = hooks_dir / f"{name}.cmd"
+        cmd_shim.unlink(missing_ok=True)
+        removed.append(name)
+    if checksums_dir.exists() and not any(checksums_dir.iterdir()):
+        checksums_dir.rmdir()
+    return removed
+
+
 def setup_mcp_discovery(repo_root: Path) -> None:
     deadpush_cmd = str(Path(sys.executable).parent / "deadpush")
     if not Path(deadpush_cmd).exists():
