@@ -112,6 +112,46 @@ def _is_immutable(path: Path) -> bool:
         return False
 
 
+# Core patterns merged into ignore files during setup
+GUARDIAN_IGNORE_PATTERNS = {
+    "claude.md", ".cursorrules", ".claude_instructions", ".copilot-instructions.md",
+    "windsurf_rules.md", "agents.md", "llm_context.txt", "ai_prompt.md",
+    ".deadpush-autoignore", ".deadpush-quarantine/", ".deadpush-archive/",
+    "**/scratch*.md", "**/temp*.py", "**/tmp*.go", "**/playground.*",
+    "node_modules/", "__pycache__/", ".venv/", "venv/", "target/", "dist/",
+}
+
+
+def merge_guardian_ignore_files(repo_root: Path, extra: set[str] | None = None) -> int:
+    """Merge guardian ignore patterns into .cursorignore, .claudeignore, .gitignore."""
+    patterns = set(GUARDIAN_IGNORE_PATTERNS)
+    if extra:
+        patterns |= extra
+    added = 0
+    for ignore_name in (".cursorignore", ".claudeignore", ".gitignore"):
+        ignore_path = repo_root / ignore_name
+        existing: set[str] = set()
+        if ignore_path.exists():
+            try:
+                existing = {
+                    line.strip()
+                    for line in ignore_path.read_text(encoding="utf-8").splitlines()
+                    if line.strip() and not line.startswith("#")
+                }
+            except Exception:
+                continue
+        to_add = patterns - existing
+        if not to_add:
+            continue
+        with ignore_path.open("a", encoding="utf-8") as f:
+            f.write("\n# Added by deadpush\n")
+            for pattern in sorted(to_add):
+                f.write(f"{pattern}\n")
+        added += len(to_add)
+        print(f"  → Updated {ignore_name} with {len(to_add)} patterns")
+    return added
+
+
 def _print_violations(header: str, violations: list[dict[str, Any]], footer: str) -> None:
     print(f"\n{header}\n")
     for v in violations:
@@ -193,9 +233,9 @@ def install_hook(repo_root: Path) -> None:
     """
     Install a cross-platform pre-push git hook.
 
-    The hook runs `deadpush scan --format summary` (via the current Python
-    to avoid PATH/venv issues) and blocks the push if blocking debris or
-    dead symbols are found.
+    The hook runs `deadpush hooks run-prepush` (via the current Python
+    to avoid PATH/venv issues) and blocks the push if guardrail violations
+    are found in outgoing commits.
 
     This version uses a Python script instead of Bash so it works on:
     - Windows (PowerShell, CMD, Git for Windows without Git Bash)

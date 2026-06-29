@@ -914,18 +914,11 @@ class GuardianControlHandler(BaseHTTPRequestHandler):
             payload = json.loads(body) if body.strip() else {}
 
             if path == "/trigger-light-analysis":
-                # Light / safe action: run a quick debris scan on the repo root (non-blocking hint)
-                # For deep analysis agents can still call full scan, this is for "is it safe?" quick check
-                from .debris import DebrisDetector
-                detector = DebrisDetector(handler.config)
-                # Quick: just scan for high-risk debris without full graph
-                files = []  # could use crawler but to keep light, just note
-                # In practice, return current quarantine + score as "analysis"
                 result = {
                     "message": "Light analysis triggered. Current guardian state returned.",
                     "safety": handler.safety_score.get_summary(),
                     "quarantine_count": len(handler.quarantine.list_quarantined()),
-                    "recommendation": "Use /quarantine-list for details. Run full `deadpush scan` for deep static analysis if needed."
+                    "recommendation": "Use /quarantine-list for details. Run `deadpush doctor` for a full health check.",
                 }
                 self._send_json(result)
             elif path == "/quarantine/restore":
@@ -1233,7 +1226,6 @@ class GuardianHandler(FileSystemEventHandler or object):
             return
 
         self.last_intervention_ts = now
-        filename = path.name.lower()
 
         # === STEP 1: Check blocked files (deadpush.toml blocked_files/blocked_patterns) ===
         if self.config.is_blocked(rel):
@@ -1241,17 +1233,13 @@ class GuardianHandler(FileSystemEventHandler or object):
             return
 
         # === STEP 2: Run full guardrail pipeline ===
-        from .intercept import _run_guardrails, _write_feedback, GuardrailResult, FEEDBACK_DIR
+        from .intercept import _run_guardrails, _write_feedback, FEEDBACK_DIR
 
         old_source = self._git_show(rel)
-        try:
-            source = path.read_text(encoding="utf-8", errors="ignore")
-        except Exception:
-            return
 
         result = _run_guardrails(
             path, self.config.repo_root, self.config,
-            _old_source=old_source, _rel_path_override=rel,
+            old_source=old_source, rel_path_override=rel,
         )
 
         # === STEP 3: Enforce guardrail results ===
@@ -1280,7 +1268,7 @@ class GuardianHandler(FileSystemEventHandler or object):
 
         # === STEP 4: Debris scan (secondary, in addition to guardrails) ===
         try:
-            from .crawler import FileInfo
+            from .types import FileInfo
             fi = FileInfo(
                 path=path,
                 rel_path=path.relative_to(self.config.repo_root),
@@ -1307,7 +1295,7 @@ class GuardianHandler(FileSystemEventHandler or object):
     # ------------------------------------------------------------------
     def _intervene_blocked(self, path: Path, rel: str, event_type: str):
         """Intervene when a blocked file is written (claude.md, etc.)."""
-        from .intercept import GuardrailResult, Violation, _write_feedback, FEEDBACK_DIR
+        from .intercept import GuardrailResult, Violation
 
         self.last_intervention_ts = time.time()
         score = self.safety_score.report_incident(25, f"Blocked file written: {rel}", str(path))

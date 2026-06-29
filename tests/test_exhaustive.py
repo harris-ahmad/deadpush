@@ -128,10 +128,6 @@ class TestMcpProtocol:
 
     ALL_TOOLS = [
         "write_file", "check_file",
-        "scan", "get_dead_symbols", "get_debris", "get_test_issues",
-        "get_stale_docs", "get_layer_violations", "get_security_boundaries",
-        "get_complexity_alerts",
-        "clean",
         "quarantine_list", "quarantine_restore",
         "get_feedback", "get_recent_feedback", "acknowledge_feedback",
         "retry_write",
@@ -158,15 +154,6 @@ class TestMcpProtocol:
         smoke_args: dict[str, dict] = {
             "write_file": {"path": "x.py", "content": "x = 1"},
             "check_file": {"path": "x.py", "content": "x = 1"},
-            "scan": {},
-            "get_dead_symbols": {},
-            "get_debris": {},
-            "get_test_issues": {},
-            "get_stale_docs": {},
-            "get_layer_violations": {},
-            "get_security_boundaries": {},
-            "get_complexity_alerts": {},
-            "clean": {},
             "quarantine_list": {},
             "quarantine_restore": {"name": "nonexistent"},
             "get_feedback": {},
@@ -516,118 +503,11 @@ class TestLearningLoop:
 
 
 # ======================================================================
-# F. DEAD CODE DETECTION
+# F. SAFETY SCORE
 # ======================================================================
 
-class TestDeadCodeDetection:
-    """Verify dead code detection via the MCP scan pipeline."""
-
-    DEAD_CODE_PROJECT = {
-        "src/main.py": """
-def used_function():
-    return 42
-
-def dead_function():
-    return "never called"
-
-def another_dead():
-    pass
-""",
-        "src/runner.py": """
-from .main import used_function
-
-def run():
-    return used_function()
-""",
-    }
-
-    def test_dead_symbol_detected(self, temp_repo):
-        """Scan finds dead symbols after analysing a project."""
-        for path_str, content in self.DEAD_CODE_PROJECT.items():
-            p = temp_repo / path_str
-            p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_text(content)
-
-        subprocess.run(["git", "add", "."], capture_output=True, cwd=str(temp_repo))
-        subprocess.run(
-            ["git", "commit", "-m", "add project with dead code"],
-            capture_output=True, cwd=str(temp_repo),
-        )
-
-        # Use scan through MCP
-        proc = _spawn_mcp_for(temp_repo)
-        try:
-            resp = _call(proc, "scan", {})
-            data = _assert_ok(resp)
-            # Dead symbols should be found
-            assert data.get("dead_symbols_count", 0) >= 2, (
-                f"Expected at least 2 dead symbols, got {data}"
-            )
-        finally:
-            _send(proc, {"jsonrpc": "2.0", "id": 999, "method": "shutdown", "params": {}})
-            proc.wait(timeout=5)
-
-    def test_get_dead_symbols_returns_list(self, temp_repo):
-        """get_dead_symbols returns structured symbol data."""
-        for path_str, content in self.DEAD_CODE_PROJECT.items():
-            p = temp_repo / path_str
-            p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_text(content)
-
-        subprocess.run(["git", "add", "."], capture_output=True, cwd=str(temp_repo))
-        subprocess.run(
-            ["git", "commit", "-m", "add code"],
-            capture_output=True, cwd=str(temp_repo),
-        )
-
-        proc = _spawn_mcp_for(temp_repo)
-        try:
-            resp = _call(proc, "scan", {})
-            _assert_ok(resp)
-
-            resp2 = _call(proc, "get_dead_symbols", {})
-            data = _assert_ok(resp2)
-            assert data["count"] >= 2
-            assert len(data["symbols"]) >= 2
-            names = [s["name"] for s in data["symbols"]]
-            assert any("dead_function" in n for n in names), f"dead_function not found: {names}"
-        finally:
-            _send(proc, {"jsonrpc": "2.0", "id": 999, "method": "shutdown", "params": {}})
-            proc.wait(timeout=5)
-
-
-# ======================================================================
-# G. SECURITY BOUNDARIES & COMPLEXITY
-# ======================================================================
-
-class TestSecurityAndComplexity:
-    """Security boundary detection and complexity alerts."""
-
-    def test_security_boundaries_detected(self, mcp_proc):
-        """get_security_boundaries returns operations that need test coverage."""
-        # Write a file with security-sensitive ops
-        _call(mcp_proc, "write_file", {"path": "src/crypto_util.py", "content": """
-import subprocess
-import hashlib
-
-def hash_it(data):
-    return hashlib.sha256(data).hexdigest()
-
-def run_cmd(cmd):
-    return subprocess.run(cmd, capture_output=True)
-"""})
-
-        resp = _call(mcp_proc, "get_security_boundaries", {"min_severity": "low"})
-        data = _assert_ok(resp)
-        # Should have untested boundaries
-        assert data.get("count_untested", 0) >= 0  # At minimum doesn't crash
-
-    def test_complexity_alerts(self, mcp_proc):
-        """get_complexity_alerts returns data without crashing."""
-        resp = _call(mcp_proc, "get_complexity_alerts", {"min_pct": 0})
-        data = _assert_ok(resp)
-        assert "count" in data
-        assert "alerts" in data
+class TestSafetyScore:
+    """Guardian safety score retrieval."""
 
     def test_get_safety_score(self, mcp_proc, temp_repo):
         """get_safety_score returns without error (with or without guardian.log)."""
@@ -787,12 +667,6 @@ class TestUncertaintyAnnotations:
         d = v.to_dict()
         assert "uncertainty" not in d
 
-    def test_deadness_result_supports_uncertainty(self):
-        """DeadnessResult carries optional uncertainty field."""
-        from deadpush.deadness import DeadnessResult
-        r = DeadnessResult(alive_score=0.5, tier="uncertain", uncertainty="Call graph may be incomplete")
-        assert r.uncertainty == "Call graph may be incomplete"
-
 
 # ======================================================================
 # L. EDGE CASES
@@ -845,12 +719,6 @@ class TestEdgeCases:
         resp = _call(mcp_danger_proc, "add_allowed_pattern", {"pattern": "[invalid", "description": "bad"})
         assert resp["success"] is False
         assert "Invalid regex" in resp.get("error", "")
-
-    def test_clean_noop_on_empty(self, mcp_proc):
-        """clean tool returns zero items on a clean repo."""
-        resp = _call(mcp_proc, "clean", {"mode": "dry_run"})
-        data = _assert_ok(resp)
-        assert data.get("cleaned", 0) >= 0
 
     def test_adjudicate_finding_missing_description(self, mcp_proc):
         """adjudicate_finding with empty description returns error."""
@@ -921,60 +789,3 @@ class TestEdgeCases:
         resp = _call(mcp_proc, "get_safety_score", {})
         data = _assert_ok(resp)
         assert "safety_score" in data
-
-    def test_dead_symbols_on_clean_repo(self, mcp_proc):
-        """get_dead_symbols doesn't crash on a minimal repo."""
-        resp = _call(mcp_proc, "get_dead_symbols", {})
-        data = _assert_ok(resp)
-        assert "symbols" in data or "dead_symbols" in data
-        assert "count" in data
-
-    def test_debris_on_clean_repo(self, mcp_proc):
-        """get_debris doesn't crash on a minimal repo."""
-        resp = _call(mcp_proc, "get_debris", {})
-        data = _assert_ok(resp)
-        assert "debris" in data or "items" in data
-
-    def test_get_test_issues_on_clean(self, mcp_proc):
-        """get_test_issues doesn't crash on a repo with trivial files."""
-        resp = _call(mcp_proc, "get_test_issues", {})
-        data = _assert_ok(resp)
-        assert "issues" in data or "test_files" in data or "count" in data
-
-    def test_get_stale_docs_on_clean(self, mcp_proc):
-        """get_stale_docs doesn't crash on a minimal repo."""
-        resp = _call(mcp_proc, "get_stale_docs", {})
-        data = _assert_ok(resp)
-        assert "issues" in data or "stale" in data or "docs" in data
-
-    def test_get_layer_violations_on_clean(self, mcp_proc):
-        """get_layer_violations doesn't crash on a minimal repo."""
-        resp = _call(mcp_proc, "get_layer_violations", {})
-        data = _assert_ok(resp)
-        assert "violations" in data or "layers" in data
-
-
-# ======================================================================
-# Helper
-# ======================================================================
-
-def _spawn_mcp_for(temp_repo: Path) -> subprocess.Popen:
-    """Spawn MCP server for a specific temp repo (not using mcp_proc fixture)."""
-    proc = subprocess.Popen(
-        [VENV_PY, "-u", "-c", f"""
-import sys, os
-sys.path.insert(0, {json.dumps(REPO_ROOT)})
-os.environ['PYTHONPATH'] = {json.dumps(REPO_ROOT)}
-from deadpush.mcp_server import McpServer
-server = McpServer(repo_root=r'{temp_repo}')
-server.run()
-"""],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        cwd=str(temp_repo),
-    )
-    _send(proc, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
-    _write_raw(proc, {"jsonrpc": "2.0", "method": "notifications/initialized"})
-    return proc

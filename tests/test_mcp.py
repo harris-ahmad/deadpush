@@ -85,7 +85,7 @@ class TestMcpProtocol:
             names = [t["name"] for t in tools]
             assert "write_file" in names
             assert "check_file" in names
-            assert "scan" in names
+            assert "quarantine_list" in names
             assert "get_runtime_config" in names
             assert "add_allowed_pattern" in names
             assert "remove_allowed_pattern" in names
@@ -509,20 +509,6 @@ class TestMcpProtocolCompliance:
 
 class TestMcpArgValidation:
     """Server returns structured errors for invalid argument types."""
-
-    def test_complexity_alerts_invalid_min_pct(self, temp_repo):
-        """get_complexity_alerts with non-numeric min_pct returns error."""
-        proc = _spawn_mcp_server(temp_repo)
-        try:
-            _init_and_notify(proc)
-            resp = _send(proc, {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
-                "name": "get_complexity_alerts", "arguments": {"min_pct": "abc"}
-            }})
-            result = json.loads(resp["result"]["content"][0]["text"])
-            assert result["success"] is False
-            assert "min_pct" in result["error"]
-        finally:
-            _shutdown_and_wait(proc)
 
     def test_get_feedback_invalid_limit(self, temp_repo):
         """get_feedback with non-numeric limit returns error."""

@@ -18,14 +18,14 @@ You tell your agent to "add the new feature" and walk away.
 - A `claude.md` or `.cursorrules` file committed to the repo
 - Hardcoded API keys in `.env` files the agent "helpfully" created
 - 47 new "temporary" scripts and scratchpads
-- Dead code and duplicated logic everywhere
+- LLM context files like `CLAUDE.md` or `agents.md` committed to the repo
 
 **deadpush** is the always-on guardian that catches this the moment it happens.
 
 ## One Command. Real Protection.
 
 ```bash
-pip install deadpush[watch,rich]
+pip install deadpush
 deadpush protect --daemon
 ```
 
@@ -54,10 +54,10 @@ deadpush quarantine list
 
 You'll see the guardian react, drop the Safety Score, and quarantine the files.
 
-For a full automated demo of every feature (including burst simulation and call-graph verification):
+For a full automated demo of guardian features (burst simulation, hooks, MCP):
 
 ```bash
-python scripts/full_e2e_test.py --simulate-agent --burst --run-scan
+python scripts/full_e2e_test.py --simulate-agent --burst
 ```
 
 ## Key Features
@@ -66,9 +66,8 @@ python scripts/full_e2e_test.py --simulate-agent --burst --run-scan
 - **Smart multi-agent Safety Score** — Penalizes bursts of dangerous activity from parallel agents
 - **Automatic quarantine** (never hard-delete) — Easy `deadpush quarantine list` / `restore`
 - **Local Control Interface for agents** — Your AI coding agents can query the guardian themselves (`GET /status`, `/quarantine-list`, etc. on localhost)
-- **Cross-platform pre-push hook** — Works in PowerShell, CMD, and Git Bash
-- **Strong static analysis + verification** — Structured call graphs + `deadpush verify` so you can actually trust (or challenge) the dead code reports
-- **Debris detection** — LLM context files, vibe scratchpads, hardcoded secrets, AI-generated duplicates
+- **Cross-platform git hooks** — Pre-commit, post-commit, and pre-push guardrails
+- **Debris detection** — LLM context files, vibe scratchpads, hardcoded secrets
 
 ## Commands You'll Actually Use
 
@@ -76,7 +75,8 @@ python scripts/full_e2e_test.py --simulate-agent --burst --run-scan
 deadpush protect --daemon     # The one command you run per repo
 deadpush status               # Is the guardian alive? What's the Safety Score?
 deadpush quarantine list      # See what it caught
-deadpush verify               # Cross-check the static analysis with real references
+deadpush doctor               # Health check (hooks, MCP, guardian)
+deadpush mcp                  # MCP server for AI agents (guardrailed writes)
 ```
 
 ## Why This Matters in the AI Era
@@ -90,7 +90,7 @@ deadpush is the missing safety net.
 ## Installation
 
 ```bash
-pip install deadpush[watch,rich]
+pip install deadpush
 ```
 
 Then run `deadpush protect --daemon` in any repo you care about.
@@ -104,75 +104,49 @@ The pre-push hook ships as a Python script + `.cmd` shim. It works from PowerShe
 ```bash
 git clone https://github.com/harris-ahmad/deadpush
 cd deadpush
-pip install -e ".[dev,watch,rich]"
+pip install -e ".[dev,rich]"
 ```
 
 ## Architecture
 
-deadpush is organized into four layers that work together:
+deadpush is a closed-loop guardian with four cooperating layers:
 
 ### 1. Intercept Layer (`deadpush/intercept.py`)
-The real-time guardrail engine. Every file write is checked against:
+The real-time guardrail engine. Every file write is checked via `enforce_content()`:
 - **Security guardrails**: `eval`, `subprocess`, pickle deserialization, SQL injection patterns
-- **Secret detection**: Hardcoded API keys, tokens, passwords (with **path-aware lowering** — test/mock files get `warn` instead of `block`)
-- **Prompt injection**: AI prompt manipulation patterns (ignore-previous-instructions, role-play overrides, chat markup)
+- **Secret detection**: Hardcoded API keys, tokens, passwords (with **path-aware lowering** in test/mock files)
+- **Prompt injection**: AI prompt manipulation patterns
 - **Destructive change detection**: Near-empty rewrites, >50% line reduction
 - **Sensitive config protection**: CI/CD, deployment, Docker files
 - **Layer violations**: Architecture import rules
-- **Debris detection**: AI artifacts, stub code, temp files
+- **Debris detection**: LLM context files, scratchpads, secrets
 
-**Path-aware guardrails**: Files in `test/`, `spec/`, `tests/`, `__tests__/`, `mocks/`, `fixtures/` directories, or files with `test_`, `_test`, `_spec` stems, automatically receive lowered severity for security/secret checks — recognizing that test code commonly uses patterns that would be dangerous in production.
+**Learned false positive suppression**: Adjudicated false positives persist to `.deadpush/learned_patterns.json` and auto-suppress on future checks.
 
-**Learned false positive suppression**: When the agent adjudicator confirms a finding is a false positive, the pattern is persisted to `.deadpush/learned_patterns.json` and auto-suppressed on future checks. This creates a **feedback-driven learning loop** that reduces noise over time.
+### 2. Guardian Daemon (`deadpush/guard.py`)
+Filesystem watcher that quarantines dangerous writes, maintains the Safety Score, and exposes a local control API for agents.
 
-### 2. Analysis Layer (`deadpush/deadness.py`, `deadpush/graph.py`, `deadpush/importgraph.py`)
-Multi-factor dead code scoring combining 8 signals:
-- **Call graph in-degree** (0.30): How many callers reference the symbol
-- **Registration detection** (0.20): Framework decorators, URL routes, CLI commands
-- **String reference** (0.10): Name appears as string literal elsewhere
-- **Import count** (0.10): External module imports
-- **Entry point reachability** (0.05): Reachable from detected entry points
-- **Git freshness** (0.05): Recently modified (git blame)
-- **Call chain propagation** (0.10): Callers are themselves live (pass-through scoring)
-- **Test coverage** (0.10): Referenced in test files
-
-Each symbol gets a `DeadnessResult` with an `alive_score` (0.0–1.0), a `tier` (high/medium/low/uncertain), factor breakdown, reasons, and an **uncertainty** field explaining why the classifier might be wrong.
-
-The `uncertainty` field is populated when the signal is ambiguous (e.g., "String reference detected but could be coincidental", "Import found but likely re-export", "Only one caller — may be indirect").
-
-### 3. Call Graph Resolution (`deadpush/cli.py:84-148`)
-The `_resolve_callee_to_symbol` function uses a 5-step heuristic pipeline:
-1. **Local exact match**: Symbol exists in the same file
-2. **Method receiver resolution**: Class methods via receiver name (`self`, `this`, or class name)
-3. **Import resolution**: Module-qualified names from `file_imports`
-4. **Dotted name resolution**: `module.function` style callee splitting
-5. **Fallback name match**: Any symbol with matching name across the project (lowest confidence)
-
-Each step uses exact prefix/suffix matching rather than loose substring checks to avoid false edges.
+### 3. Git Hooks (`deadpush/hooks.py`)
+Pre-commit, post-commit, and pre-push hooks all call the same `enforce_content()` kernel — no bypass between MCP, daemon, and git.
 
 ### 4. MCP Server (`deadpush/mcp_server.py`)
-A Model Context Protocol server (stdio transport) exposing all capabilities as tools:
-- **Agent-as-Adjudicator**: `verify_finding` and `learn_false_positive` tools let the agent itself adjudicate uncertain findings and teach deadpush about false positive patterns, creating a **feedback-driven learning loop**.
-- **Write/Check pipeline**: `write_file`, `check_file`, `get_write_diff`, `retry_write`
-- **Test-verified writes**: `verify_write` runs guardrails + tests atomically
-- **Scanning**: `scan`, `get_dead_symbols`, `get_debris`, `get_test_issues`, `get_stale_docs`, `get_layer_violations`, `get_security_boundaries`, `get_complexity_alerts`
-- **Configuration**: `add_allowed_pattern`, `ignore_path`, `set_guardrail_level`, `reset_runtime_config`
-- **Feedback**: `get_feedback`, `get_recent_feedback`, `acknowledge_feedback`
+Stdio MCP server exposing guardian tools: `write_file`, `check_file`, `verify_write`, quarantine management, feedback loops, and danger-gated config tools.
 
 ### Data Flow
 
 ```
-Agent writes file
+Agent writes file (MCP write_file or native editor)
        ↓
-Intercept Layer checks (security, secrets, prompt injection, debris, layers, destructive changes)
+enforce_content() — same kernel for MCP, hooks, and guardian
        ↓
-Path-aware lowering for test/mock files  →  Learned pattern suppression
-       ↓
-Approved?  →  Blocked → Quarantine + Feedback
+Approved?  →  Blocked → Quarantine + Feedback + Safety Score drop
   Yes
        ↓
-MCP verify_write (optional) → Run tests → Pass? → Write
+verify_write (optional) → Run tests → Pass? → Write
                                               Fail → Quarantine + Restore from git
+       ↓
+git commit → pre-commit hook → post-commit hook
+git push   → pre-push hook (server-side GitHub Action available)
 ```
 
 ## Philosophy

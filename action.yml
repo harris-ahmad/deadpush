@@ -1,16 +1,12 @@
 name: "deadpush"
-description: "Run deadpush to detect dead code and semantic debris (AI-generated files, context leaks, etc.)"
+description: "Run deadpush guardian health check and pre-push guardrails on CI"
 author: "Harris Ahmad"
 
 inputs:
-  entry:
-    description: "Comma-separated list of entry points"
+  hardened:
+    description: "Run doctor in hardened mode (if guardian uses privilege separation)"
     required: false
-    default: ""
-  format:
-    description: "Output format (markdown, json, summary)"
-    required: false
-    default: "markdown"
+    default: "false"
 
 runs:
   using: "composite"
@@ -18,17 +14,13 @@ runs:
     - name: Install deadpush
       shell: bash
       run: |
-        pip install deadpush[rich]
+        pip install deadpush
 
-    - name: Run deadpush scan
+    - name: Run deadpush doctor
       shell: bash
       run: |
-        deadpush scan --format ${{ inputs.format }} ${{ inputs.entry && '--entry ' || '' }}${{ inputs.entry }}
-      continue-on-error: true
-
-    - name: Upload report
-      uses: actions/upload-artifact@v4
-      with:
-        name: deadpush-report
-        path: deadpush-report.md
-        if-no-files-found: ignore
+        if [ "${{ inputs.hardened }}" = "true" ]; then
+          deadpush doctor --hardened
+        else
+          deadpush doctor
+        fi
