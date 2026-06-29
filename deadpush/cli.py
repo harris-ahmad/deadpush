@@ -43,7 +43,12 @@ def cmd_guard(no_intervention, daemon, strict, hardened):
 @click.option("--enable", is_flag=True, help="Enable persistent background guardian (auto-starts daemon after setup)")
 @click.option("--daemon", is_flag=True, help="Start the guardian as a persistent background daemon after performing full setup")
 @click.option("--hardened", is_flag=True, help="Run as _deadpush user (privilege separation)")
-def cmd_protect(enable, daemon, hardened):
+@click.option(
+    "--allow-self-protect",
+    is_flag=True,
+    help="Allow protecting the deadpush source repo itself (not recommended for development)",
+)
+def cmd_protect(enable, daemon, hardened, allow_self_protect):
     """
     One-command setup to protect your vibe coding workflow.
 
@@ -56,7 +61,19 @@ def cmd_protect(enable, daemon, hardened):
     Run this once per repo (or after major changes) then walk away.
     The guardian will monitor, score, quarantine dangerous files autonomously.
     """
+    from .config import is_guardian_dev_repo
     config = load_config()
+
+    if is_guardian_dev_repo(config.repo_root) and not allow_self_protect:
+        print_error("Refusing to protect the deadpush development repository.")
+        print_error(
+            "Running protect here installs git hooks and a filesystem guardian that "
+            "will block your own commits and quarantine source files."
+        )
+        print("Test in a throwaway clone instead:")
+        print("  git clone . /tmp/deadpush-e2e && cd /tmp/deadpush-e2e && deadpush protect")
+        print("Or pass --allow-self-protect to override (not recommended).")
+        return
 
     start_background = bool(enable or daemon)
 
@@ -502,6 +519,19 @@ def cmd_quarantine_clear(older_than, force):
 def cmd_hooks():
     """Manage deadpush git hooks."""
     pass
+
+
+@cmd_hooks.command("uninstall")
+def cmd_hooks_uninstall():
+    """Remove deadpush-installed git hooks from this repo."""
+    config = load_config()
+    from .hooks import uninstall_deadpush_hooks
+
+    removed = uninstall_deadpush_hooks(config.repo_root)
+    if removed:
+        print_success(f"Removed deadpush hooks: {', '.join(removed)}")
+    else:
+        print("No deadpush hooks found to remove.")
 
 
 @cmd_hooks.command("install-precommit")

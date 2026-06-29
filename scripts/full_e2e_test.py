@@ -35,6 +35,7 @@ POLL_INTERVAL = 0.5
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
+from deadpush.config import is_guardian_dev_repo  # noqa: E402
 from deadpush.guard import _scoped_pidfile  # noqa: E402
 
 
@@ -246,10 +247,6 @@ def cleanup_sandbox(repo: Path) -> None:
         shutil.rmtree(sandbox, ignore_errors=True)
 
 
-def is_deadpush_source_repo(repo: Path) -> bool:
-    """True if repo looks like the deadpush development tree."""
-    return (repo / "deadpush" / "__init__.py").is_file() and (repo / "pyproject.toml").is_file()
-
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Guardian E2E test for deadpush")
@@ -269,7 +266,7 @@ def main() -> None:
         print(f"ERROR: {repo} does not exist")
         sys.exit(1)
 
-    if is_deadpush_source_repo(repo) and not args.allow_self_test:
+    if is_guardian_dev_repo(repo) and not args.allow_self_test:
         print("ERROR: Refusing to run E2E against the deadpush source repo.")
         print("Protecting this repo will quarantine/revert your working tree (including this script).")
         print("Use a throwaway clone instead:")

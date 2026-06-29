@@ -145,6 +145,20 @@ class Config:
         }
 
 
+def is_guardian_dev_repo(repo_root: Path) -> bool:
+    """True when repo is the deadpush package source tree (not a consumer project)."""
+    if not (repo_root / "deadpush" / "__init__.py").is_file():
+        return False
+    pyproj = repo_root / "pyproject.toml"
+    if not pyproj.is_file():
+        return False
+    try:
+        data = tomllib.loads(pyproj.read_text(encoding="utf-8"))
+        return data.get("project", {}).get("name") == "deadpush"
+    except Exception:
+        return True
+
+
 def _find_repo_root(start: Path | None = None) -> Path:
     """Walk up to find likely repo root."""
     if start is None:

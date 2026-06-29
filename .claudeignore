@@ -1,0 +1,23 @@
+
+# Added by deadpush
+**/playground.*
+**/scratch*.md
+**/temp*.py
+**/tmp*.go
+.claude_instructions
+.copilot-instructions.md
+.cursorrules
+.deadpush-archive/
+.deadpush-autoignore
+.deadpush-quarantine/
+.venv/
+__pycache__/
+agents.md
+ai_prompt.md
+claude.md
+dist/
+llm_context.txt
+node_modules/
+target/
+venv/
+windsurf_rules.md

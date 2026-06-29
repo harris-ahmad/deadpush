@@ -1,0 +1,10 @@
+{
+  "servers": {
+    "deadpush": {
+      "command": "/Users/harris/Documents/personal/deadpush/.venv/bin/deadpush",
+      "args": [
+        "mcp"
+      ]
+    }
+  }
+}
