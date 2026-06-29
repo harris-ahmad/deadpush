@@ -48,12 +48,77 @@ from socketserver import ThreadingMixIn
 from urllib.parse import urlparse, parse_qs
 
 
+_HARDENED_STATE_DIR = Path("/var/db/deadpush")
+
+
+def _state_dir(hardened: bool = False) -> Path:
+    if hardened:
+        return _HARDENED_STATE_DIR
+    return Path.home() / ".deadpush"
+
+
+@functools.lru_cache(maxsize=16)
+def _repo_id(repo_root: str) -> str:
+    return hashlib.sha256(repo_root.encode()).hexdigest()[:12]
+
+
+def _scoped_pidfile(repo_root: Path, hardened: bool = False) -> Path:
+    return _state_dir(hardened) / f"guardian.{_repo_id(str(repo_root))}.pid"
+
+
+def _scoped_lockfile(repo_root: Path, hardened: bool = False) -> Path:
+    return _state_dir(hardened) / f"guardian.{_repo_id(str(repo_root))}.lock"
+
+
+def _scoped_portfile(repo_root: Path, hardened: bool = False) -> Path:
+    return _state_dir(hardened) / f"guardian.control.port.{_repo_id(str(repo_root))}"
+
+
+def _scoped_suspend_file(repo_root: Path, hardened: bool = False) -> Path:
+    return _state_dir(hardened) / f"mcp_suspended.{_repo_id(str(repo_root))}"
+
+
+def _scoped_safety_score_file(repo_root: Path, hardened: bool = False) -> Path:
+    return _state_dir(hardened) / f"safety_score.{_repo_id(str(repo_root))}.json"
+
+
+def _scoped_log_file(repo_root: Path, hardened: bool = False) -> Path:
+    return _state_dir(hardened) / f"guardian.{_repo_id(str(repo_root))}.log"
+
+
+def _scoped_plist_label(repo_root: Path) -> str:
+    return f"com.deadpush.guardian.{_repo_id(str(repo_root))}"
+
+
+def _scoped_plist_path(repo_root: Path, hardened: bool = False) -> Path:
+    if hardened:
+        return Path("/Library/LaunchDaemons") / f"com.deadpush.guardian.{_repo_id(str(repo_root))}.plist"
+    return Path.home() / "Library" / "LaunchAgents" / f"com.deadpush.guardian.{_repo_id(str(repo_root))}.plist"
+
+
+def _scoped_systemd_unit_path(repo_root: Path, hardened: bool = False) -> Path:
+    rid = _repo_id(str(repo_root))
+    if hardened:
+        return Path("/etc/systemd/system") / f"deadpush-guardian.{rid}.service"
+    return Path.home() / ".config" / "systemd" / "user" / f"deadpush-guardian.{rid}.service"
+
+
+def _is_hardened(hardened: bool = False) -> bool:
+    return hardened
+
+
 # =============================================================================
 # Logging
 # =============================================================================
 from logging.handlers import RotatingFileHandler
 
-def setup_logging(log_file: Optional[Path] = None, level=logging.INFO, daemon: bool = False, hardened: bool = False):
+def setup_logging(
+    log_file: Optional[Path] = None,
+    level=logging.INFO,
+    daemon: bool = False,
+    hardened: bool = False,
+    repo_root: Path | None = None,
+):
     """Setup logging.
 
     In daemon mode: ONLY file logging (headless/silent on stdout/stderr).
@@ -61,7 +126,10 @@ def setup_logging(log_file: Optional[Path] = None, level=logging.INFO, daemon: b
     Uses RotatingFileHandler (10MB × 5 files) to prevent unbounded growth.
     """
     if log_file is None:
-        log_file = _state_dir(hardened) / "guardian.log"
+        if repo_root is None:
+            log_file = _state_dir(hardened) / "guardian.log"
+        else:
+            log_file = _scoped_log_file(repo_root, hardened)
         log_file.parent.mkdir(parents=True, exist_ok=True)
 
     handlers = [RotatingFileHandler(log_file, maxBytes=10_000_000, backupCount=5, encoding="utf-8")]
@@ -380,7 +448,8 @@ class SessionSafetyScore:
     - get_activity_level() and get_session_summary() used in logs + status cmd
     """
 
-    def __init__(self, hardened: bool = False):
+    def __init__(self, repo_root: Path, hardened: bool = False):
+        self.repo_root = repo_root.resolve()
         self.score = 100
         self.incidents = []
         self.recent_window = 60  # seconds
@@ -391,8 +460,8 @@ class SessionSafetyScore:
         self.hardened = hardened
 
     def _score_path(self) -> Path:
-        """Path to the safety score JSON file."""
-        return _state_dir(self.hardened) / "safety_score.json"
+        """Path to the per-repo safety score JSON file."""
+        return _scoped_safety_score_file(self.repo_root, self.hardened)
 
     def mark_clean_shutdown(self):
         """Mark clean shutdown so restart doesn't apply penalty.
@@ -1056,7 +1125,7 @@ class GuardianHandler(FileSystemEventHandler or object):
         self.logger = logger or logging.getLogger("deadpush.guardian")
         self.detector = DebrisDetector(config)
         self.quarantine = QuarantineManager(config.repo_root)
-        self.safety_score = SessionSafetyScore(hardened=hardened)
+        self.safety_score = SessionSafetyScore(config.repo_root, hardened=hardened)
         self.safety_score.load_score()
         self.session_mgr = SessionManager()
 
@@ -1102,6 +1171,8 @@ class GuardianHandler(FileSystemEventHandler or object):
             return
         pidfile = _scoped_pidfile(self.config.repo_root, self.hardened)
         respawn_cmd = [sys.executable, "-m", "deadpush.cli", "guard", "--daemon"]
+        if self.hardened:
+            respawn_cmd.append("--hardened")
         proc = start_shadow_process(os.getpid(), pidfile, respawn_cmd, self.config.repo_root)
         if proc is not None:
             self.shadow_process = proc
@@ -1135,6 +1206,21 @@ class GuardianHandler(FileSystemEventHandler or object):
                     pass
             self.shadow_process = None
         stop_shadow_for_repo(self.config.repo_root, self.hardened)
+
+    def _check_hook_integrity(self) -> None:
+        """Detect and repair tampered or missing deadpush git hooks."""
+        try:
+            from .hooks import repair_deadpush_hooks, verify_hooks_installed
+
+            problems = verify_hooks_installed(self.config.repo_root)
+            if not problems:
+                return
+            self.logger.warning(f"Hook integrity issue(s): {', '.join(problems)} — repairing")
+            repaired = repair_deadpush_hooks(self.config.repo_root)
+            if repaired:
+                self.logger.info(f"Reinstalled hooks: {', '.join(repaired)}")
+        except Exception as e:
+            self.logger.debug(f"Hook integrity check skipped: {e}")
 
     # ------------------------------------------------------------------
     # MCP suspension (disables agent's MCP access when score is critical)
@@ -1495,77 +1581,6 @@ class GuardianHandler(FileSystemEventHandler or object):
 
 
 # =============================================================================
-# State directory management
-# =============================================================================
-
-_HARDENED_STATE_DIR = Path("/var/db/deadpush")
-
-
-def _state_dir(hardened: bool = False) -> Path:
-    """Get the state directory for a repo.
-    
-    Args:
-        hardened: If True, returns /var/db/deadpush (requires root/_deadpush).
-                  If False, returns ~/.deadpush (user-writable).
-    """
-    if hardened:
-        return _HARDENED_STATE_DIR
-    return Path.home() / ".deadpush"
-
-
-def _is_hardened(hardened: bool = False) -> bool:
-    """Check if running in hardened mode.
-    
-    Args:
-        hardened: Explicit hardened flag.
-    """
-    return hardened
-
-
-# =============================================================================
-# Repo-scoped resource helpers
-# =============================================================================
-@functools.lru_cache(maxsize=16)
-def _repo_id(repo_root: str) -> str:
-    """Short deterministic hash from repo root path."""
-    return hashlib.sha256(repo_root.encode()).hexdigest()[:12]
-
-
-def _scoped_pidfile(repo_root: Path, hardened: bool = False) -> Path:
-    return _state_dir(hardened) / f"guardian.{_repo_id(str(repo_root))}.pid"
-
-
-def _scoped_lockfile(repo_root: Path, hardened: bool = False) -> Path:
-    return _state_dir(hardened) / f"guardian.{_repo_id(str(repo_root))}.lock"
-
-
-def _scoped_portfile(repo_root: Path, hardened: bool = False) -> Path:
-    return _state_dir(hardened) / f"guardian.control.port.{_repo_id(str(repo_root))}"
-
-
-def _scoped_suspend_file(repo_root: Path, hardened: bool = False) -> Path:
-    return _state_dir(hardened) / f"mcp_suspended.{_repo_id(str(repo_root))}"
-
-
-def _scoped_plist_label(repo_root: Path) -> str:
-    return f"com.deadpush.guardian.{_repo_id(str(repo_root))}"
-
-
-def _scoped_plist_path(repo_root: Path, hardened: bool = False) -> Path:
-    if hardened:
-        return Path("/Library/LaunchDaemons") / f"com.deadpush.guardian.{_repo_id(str(repo_root))}.plist"
-    return Path.home() / "Library" / "LaunchAgents" / f"com.deadpush.guardian.{_repo_id(str(repo_root))}.plist"
-
-
-def _scoped_systemd_unit_path(repo_root: Path, hardened: bool = False) -> Path:
-    """Path for Linux systemd unit file (user or system scope)."""
-    rid = _repo_id(str(repo_root))
-    if hardened:
-        return Path("/etc/systemd/system") / f"deadpush-guardian.{rid}.service"
-    return Path.home() / ".config" / "systemd" / "user" / f"deadpush-guardian.{rid}.service"
-
-
-# =============================================================================
 # Shadow Process — Re-spawns guardian if it crashes
 # =============================================================================
 
@@ -1744,7 +1759,9 @@ def run_guardian(intervention: bool = True, daemon: bool = False, strict: bool =
 
     config = load_config()
 
-    logger = setup_logging(daemon=daemon, hardened=hardened)
+    logger = setup_logging(
+        daemon=daemon, hardened=hardened, repo_root=config.repo_root,
+    )
 
     _state_dir(hardened).mkdir(parents=True, exist_ok=True)
     pidfile = _scoped_pidfile(config.repo_root, hardened)
@@ -1797,7 +1814,7 @@ def run_guardian(intervention: bool = True, daemon: bool = False, strict: bool =
 
             # Re-initialize logging BEFORE closing FDs so the new
             # RotatingFileHandler has a valid FD that survives the close loop
-            logger = setup_logging(daemon=True, hardened=hardened)
+            logger = setup_logging(daemon=True, hardened=hardened, repo_root=config.repo_root)
 
             # Close all inherited FDs except stdio (0,1,2) and the log FD.
             # Use root logger's handlers (named loggers propagate to root).
@@ -1933,6 +1950,7 @@ def _run_observer(handler: GuardianHandler, logger, daemon_mgr: DaemonManager | 
 
                 handler._check_shadow()
                 handler._check_suspension()
+                handler._check_hook_integrity()
                 time.sleep(1)
             except Exception as e:
                 if not running:
@@ -2119,6 +2137,42 @@ See `deadpush guard --daemon` for the core persistent mode.
 # =============================================================================
 # Hardened environment setup (privilege separation)
 # =============================================================================
+def _apply_hardened_repo_acls(repo_root: Path) -> None:
+    """Grant _deadpush read + intervention ACLs on the protected repo tree."""
+    import subprocess as _sp
+
+    repo_root = repo_root.resolve()
+    quarantine_dir = repo_root / ".deadpush-quarantine"
+    quarantine_dir.mkdir(parents=True, exist_ok=True)
+
+    if sys.platform == "darwin":
+        # Read + quarantine/restore: write and delete_child on the repo tree.
+        intervention = (
+            "_deadpush allow list,readattr,readsecurity,search,read,readextattr,"
+            "write,append,add_file,add_subdirectory,delete,delete_child,"
+            "file_inherit,directory_inherit"
+        )
+        _sp.run(
+            ["sudo", "chmod", "+a", intervention, str(repo_root)],
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+        guardian_dir = repo_root / ".guardian"
+        guardian_dir.mkdir(parents=True, exist_ok=True)
+        _sp.run(
+            ["sudo", "chmod", "+a",
+             "_deadpush allow write,append,add_file,add_subdirectory,delete_child,file_inherit,directory_inherit",
+             str(guardian_dir)],
+            capture_output=True, text=True, timeout=15, check=False,
+        )
+    elif sys.platform.startswith("linux"):
+        _sp.run(["sudo", "setfacl", "-R", "-m", "u:_deadpush:rwx", str(repo_root)],
+                capture_output=True, timeout=30, check=False)
+        guardian_dir = repo_root / ".guardian"
+        guardian_dir.mkdir(parents=True, exist_ok=True)
+        _sp.run(["sudo", "setfacl", "-R", "-m", "u:_deadpush:rwx", str(guardian_dir)],
+                capture_output=True, timeout=15, check=False)
+
+
 def setup_hardened_environment(repo_root: Path, auto_load: bool = True) -> str:
     """One-time sudo setup for hardened mode: create _deadpush user, state
     directory, repo ACLs, install daemon plist, and load it.
@@ -2187,31 +2241,9 @@ def setup_hardened_environment(repo_root: Path, auto_load: bool = True) -> str:
     _sudo(["chmod", "0700", str(state)])
     lines.append(f"Created state dir {state}")
 
-    # 4. Set ACL on repo so _deadpush can read the tree
-    if _sys.platform == "darwin":
-        r = _sudo(
-            ["chmod", "+a",
-             f"_deadpush allow list,readattr,readsecurity,search,read,readattr,readextattr,file_inherit,directory_inherit",
-             str(repo_root)],
-            check=False, timeout=15,
-        )
-        if r.returncode == 0:
-            lines.append(f"Granted _deadpush read access to {repo_root} (ACL)")
-
-        guardian_dir = repo_root / ".guardian"
-        guardian_dir.mkdir(parents=True, exist_ok=True)
-        _sudo([
-            "chmod", "+a",
-            f"_deadpush allow write,append,add_file,add_subdirectory,delete_child,file_inherit,directory_inherit",
-            str(guardian_dir),
-        ])
-        lines.append(f"Granted _deadpush write access to {guardian_dir} (ACL)")
-    else:
-        _sudo(["setfacl", "-R", "-m", "u:_deadpush:rx", str(repo_root)])
-        guardian_dir = repo_root / ".guardian"
-        guardian_dir.mkdir(parents=True, exist_ok=True)
-        _sudo(["setfacl", "-R", "-m", "u:_deadpush:rwx", str(guardian_dir)])
-        lines.append("Set ACLs via setfacl")
+    # 4. Intervention ACLs on repo (quarantine, restore, feedback)
+    _apply_hardened_repo_acls(repo_root)
+    lines.append(f"Granted _deadpush intervention ACLs on {repo_root}")
 
     # 5. Write plist / systemd unit in hardened mode
     autostart_info = setup_autostart(repo_root, hardened=True)

@@ -628,10 +628,15 @@ class McpServer:
         }, "Server running.")
 
     def _tool_get_safety_score(self, args: dict[str, Any]) -> dict[str, Any]:
-        # Check both default and hardened state directories for safety_score.json
+        from .guard import _scoped_safety_score_file, _state_dir
+
+        hardened = (self.repo_root / ".guardian" / "guardian.control.port").exists()
         candidates = [
-            Path.home() / ".deadpush" / "safety_score.json",
-            Path("/var/db/deadpush/safety_score.json"),
+            _scoped_safety_score_file(self.repo_root, hardened=False),
+            _scoped_safety_score_file(self.repo_root, hardened=True),
+            # legacy global paths
+            _state_dir(False) / "safety_score.json",
+            _state_dir(True) / "safety_score.json",
         ]
         score = "No background guardian running (start with deadpush protect --daemon)"
         for path in candidates:

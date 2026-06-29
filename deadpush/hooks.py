@@ -568,6 +568,25 @@ def uninstall_deadpush_hooks(repo_root: Path) -> list[str]:
     return removed
 
 
+def repair_deadpush_hooks(repo_root: Path) -> list[str]:
+    """Re-install deadpush hooks that are missing or tampered. Returns repaired names."""
+    problems = verify_hooks_installed(repo_root)
+    if not problems:
+        return []
+    repaired: list[str] = []
+    for name in ("pre-push", "pre-commit", "post-commit"):
+        if not any(p.startswith(name) for p in problems):
+            continue
+        if name == "pre-push":
+            install_hook(repo_root)
+        elif name == "pre-commit":
+            install_precommit_hook(repo_root)
+        elif name == "post-commit":
+            install_postcommit_hook(repo_root)
+        repaired.append(name)
+    return repaired
+
+
 def setup_mcp_discovery(repo_root: Path) -> None:
     deadpush_cmd = str(Path(sys.executable).parent / "deadpush")
     if not Path(deadpush_cmd).exists():

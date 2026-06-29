@@ -24,31 +24,44 @@ def main():
 
 
 @main.command("guard")
+@click.option("--repo", type=click.Path(exists=True, file_okay=False), default=None,
+              help="Repo root to guard (default: auto-detect from cwd)")
 @click.option("--no-intervention", is_flag=True, help="Warning mode only (no blocking/quarantine)")
 @click.option("--daemon", is_flag=True, help="Run as background daemon")
 @click.option("--strict", is_flag=True, help="Enable strict intervention mode")
-@click.option("--hardened", is_flag=True, help="Run as _deadpush user (privilege separation)")
-def cmd_guard(no_intervention, daemon, strict, hardened):
+@click.option("--soft", is_flag=True, help="Dev-only: run as your UID (agent can kill guardian)")
+@click.option("--hardened", is_flag=True, help="Run as _deadpush user (default unless --soft)")
+def cmd_guard(repo, no_intervention, daemon, strict, soft, hardened):
     """
     Start the AI Agent Guardian.
 
     This is the core always-on protection while using AI coding agents.
     """
     from .guard import run_guardian
+    import os
     intervention = not no_intervention
-    run_guardian(intervention=intervention, daemon=daemon, strict=strict, hardened=hardened)
+    use_hardened = not soft
+    if hardened:
+        use_hardened = True
+    if soft and hardened:
+        print_error("Cannot use --soft with --hardened")
+        return
+    if repo:
+        os.chdir(Path(repo).resolve())
+    run_guardian(intervention=intervention, daemon=daemon, strict=strict, hardened=use_hardened)
 
 
 @main.command("protect")
 @click.option("--enable", is_flag=True, help="Enable persistent background guardian (auto-starts daemon after setup)")
 @click.option("--daemon", is_flag=True, help="Start the guardian as a persistent background daemon after performing full setup")
-@click.option("--hardened", is_flag=True, help="Run as _deadpush user (privilege separation)")
+@click.option("--soft", is_flag=True, help="Dev-only: same-UID guardian (agent can pkill it; not production-safe)")
+@click.option("--hardened", is_flag=True, help="Explicitly request hardened mode (default unless --soft)")
 @click.option(
     "--allow-self-protect",
     is_flag=True,
     help="Allow protecting the deadpush source repo itself (not recommended for development)",
 )
-def cmd_protect(enable, daemon, hardened, allow_self_protect):
+def cmd_protect(enable, daemon, soft, hardened, allow_self_protect):
     """
     One-command setup to protect your vibe coding workflow.
 
@@ -76,9 +89,15 @@ def cmd_protect(enable, daemon, hardened, allow_self_protect):
         return
 
     start_background = bool(enable or daemon)
+    use_hardened = not soft
+    if hardened:
+        use_hardened = True
+    if soft and hardened:
+        print_error("Cannot use --soft with --hardened")
+        return
 
     # If hardened mode, do the one-time privilege separation setup first
-    if hardened:
+    if use_hardened:
         print("\n[0/4] Setting up hardened environment (privilege separation)...")
         from .guard import setup_hardened_environment
         try:
@@ -88,6 +107,8 @@ def cmd_protect(enable, daemon, hardened, allow_self_protect):
             print_warning(f"Hardened environment setup failed: {e}")
             print_warning("Try running with sudo directly, or check system logs.")
             return
+    elif start_background:
+        print_warning("Running in --soft mode: guardian uses your UID and can be killed by agents.")
 
     print_header("deadpush Protect", "One-command setup for AI Agent Guardian (persistent background protection)")
 
@@ -165,7 +186,7 @@ def cmd_protect(enable, daemon, hardened, allow_self_protect):
         # Auto-start helpers for reboot survival (AGENT priority 2)
         try:
             from .guard import run_guardian, setup_autostart, _scoped_plist_path
-            autostart_info = setup_autostart(config.repo_root, hardened=hardened)
+            autostart_info = setup_autostart(config.repo_root, hardened=use_hardened)
             if autostart_info:
                 print("\n[Auto-start for reboots]")
                 print(autostart_info)
@@ -174,7 +195,7 @@ def cmd_protect(enable, daemon, hardened, allow_self_protect):
 
         # In hardened mode, the daemon was already loaded by setup_hardened_environment().
         # In default mode, bootstrap the launchd plist so guardian runs under launchd.
-        if not hardened:
+        if not use_hardened:
             plist_path = _scoped_plist_path(config.repo_root)
             _bootstrapped = False
             if plist_path.exists():
@@ -196,7 +217,7 @@ def cmd_protect(enable, daemon, hardened, allow_self_protect):
             if not _bootstrapped:
                 print("  (launchd bootstrap unavailable — starting guardian directly)")
                 try:
-                    run_guardian(intervention=True, daemon=True, strict=False, hardened=hardened)
+                    run_guardian(intervention=True, daemon=True, strict=False, hardened=use_hardened)
                 except SystemExit:
                     pass
                 except Exception as e:
@@ -340,16 +361,18 @@ def cmd_session_log(limit):
 
 
 @main.command("status")
+@click.option("--repo", type=click.Path(exists=True, file_okay=False), default=None,
+              help="Repo root (default: auto-detect from cwd)")
 @click.option("--hardened", is_flag=True, help="Show status of a hardened guardian")
-def cmd_status(hardened):
+def cmd_status(repo, hardened):
     """Show whether the guardian is running, latest Safety Score, recent incidents, and session info.
 
     This is the primary way to check on your always-on protector without reading logs manually.
     """
     from .config import load_config
-    from .guard import DaemonManager, _scoped_pidfile, _scoped_lockfile, _scoped_portfile, _state_dir
+    from .guard import DaemonManager, _scoped_pidfile, _scoped_lockfile, _scoped_portfile, _scoped_log_file, _state_dir
 
-    config = load_config()
+    config = load_config(explicit_root=Path(repo).resolve() if repo else None)
     repo_root = config.repo_root
     pid_dir = _state_dir(hardened)
     pidfile = _scoped_pidfile(repo_root, hardened)
@@ -372,7 +395,7 @@ def cmd_status(hardened):
         print("   Or:")
         print("     deadpush guard --daemon")
 
-    log = pid_dir / "guardian.log"
+    log = _scoped_log_file(repo_root, hardened)
     if log.exists():
         try:
             text = log.read_text(errors="ignore")
@@ -1034,8 +1057,10 @@ def cmd_uninstall(hardened, force):
 
 
 @main.command("doctor")
+@click.option("--repo", type=click.Path(exists=True, file_okay=False), default=None,
+              help="Repo root (default: auto-detect from cwd)")
 @click.option("--hardened", is_flag=True, help="Check hardened guardian")
-def cmd_doctor(hardened):
+def cmd_doctor(repo, hardened):
     """Run comprehensive health checks on the guardian setup.
 
     Verifies:
@@ -1050,8 +1075,9 @@ def cmd_doctor(hardened):
     from .config import load_config
     from .guard import (
         _scoped_pidfile, _scoped_lockfile, _scoped_portfile,
-        _scoped_plist_label, _scoped_plist_path, _state_dir,
-        DaemonManager
+        _scoped_plist_label, _scoped_plist_path, _scoped_safety_score_file,
+        _scoped_log_file, _state_dir,
+        DaemonManager,
     )
     import subprocess
     import os
@@ -1061,7 +1087,7 @@ def cmd_doctor(hardened):
         from .guard import _use_hardened
         _use_hardened()
 
-    config = load_config()
+    config = load_config(explicit_root=Path(repo).resolve() if repo else None)
     repo_root = config.repo_root
 
     pidfile = _scoped_pidfile(repo_root, hardened)
@@ -1070,8 +1096,8 @@ def cmd_doctor(hardened):
     plist_label = _scoped_plist_label(repo_root)
     plist_path = _scoped_plist_path(repo_root, hardened)
     state_dir = _state_dir(hardened)
-    safety_score_file = state_dir / "safety_score.json"
-    log_file = state_dir / "guardian.log"
+    safety_score_file = _scoped_safety_score_file(repo_root, hardened)
+    log_file = _scoped_log_file(repo_root, hardened)
     shared_port_file = repo_root / ".guardian" / "guardian.control.port"
 
     print_header("deadpush Doctor", f"Health check for {repo_root.name}")
