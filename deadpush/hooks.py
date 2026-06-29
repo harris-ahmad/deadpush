@@ -584,7 +584,7 @@ def setup_mcp_discovery(repo_root: Path) -> None:
 def setup_github_guard_action(repo_root: Path) -> Path | None:
     """Write the GitHub Actions workflow file for server-side push protection.
 
-    The workflow runs on every push: it installs deadpush, scans the outgoing
+    The workflow runs on every push: it installs deadpush, checks outgoing
     commits for guardrail violations, and force-pushes a revert if violations
     are found.
 
@@ -602,7 +602,7 @@ permissions:
   contents: write
 
 jobs:
-  scan:
+  guard:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -612,8 +612,8 @@ jobs:
       - name: Install deadpush
         run: pip install deadpush
 
-      - name: Scan pushed commits
-        id: scan
+      - name: Check pushed commits
+        id: guard
         continue-on-error: true
         run: |
           BEFORE="${{ github.event.before }}"
@@ -629,7 +629,7 @@ jobs:
           fi
 
       - name: Revert on violation
-        if: steps.scan.outcome == 'failure'
+        if: steps.guard.outcome == 'failure'
         run: |
           git config user.name "deadpush Guard"
           git config user.email "guard@deadpush.dev"

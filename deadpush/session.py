@@ -32,8 +32,6 @@ class VibeSession:
     incidents: list[dict[str, Any]] = field(default_factory=list)
     safety_score_start: int = 100
     safety_score_end: int | None = None
-    total_debris_found: int = 0
-    total_dead_symbols: int = 0
 
 
 class SessionManager:
@@ -171,9 +169,7 @@ class SessionManager:
             f"  Duration: {duration}\n"
             f"  Files touched: {len(session.files_changed)}\n"
             f"  Incidents: {len(session.incidents)}\n"
-            f"  Safety: {session.safety_score_start} → {session.safety_score_end or '?'}{score_delta}\n"
-            f"  Debris found: {session.total_debris_found}\n"
-            f"  Dead symbols: {session.total_dead_symbols}"
+            f"  Safety: {session.safety_score_start} → {session.safety_score_end or '?'}{score_delta}"
         )
 
     # ------------------------------------------------------------------
@@ -189,8 +185,6 @@ class SessionManager:
             "incidents": session.incidents,
             "safety_score_start": session.safety_score_start,
             "safety_score_end": session.safety_score_end,
-            "total_debris_found": session.total_debris_found,
-            "total_dead_symbols": session.total_dead_symbols,
         }
 
     def _dict_to_session(self, data: dict[str, Any]) -> VibeSession:
@@ -203,8 +197,6 @@ class SessionManager:
             incidents=data.get("incidents", []),
             safety_score_start=data.get("safety_score_start", 100),
             safety_score_end=data.get("safety_score_end"),
-            total_debris_found=data.get("total_debris_found", 0),
-            total_dead_symbols=data.get("total_dead_symbols", 0),
         )
 
     def _save_active(self, session: VibeSession):

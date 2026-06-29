@@ -3,7 +3,7 @@ Architecture Layer Enforcer — validates import dependencies between layers.
 
 AI agents frequently bypass architectural boundaries, creating direct coupling
 between layers that should remain separate (e.g., views importing models directly).
-This module enforces user-defined layer rules during scans.
+This module enforces user-defined layer rules during guardrail checks.
 """
 
 from __future__ import annotations

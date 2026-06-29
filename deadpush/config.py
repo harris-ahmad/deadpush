@@ -1,13 +1,12 @@
 """
-Configuration loading for deadpush.
+Configuration loading for deadpush guardian.
 
 Supports:
 - Auto-detection of repo root (.git, pyproject.toml, etc.)
-- Language enablement
-- Entrypoint configuration
 - Debris blocking/warning rules
+- Blocked file patterns (LLM context files, etc.)
 - Custom ignore patterns (merged with .gitignore etc.)
-- Optional loading from pyproject.toml [tool.deadpush] or .deadpush.toml
+- Optional loading from pyproject.toml [tool.deadpush] or deadpush.toml
 """
 
 from __future__ import annotations
@@ -17,50 +16,17 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 import tomllib
-import pathspec
-
-
-SUPPORTED_LANGUAGES = [
-    "python",
-    "typescript",
-    "javascript",
-    "go",
-    "rust",
-    "cpp",
-    "java",
-]
-
-
-@dataclass
-class EntrypointsConfig:
-    """Configuration for entry point detection."""
-    include: list[str] = field(default_factory=list)
-    dynamic_patterns: list[str] = field(default_factory=lambda: [
-        r"main\b", r"__main__", r"if __name__",
-        r"app\.run", r"server\.(start|listen)", r"cli\."
-    ])
 
 
 @dataclass
 class DebrisConfig:
-    """Rules for debris categories."""
+    """Rules for guardian debris categories."""
     block_categories: set[str] = field(default_factory=lambda: {
-        "hardcoded_secret", "llm_context_file", "chat_export"
+        "hardcoded_secret", "llm_context_file", "chat_export",
     })
     warn_categories: set[str] = field(default_factory=lambda: {
-        "vibe_scratchpad", "duplicate_file", "ai_regenerated_duplicate",
-        "dev_artifact", "env_file", "silent_failure", "hallucinated_import",
-        "weak_test", "no_assertions", "tautology", "empty_test",
-        "prompt_injection",
+        "vibe_scratchpad", "prompt_injection",
     })
-
-
-@dataclass
-class DeadCodeConfig:
-    """Configuration for dead code analysis (multi-factor scoring)."""
-    min_confidence: str = "high"
-    show_uncertain: bool = False
-    custom_registrations: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -80,6 +46,7 @@ class BlockConfig:
         ".claude_instructions",
         ".copilot-instructions.md",
         "windsurf_rules.md",
+        "agents.md",
     ])
     blocked_patterns: list[str] = field(default_factory=list)
 
@@ -104,20 +71,17 @@ def _load_deadpush_toml(root: Path) -> dict[str, Any]:
 class Config:
     """Main deadpush configuration object passed around the system."""
     repo_root: Path
-    languages: list[str] = field(default_factory=lambda: list(SUPPORTED_LANGUAGES))
-    entrypoints: EntrypointsConfig = field(default_factory=EntrypointsConfig)
     debris: DebrisConfig = field(default_factory=DebrisConfig)
-    dead_code: DeadCodeConfig = field(default_factory=DeadCodeConfig)
     test: TestConfig = field(default_factory=TestConfig)
     block: BlockConfig = field(default_factory=BlockConfig)
     ignore_patterns: list[str] = field(default_factory=lambda: [
         "__pycache__/", ".git/", "node_modules/", ".deadpush-archive/",
         ".venv/", "venv/", "dist/", "build/", "*.pyc", ".mypy_cache/",
-        "target/", "Cargo.lock", "package-lock.json"
+        "target/", "Cargo.lock", "package-lock.json",
+        ".deadpush-quarantine/", ".deadpush/",
     ])
     max_file_size_mb: int = 5
     control_port: int = 14242
-    # Sensitive config files that trigger warnings when modified
     sensitive_config_patterns: list[str] = field(default_factory=lambda: [
         "Dockerfile*", "docker-compose*", ".dockerignore",
         ".github/workflows/*", ".gitlab-ci.yml", "Jenkinsfile*",
@@ -127,17 +91,6 @@ class Config:
         "Procfile", "systemd/*.service", "*.plist",
         "nginx.conf", "nginx/*.conf", ".env.production", ".env.staging",
     ])
-
-    def is_language_enabled(self, name: str) -> bool:
-        name = name.lower()
-        if name == "ts":
-            name = "typescript"
-        if name == "js":
-            name = "javascript"
-        if name == "c++":
-            name = "cpp"
-        enabled = [l.lower() for l in self.languages]
-        return name in enabled or name in [l.split()[0] for l in enabled]
 
     def should_block_debris_category(self, category: str) -> bool:
         return category in self.debris.block_categories
@@ -155,10 +108,9 @@ class Config:
         return False
 
     def get_effective_ignore_spec(self) -> "pathspec.PathSpec":
-        """Build a pathspec for filtering. (lazy import to avoid hard dep at top)"""
+        """Build a pathspec for filtering."""
         import pathspec
         patterns = list(self.ignore_patterns)
-        # Merge .gitignore if present
         gi = self.repo_root / ".gitignore"
         if gi.exists():
             try:
@@ -171,10 +123,7 @@ class Config:
         return pathspec.PathSpec.from_lines("gitwildmatch", patterns)
 
     def is_blocked(self, rel_path: str) -> bool:
-        """Check if a relative file path matches any blocked file/pattern.
-
-        Case-insensitive (matches across platforms and agent casing whims).
-        """
+        """Check if a relative file path matches any blocked file/pattern."""
         rp = rel_path.replace("\\", "/")
         name = Path(rp).name
         if name.lower() in (b.lower() for b in self.block.blocked_files):
@@ -189,16 +138,15 @@ class Config:
     def to_dict(self) -> dict[str, Any]:
         return {
             "repo_root": str(self.repo_root),
-            "languages": self.languages,
-            "entrypoints": {
-                "include": self.entrypoints.include,
-                "dynamic_patterns": self.entrypoints.dynamic_patterns,
+            "block": {
+                "blocked_files": self.block.blocked_files,
+                "blocked_patterns": self.block.blocked_patterns,
             },
         }
 
 
 def _find_repo_root(start: Path | None = None) -> Path:
-    """Walk up to find likely repo root. Robust to deleted cwd (e.g. during tests or rm -rf while in dir)."""
+    """Walk up to find likely repo root."""
     if start is None:
         try:
             start = Path.cwd()
@@ -217,57 +165,34 @@ def _find_repo_root(start: Path | None = None) -> Path:
 def load_config(explicit_root: Path | None = None) -> Config:
     """Load config, merging file-based overrides if present."""
     root = explicit_root or _find_repo_root()
-
     cfg = Config(repo_root=root)
 
-    # Try pyproject.toml [tool.deadpush]
     pyproj = root / "pyproject.toml"
     if pyproj.exists():
         try:
             data = tomllib.loads(pyproj.read_text(encoding="utf-8"))
             tool = data.get("tool", {}).get("deadpush", {})
-            if "languages" in tool:
-                cfg.languages = [str(x) for x in tool["languages"]]
-            if "entrypoints" in tool:
-                ep = tool["entrypoints"]
-                if "include" in ep:
-                    cfg.entrypoints.include = list(ep["include"])
-                if "dynamic_patterns" in ep:
-                    cfg.entrypoints.dynamic_patterns = list(ep["dynamic_patterns"])
             if "ignore" in tool:
                 cfg.ignore_patterns.extend(tool["ignore"])
             if "max_file_size_mb" in tool:
                 cfg.max_file_size_mb = int(tool["max_file_size_mb"])
             if "control_port" in tool:
                 cfg.control_port = int(tool["control_port"])
-            if "dead_code" in tool:
-                dc = tool["dead_code"]
-                if "min_confidence" in dc:
-                    cfg.dead_code.min_confidence = str(dc["min_confidence"])
-                if "show_uncertain" in dc:
-                    cfg.dead_code.show_uncertain = bool(dc["show_uncertain"])
-                if "custom_registrations" in dc:
-                    cfg.dead_code.custom_registrations = list(dc["custom_registrations"])
+            block_data = tool.get("block", {})
+            if "blocked_files" in block_data:
+                cfg.block.blocked_files = list(block_data["blocked_files"])
+            if "blocked_patterns" in block_data:
+                cfg.block.blocked_patterns = list(block_data["blocked_patterns"])
         except Exception:
-            pass  # ignore bad toml, use defaults
+            pass
 
-    # deadpush.toml / .deadpush.toml / .deadpush/config.toml
     dpt_data = _load_deadpush_toml(root)
     if dpt_data:
-        if "languages" in dpt_data:
-            cfg.languages = [str(x) for x in dpt_data["languages"]]
         block_data = dpt_data.get("block", {})
         if "blocked_files" in block_data:
             cfg.block.blocked_files = list(block_data["blocked_files"])
         if "blocked_patterns" in block_data:
             cfg.block.blocked_patterns = list(block_data["blocked_patterns"])
-        dc_data = dpt_data.get("dead_code", {})
-        if "min_confidence" in dc_data:
-            cfg.dead_code.min_confidence = str(dc_data["min_confidence"])
-        if "show_uncertain" in dc_data:
-            cfg.dead_code.show_uncertain = bool(dc_data["show_uncertain"])
-        if "custom_registrations" in dc_data:
-            cfg.dead_code.custom_registrations = list(dc_data["custom_registrations"])
         test_data = dpt_data.get("tests", {})
         if "command" in test_data:
             cfg.test.command = str(test_data["command"])
@@ -276,13 +201,4 @@ def load_config(explicit_root: Path | None = None) -> Config:
         if "enabled" in test_data:
             cfg.test.enabled = bool(test_data["enabled"])
 
-    # Env var overrides for quick use
-    if os.environ.get("DEADPUSH_LANGUAGES"):
-        cfg.languages = [x.strip() for x in os.environ["DEADPUSH_LANGUAGES"].split(",") if x.strip()]
-
     return cfg
-
-
-# Convenience for tests / direct use
-def get_default_languages() -> list[str]:
-    return list(SUPPORTED_LANGUAGES)
