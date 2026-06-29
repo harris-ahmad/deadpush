@@ -628,9 +628,11 @@ def cmd_unfreeze(hardened):
 
 
 @main.command("stop")
+@click.option("--repo", type=click.Path(exists=True, file_okay=False), default=None,
+              help="Repo root to stop (default: auto-detect from cwd)")
 @click.option("--hardened", is_flag=True, help="Stop a hardened guardian")
 @click.option("--force", is_flag=True, help="Force cleanup of stale lock/PID files (use if guardian crashed)")
-def cmd_stop(hardened, force):
+def cmd_stop(repo, hardened, force):
     """Stop the deadpush guardian and clean up.
 
     Sends SIGTERM to the guardian (which saves safety score with a clean-shutdown
@@ -650,18 +652,18 @@ def cmd_stop(hardened, force):
         _scoped_portfile,
         _scoped_plist_label,
         _scoped_plist_path,
-        _shadow_tag,
+        stop_shadow_for_repo,
     )
     from .hooks import _make_mutable
 
-    config = load_config()
+    config = load_config(explicit_root=Path(repo).resolve() if repo else None)
     repo_root = config.repo_root
     pidfile = _scoped_pidfile(repo_root, hardened)
     lockfile = _scoped_lockfile(repo_root, hardened)
     plist_label = _scoped_plist_label(repo_root)
     plist_path = _scoped_plist_path(repo_root, hardened)
     portfile = _scoped_portfile(repo_root, hardened)
-    shadow_tag = _shadow_tag(repo_root)
+    shadow_pidfile = pidfile.with_suffix(".shadow")
 
     # Force cleanup mode: just remove all state files and exit
     if force:
@@ -687,28 +689,15 @@ def cmd_stop(hardened, force):
     guardian_killed = False
     shadow_killed = False
 
-    # 1. Kill shadow processes first (they re-spawn the guardian)
+    # 1. Kill shadow processes first (they re-spawn the guardian) — repo-scoped only
     if not hardened:
-        try:
-            r = subprocess.run(
-                ["pgrep", "-f", shadow_tag],
-                capture_output=True, text=True, timeout=5,
-            )
-            if r.returncode == 0:
-                pids = [int(p) for p in r.stdout.strip().splitlines() if p.strip()]
-                for pid in pids:
-                    try:
-                        os.kill(pid, signal.SIGKILL)
-                        shadow_killed = True
-                    except OSError:
-                        pass
-                if shadow_killed:
-                    print(f"  Killed {len(pids)} shadow process(es)")
-                time.sleep(0.2)
-        except Exception:
-            pass
+        count = stop_shadow_for_repo(repo_root, hardened)
+        if count:
+            shadow_killed = True
+            print(f"  Killed {count} shadow process(es)")
+            time.sleep(0.2)
 
-    # 2. Kill guardian via PID file
+    # 2. Kill guardian via PID file for this repo only
     guardian_pid = None
     if hardened:
         try:
@@ -774,36 +763,7 @@ def cmd_stop(hardened, force):
         except OSError:
             print(f"  Guardian PID {guardian_pid} not running (stale PID file)")
 
-    # 3. Kill any remaining deadpush guard processes not caught above
-    if not guardian_killed:
-        try:
-            pgrep_cmd = ["sudo", "pgrep"] if hardened else ["pgrep"]
-            r = subprocess.run(
-                pgrep_cmd + ["-f", "-x", r"python.*-m deadpush\.cli guard"],
-                capture_output=True, text=True, timeout=5,
-            )
-            if r.returncode == 0:
-                pids = [int(p) for p in r.stdout.strip().splitlines() if p.strip()]
-                my_pid = os.getpid()
-                for pid in pids:
-                    if hardened or pid != my_pid:
-                        try:
-                            if hardened:
-                                subprocess.run(
-                                    ["sudo", "kill", str(pid)],
-                                    capture_output=True, timeout=5,
-                                )
-                            else:
-                                os.kill(pid, signal.SIGTERM)
-                            guardian_killed = True
-                        except OSError:
-                            pass
-                if guardian_killed:
-                    print(f"  Killed {len(pids)} remaining guardian process(es)")
-        except Exception:
-            pass
-
-    # 4. Launchctl bootout (unload plist, prevents re-spawn)
+    # 3. Launchctl bootout (unload plist, prevents re-spawn)
     try:
         if hardened:
             r = subprocess.run(
@@ -838,8 +798,8 @@ def cmd_stop(hardened, force):
     except OSError as e:
         print(f"  Could not remove plist: {e}")
 
-    # 6. Clean up PID / lock / port files
-    for f in [pidfile, lockfile, portfile]:
+    # 6. Clean up PID / lock / port / shadow files for this repo only
+    for f in [pidfile, lockfile, portfile, shadow_pidfile]:
         try:
             if hardened:
                 subprocess.run(["sudo", "rm", "-f", str(f)], capture_output=True, text=True, timeout=10)

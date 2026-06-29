@@ -106,7 +106,7 @@ class DaemonManager:
                 self.lock_fd.close()
             return False
 
-    def write_pid(self):
+    def write_pid(self, repo_root: Path | None = None):
         pid = os.getpid()
         with self.pidfile.open("w") as f:
             f.write(str(pid))
@@ -114,7 +114,19 @@ class DaemonManager:
         start_time = time.clock_gettime(time.CLOCK_MONOTONIC)
         with self.startfile.open("w") as f:
             f.write(str(start_time))
+        if repo_root is not None:
+            self.holderfile.write_text(str(repo_root.resolve()), encoding="utf-8")
         self.logger.info(f"Daemon started with PID {pid}")
+
+    def _state_files(self) -> tuple[Path, ...]:
+        return (
+            self.pidfile,
+            self.lockfile,
+            self.startfile,
+            self.holderfile,
+            self.pidfile.with_suffix(".repo"),
+            self.pidfile.with_suffix(".shadow"),
+        )
 
     def cleanup(self):
         if self.lock_fd:
@@ -123,7 +135,7 @@ class DaemonManager:
                 self.lock_fd.close()
             except Exception:
                 pass
-        for f in (self.pidfile, self.lockfile, self.startfile, self.holderfile):
+        for f in self._state_files():
             if f.exists():
                 try:
                     f.unlink()
@@ -132,7 +144,7 @@ class DaemonManager:
 
     def force_cleanup(self):
         """Force remove all daemon state files (for stale lock recovery)."""
-        for f in (self.pidfile, self.lockfile, self.startfile, self.holderfile):
+        for f in self._state_files():
             if f.exists():
                 try:
                     f.unlink()
@@ -1109,6 +1121,21 @@ class GuardianHandler(FileSystemEventHandler or object):
             self.logger.warning("Shadow process died, restarting...")
             self._start_shadow()
 
+    def _stop_shadow(self) -> None:
+        """Terminate the per-repo shadow watchdog (prevents respawn after stop)."""
+        if self.shadow_process is not None:
+            try:
+                if self.shadow_process.poll() is None:
+                    self.shadow_process.terminate()
+                    self.shadow_process.wait(timeout=3)
+            except Exception:
+                try:
+                    self.shadow_process.kill()
+                except Exception:
+                    pass
+            self.shadow_process = None
+        stop_shadow_for_repo(self.config.repo_root, self.hardened)
+
     # ------------------------------------------------------------------
     # MCP suspension (disables agent's MCP access when score is critical)
     # ------------------------------------------------------------------
@@ -1640,6 +1667,37 @@ def _shadow_tag(repo_root: Path) -> str:
     return f"{_SHADOW_TAG_PREFIX}{_repo_id(str(repo_root))}"
 
 
+def stop_shadow_for_repo(repo_root: Path, hardened: bool = False) -> int:
+    """Kill shadow process(es) scoped to one repo. Returns count killed."""
+    import signal
+
+    tag = _shadow_tag(repo_root)
+    killed = 0
+    try:
+        r = subprocess.run(
+            ["pgrep", "-f", tag],
+            capture_output=True, text=True, timeout=5,
+        )
+        if r.returncode == 0:
+            my_pid = os.getpid()
+            for line in r.stdout.strip().splitlines():
+                if not line.strip():
+                    continue
+                pid = int(line.strip())
+                if pid == my_pid:
+                    continue
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                    killed += 1
+                except OSError:
+                    pass
+    except Exception:
+        pass
+    shadow_pidfile = _scoped_pidfile(repo_root, hardened).with_suffix(".shadow")
+    shadow_pidfile.unlink(missing_ok=True)
+    return killed
+
+
 def start_shadow_process(guardian_pid: int, pidfile: Path, respawn_cmd: list[str], repo_root: Path) -> subprocess.Popen | None:
     """Launch a shadow subprocess that re-spawns the guardian if it dies.
 
@@ -1762,7 +1820,7 @@ def run_guardian(intervention: bool = True, daemon: bool = False, strict: bool =
                 except OSError:
                     pass
 
-            daemon_mgr.write_pid()
+            daemon_mgr.write_pid(config.repo_root)
             atexit.register(daemon_mgr.cleanup)
 
             handler = GuardianHandler(config, intervention=intervention, strict_mode=strict, daemon=daemon, logger=logger, hardened=hardened)
@@ -1775,13 +1833,13 @@ def run_guardian(intervention: bool = True, daemon: bool = False, strict: bool =
             # Start control server in the final daemon process (post-fork)
             _start_control_server(control_server, logger, config.repo_root, hardened)
 
-            _run_observer(handler, logger)
+            _run_observer(handler, logger, daemon_mgr)
         except Exception as e:
             logger.error(f"Daemon failed: {e}")
             daemon_mgr.cleanup()
     else:
         logger.info("Starting in FOREGROUND mode...")
-        daemon_mgr.write_pid()
+        daemon_mgr.write_pid(config.repo_root)
         atexit.register(daemon_mgr.cleanup)
 
         handler = GuardianHandler(config, intervention=intervention, strict_mode=strict, daemon=daemon, logger=logger, hardened=hardened)
@@ -1793,7 +1851,7 @@ def run_guardian(intervention: bool = True, daemon: bool = False, strict: bool =
 
         _start_control_server(control_server, logger, config.repo_root, hardened)
 
-        _run_observer(handler, logger)
+        _run_observer(handler, logger, daemon_mgr)
 
 
 def _start_control_server(control_server, logger, repo_root, hardened):
@@ -1816,7 +1874,7 @@ def _start_control_server(control_server, logger, repo_root, hardened):
         logger.warning("Local control interface could not be started (agents can fall back to `deadpush status` / CLI)")
 
 
-def _run_observer(handler: GuardianHandler, logger):
+def _run_observer(handler: GuardianHandler, logger, daemon_mgr: DaemonManager | None = None):
     """Run the filesystem observer with automatic recovery on crashes.
 
     This improves daemon reliability: if the watcher thread dies (e.g. transient FS error,
@@ -1828,27 +1886,37 @@ def _run_observer(handler: GuardianHandler, logger):
 
     backoff = 1
     max_backoff = 30
+    running = True
 
     def shutdown(signum, frame):
+        nonlocal running
+        if not running:
+            return
+        running = False
         logger.info("Guardian shutting down gracefully...")
         try:
             handler.safety_score.mark_clean_shutdown()
         except Exception:
             pass
-        if 'observer' in locals() and observer:
+        try:
+            handler._stop_shadow()
+        except Exception:
+            pass
+        if daemon_mgr is not None:
             try:
-                observer.stop()
+                daemon_mgr.cleanup()
             except Exception:
                 pass
-        # note: sys.exit will be caught by outer if needed
 
     signal.signal(signal.SIGTERM, shutdown)
     signal.signal(signal.SIGINT, shutdown)
 
     observer = None
     try:
-        while True:
+        while running:
             try:
+                if not running:
+                    break
                 if observer is None or not getattr(observer, 'is_alive', lambda: False)():
                     if observer is not None:
                         try:
@@ -1867,6 +1935,8 @@ def _run_observer(handler: GuardianHandler, logger):
                 handler._check_suspension()
                 time.sleep(1)
             except Exception as e:
+                if not running:
+                    break
                 logger.error(f"Watcher error (auto-recovering in {backoff}s): {e}")
                 if observer:
                     try:
@@ -1878,11 +1948,21 @@ def _run_observer(handler: GuardianHandler, logger):
                 observer = None  # force recreate next iter
     except KeyboardInterrupt:
         logger.info("Guardian interrupted.")
+        running = False
     finally:
+        try:
+            handler._stop_shadow()
+        except Exception:
+            pass
         if observer:
             try:
                 observer.stop()
                 observer.join(timeout=3)
+            except Exception:
+                pass
+        if daemon_mgr is not None:
+            try:
+                daemon_mgr.cleanup()
             except Exception:
                 pass
         logger.info("Observer stopped.")
