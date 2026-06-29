@@ -6,9 +6,9 @@ This project uses **deadpush**: an agent-native guardrail system that intercepts
 
 - Write files normally via MCP (`write_file` tool). Guardrails run automatically.
 - If blocked → read the feedback file → fix the issue → retry.
-- If you hit a false positive → `add_allowed_pattern` to whitelist the code.
+- If you hit a false positive → `add_allowed_pattern` to whitelist the code (requires `deadpush mcp --danger`).
 
-## MCP Tools (24 available)
+## MCP Tools
 
 Connect via `deadpush mcp` (stdio JSON-RPC on `2024-11-05` protocol).
 
@@ -17,34 +17,27 @@ Connect via `deadpush mcp` (stdio JSON-RPC on `2024-11-05` protocol).
 |---|---|
 | `write_file(path, content)` | Write through guardrails. Blocked files go to quarantine + feedback. |
 | `check_file(path, content)` | Preview: would the file pass? Returns violations without writing. |
+| `verify_write(path, content)` | Write + run related tests. File only persists if tests pass. |
+| `get_write_diff(path, content)` | Preview diff + guardrail violations before writing. |
+| `retry_write(path, content)` | Submit corrected content for a previously blocked file. |
 
-### Scan
+### Quarantine
 | Tool | What it does |
 |---|---|
-| `scan` | Full analysis summary (dead symbols, debris, test issues, etc.) |
-| `get_dead_symbols` | Unreachable code |
-| `get_debris` | AI artifacts, stale files |
-| `get_test_issues` | No-assertion / tautology / empty tests |
-| `get_stale_docs` | Docstring-param mismatches |
-| `get_layer_violations` | Architectural import violations |
-| `get_security_boundaries` | Untested security-sensitive ops |
-| `get_complexity_alerts` | Complexity spikes |
-
-### Clean / Quarantine
-| Tool | What it does |
-|---|---|
-| `clean(mode)` | Remove dead code / debris (safe, dry_run, force) |
 | `quarantine_list(limit)` | List quarantined files |
-| `quarantine_restore(name)` | Restore from quarantine |
+| `quarantine_restore(name)` | Restore from quarantine (danger mode) |
 
 ### Feedback
 | Tool | What it does |
 |---|---|
 | `get_feedback(limit)` | Read recent guardrail feedback |
+| `get_recent_feedback(limit)` | Unacknowledged feedback only |
+| `acknowledge_feedback(name)` | Mark feedback as read/addressed |
 | `get_status` | Current paths + available tools |
 | `get_safety_score` | Latest guardian score |
+| `get_test_results(limit)` | Recent verify_write test output |
 
-### Config (agent self-service)
+### Config (agent self-service — danger mode for softening actions)
 | Tool | What it does |
 |---|---|
 | `get_runtime_config` | View all current rules |
@@ -53,14 +46,11 @@ Connect via `deadpush mcp` (stdio JSON-RPC on `2024-11-05` protocol).
 | `ignore_path(path)` | Skip a file entirely |
 | `set_guardrail_level(category, level)` | Set severity: `off`, `warn`, or `block` |
 | `reset_runtime_config` | Clear all overrides to defaults |
+| `allow_sensitive_write(path)` | Opt in to writing a sensitive config file |
+| `learn_false_positive(category, pattern, reason)` | Teach deadpush to suppress a false positive |
+| `adjudicate_finding(...)` | Structured adjudication rubric for a finding |
 
 All tools return `{"success": bool, "data": ..., "summary": "..."}`.
-
-### Diff / Preview
-| Tool | What it does |
-|---|---|
-| `get_write_diff(path, content)` | Preview diff + guardrail violations before writing |
-| `allow_sensitive_write(path)` | Opt in to writing a sensitive config file (CI/CD, Docker, etc.) |
 
 ## Guardrail Categories
 
@@ -72,7 +62,7 @@ All tools return `{"success": bool, "data": ..., "summary": "..."}`.
 | `layer` | `block` | Imports violating architecture layer rules |
 | `sensitive` | `block` | Writes to CI/CD, deployment, Docker, and other sensitive config files |
 | `destructive` | `warn` | Near-empty rewrites of substantial files, >50% line reduction |
-| `debris` | `warn` | TODO stubs, FIXME markers, bare `pass` statements |
+| `debris` | `warn` | LLM context files, scratchpads, hardcoded secrets in debris scan |
 | `dependency` | `warn` | Typosquat packages, suspicious package names in dep files |
 
 ## Self-Correction Flow
@@ -94,8 +84,6 @@ Then retry — it will pass.
 
 Persisted in `.deadpush/rules.json`. Survives server restarts.
 Modify via MCP tools above. Do NOT edit the file directly.
-
-Use `set_guardrail_level("prompt_injection", "warn")` to downgrade a category to warning-only (doesn't block, just reports).
 
 ## What NOT To Do
 

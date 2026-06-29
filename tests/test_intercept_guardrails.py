@@ -26,10 +26,8 @@ from deadpush.intercept import (
     _check_dependency_integrity,
     _run_guardrails,
     enforce_content,
-    STAGING_DIR,
     FEEDBACK_DIR,
     QUARANTINE_DIR,
-    _get_file_rel,
     _write_feedback,
 )
 from deadpush.rules import RuntimeConfig
@@ -204,55 +202,30 @@ class TestLayerViolationsChecker:
 
 
 # ======================================================================
-# _get_file_rel
-# ======================================================================
-
-class TestGetFileRel:
-    def test_normal_path(self, temp_dir):
-        staging = temp_dir / STAGING_DIR
-        staged = staging / "src" / "main.py"
-        staged.parent.mkdir(parents=True)
-        staged.touch()
-        assert _get_file_rel(staged, staging) == "src/main.py"
-
-    def test_outside_staging(self, temp_dir):
-        staging = temp_dir / STAGING_DIR
-        other = temp_dir / "other.py"
-        other.touch()
-        assert _get_file_rel(other, staging) == "other.py"
-
-
-# ======================================================================
 # _run_guardrails pipeline
 # ======================================================================
 
 class TestRunGuardrails:
     def test_clean_file_allowed(self, temp_dir):
-        staging = temp_dir / STAGING_DIR
-        staging.mkdir(parents=True)
-        f = staging / "hello.py"
+        f = temp_dir / "hello.py"
         f.write_text("x = 1\n")
         config = Config(repo_root=temp_dir)
-        result = _run_guardrails(f, staging, config)
+        result = _run_guardrails(f, temp_dir, config)
         assert result.allowed is True
 
     def test_dangerous_file_blocked(self, temp_dir):
-        staging = temp_dir / STAGING_DIR
-        staging.mkdir(parents=True)
-        f = staging / "hack.py"
+        f = temp_dir / "hack.py"
         f.write_text("eval(user_input)\n")
         config = Config(repo_root=temp_dir)
-        result = _run_guardrails(f, staging, config)
+        result = _run_guardrails(f, temp_dir, config)
         assert result.allowed is False
         assert any(v.category == "security" for v in result.violations)
 
     def test_unreadable_file_blocked(self, temp_dir):
-        staging = temp_dir / STAGING_DIR
-        staging.mkdir(parents=True)
-        f = staging / "test.py"
+        f = temp_dir / "test.py"
         f.write_text("")
         config = Config(repo_root=temp_dir)
-        result = _run_guardrails(f, staging, config)
+        result = _run_guardrails(f, temp_dir, config)
         # Should not crash — empty file should be clean
         assert result.allowed is True
 
@@ -330,8 +303,12 @@ class TestInterceptDaemon:
         d = InterceptDaemon(str(temp_repo), config)
         result = d.write_file("evil.py", "eval(exploit)\n")
         assert result.allowed is False
-        # Should not exist at project root
+        # File was quarantined — should not exist at project root
         assert not (temp_repo / "evil.py").exists()
+        # Should be in quarantine
+        qdir = temp_repo / QUARANTINE_DIR
+        assert qdir.exists()
+        assert any(qdir.iterdir())
 
 
 # ======================================================================

@@ -14,6 +14,7 @@ import difflib
 import json
 import re
 import sys
+import tempfile
 import threading
 import time
 from datetime import datetime
@@ -21,7 +22,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .intercept import InterceptDaemon, GuardrailResult, Violation
-from .intercept import _run_guardrails, _check_sensitive_write, _check_destructive_changes, STAGING_DIR, FEEDBACK_DIR
+from .intercept import _run_guardrails, FEEDBACK_DIR
 from .config import load_config
 from .guard import _scoped_suspend_file
 from .rules import RuntimeConfig
@@ -149,65 +150,6 @@ class McpServer:
                         "content": {"type": "string"},
                     },
                     "required": ["path", "content"],
-                },
-            },
-            # --- Scan ---
-            {
-                "name": "scan",
-                "description": "Run full deadpush analysis. Returns dead symbols, debris, test issues, stale docs, layer violations, security boundaries, and complexity alerts as structured JSON.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {},
-                },
-            },
-            {
-                "name": "get_dead_symbols",
-                "description": "Get all unreachable/dead code symbols detected by reachability analysis.",
-                "inputSchema": {"type": "object", "properties": {}},
-            },
-            {
-                "name": "get_debris",
-                "description": "Get all debris items (AI artifacts, temp files, context dumps, chat exports).",
-                "inputSchema": {"type": "object", "properties": {}},
-            },
-            {
-                "name": "get_test_issues",
-                "description": "Get test quality issues (no-assertion tests, tautologies, empty tests).",
-                "inputSchema": {"type": "object", "properties": {}},
-            },
-            {
-                "name": "get_stale_docs",
-                "description": "Get stale/mismatched documentation (docstring params that don't match signatures).",
-                "inputSchema": {"type": "object", "properties": {}},
-            },
-            {
-                "name": "get_layer_violations",
-                "description": "Get architecture layer import violations.",
-                "inputSchema": {"type": "object", "properties": {}},
-            },
-            {
-                "name": "get_security_boundaries",
-                "description": "Get untested security-sensitive operations (eval, subprocess, crypto, SQL, etc.).",
-                "inputSchema": {"type": "object", "properties": {
-                    "min_severity": {"type": "string", "description": "Minimum severity: low, medium, high, critical"},
-                }},
-            },
-            {
-                "name": "get_complexity_alerts",
-                "description": "Get files with significant complexity increases from baseline.",
-                "inputSchema": {"type": "object", "properties": {
-                    "min_pct": {"type": "number", "description": "Minimum percentage increase to report (default 20)"},
-                }},
-            },
-            # --- Clean ---
-            {
-                "name": "clean",
-                "description": "Clean dead code and debris. By default uses safe mode (archives with explanations). Returns list of items cleaned.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "mode": {"type": "string", "description": "cleanup mode: safe (archive, default), dry_run (preview), force (delete)"},
-                    },
                 },
             },
             # --- Quarantine ---
@@ -426,19 +368,6 @@ class McpServer:
     # -----------------------------------------------------------------------
     # Tool handlers — all return structured JSON
     # -----------------------------------------------------------------------
-    def _run_analysis(self) -> dict[str, Any]:
-        """Run full analysis and return structured results."""
-        from .cli import _run_full_analysis
-        from concurrent.futures import ThreadPoolExecutor
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            future = pool.submit(_run_full_analysis, self.config)
-            try:
-                return future.result(timeout=60)
-            except TimeoutError:
-                return _err("Analysis timed out after 60s")
-            except Exception as e:
-                return _err(f"Analysis failed: {e}")
-
     def _tool_write_file(self, args: dict[str, Any]) -> dict[str, Any]:
         path = args.get("path", "")
         content = args.get("content", "")
@@ -557,119 +486,21 @@ class McpServer:
         content = args.get("content", "")
         if not path:
             return _err("path is required")
-        staging_dir = self.daemon.staging_dir
+        rel = path.replace("\\", "/")
         try:
-            staging_path = (staging_dir / path).resolve()
-            staging_path.parent.mkdir(parents=True, exist_ok=True)
-            staging_path.write_text(content, encoding="utf-8")
-            result = _run_guardrails(staging_path, staging_dir, self.config, self.runtime)
-            staging_path.unlink(missing_ok=True)
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=Path(path).suffix, delete=False, dir=str(self.repo_root)
+            ) as f:
+                f.write(content)
+                tmp_path = Path(f.name)
+            result = _run_guardrails(tmp_path, self.repo_root, self.config, self.runtime, rel_path_override=rel)
         except Exception:
-            staging_path.unlink(missing_ok=True)
             return _err("Could not process file")
+        finally:
+            tmp_path.unlink(missing_ok=True)
         violations = [{"category": v.category, "description": v.description, "line": v.line, "severity": v.severity} for v in result.violations]
         return _ok({"path": path, "would_block": len(violations) > 0, "violations": violations},
                     f"{'Would be blocked' if violations else 'Would be approved'} ({len(violations)} violation(s)).")
-
-    def _tool_scan(self, args: dict[str, Any]) -> dict[str, Any]:
-        result = self._run_analysis()
-        return _ok({
-            "files_scanned": len(result.get("files", [])),
-            "dead_symbols_count": len(result.get("dead_symbols", [])),
-            "debris_count": len(result.get("debris", [])),
-            "test_issues_count": len(result.get("test_issues", [])),
-            "stale_docs_count": len(result.get("stale_docs", [])),
-            "layer_violations_count": len(result.get("layer_violations", [])),
-            "complexity_alerts_count": len(result.get("complexity_alerts", [])),
-            "security_untested_count": len(getattr(result.get("security_report"), "untested", [])),
-        }, "Scan complete.")
-
-    def _tool_get_dead_symbols(self, args: dict[str, Any]) -> dict[str, Any]:
-        result = self._run_analysis()
-        dead = result.get("dead_symbols", [])
-        symbols = []
-        for d in dead:
-            s = d.symbol if hasattr(d, "symbol") else d
-            symbols.append({
-                "name": getattr(s, "name", str(s)),
-                "file": getattr(s, "path", getattr(d, "path", "")),
-                "confidence": getattr(d, "confidence", 1.0),
-                "reason": getattr(d, "reason", ""),
-            })
-        return _ok({"count": len(symbols), "symbols": symbols}, f"{len(symbols)} dead symbols found.")
-
-    def _tool_get_debris(self, args: dict[str, Any]) -> dict[str, Any]:
-        result = self._run_analysis()
-        items = [{"file": d.path, "category": d.category, "description": d.description, "block_push": getattr(d, "block_push", False)}
-                 for d in result.get("debris", [])]
-        return _ok({"count": len(items), "items": items}, f"{len(items)} debris items found.")
-
-    def _tool_get_test_issues(self, args: dict[str, Any]) -> dict[str, Any]:
-        result = self._run_analysis()
-        issues = [{"file": t.file, "line": t.line, "issue_type": t.issue_type, "description": t.description}
-                  for t in result.get("test_issues", [])]
-        return _ok({"count": len(issues), "issues": issues}, f"{len(issues)} test quality issues found.")
-
-    def _tool_get_stale_docs(self, args: dict[str, Any]) -> dict[str, Any]:
-        result = self._run_analysis()
-        docs = [{"file": d.file, "line": d.line, "issue_type": d.issue_type, "description": d.description}
-                for d in result.get("stale_docs", [])]
-        return _ok({"count": len(docs), "issues": docs}, f"{len(docs)} stale documentation issues found.")
-
-    def _tool_get_layer_violations(self, args: dict[str, Any]) -> dict[str, Any]:
-        result = self._run_analysis()
-        violations = [{"file": v.file, "line": v.line, "description": v.description} for v in result.get("layer_violations", [])]
-        return _ok({"count": len(violations), "violations": violations}, f"{len(violations)} layer violations found.")
-
-    def _tool_get_security_boundaries(self, args: dict[str, Any]) -> dict[str, Any]:
-        result = self._run_analysis()
-        sec = result.get("security_report")
-        if not sec:
-            return _ok({"count": 0, "boundaries": []}, "No security data.")
-        untested = [{"file": s.file, "line": s.line, "category": s.category, "description": s.description}
-                    for s in sec.untested]
-        tested = [{"file": s.file, "line": s.line, "category": s.category, "description": s.description}
-                  for s in sec.tested]
-        return _ok({"count_untested": len(untested), "count_tested": len(tested), "untested": untested, "tested": tested},
-                   f"{len(untested)} untested security boundaries.")
-
-    def _tool_get_complexity_alerts(self, args: dict[str, Any]) -> dict[str, Any]:
-        try:
-            min_pct = float(args.get("min_pct", 20))
-        except (ValueError, TypeError):
-            return _err("min_pct must be a number")
-        result = self._run_analysis()
-        alerts = [a for a in result.get("complexity_alerts", []) if a.get("pct_increase", 0) >= min_pct]
-        return _ok({"count": len(alerts), "alerts": alerts}, f"{len(alerts)} complexity alerts.")
-
-    def _tool_clean(self, args: dict[str, Any]) -> dict[str, Any]:
-        mode = args.get("mode", "safe")
-        result = self._run_analysis()
-        debris = result.get("debris", [])
-        dead = result.get("dead_symbols", [])
-        all_issues = debris + [d for d in dead]
-        if not all_issues:
-            return _ok({"cleaned": 0, "items": []}, "Nothing to clean.")
-
-        if mode == "dry_run":
-            return _ok({"would_clean": len(all_issues), "would_archive": len(all_issues) if mode != "force" else 0}, f"Would clean {len(all_issues)} items.")
-
-        import shutil
-        from datetime import datetime
-        archive_dir = self.repo_root / ".deadpush-archive" / datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        archive_dir.mkdir(parents=True, exist_ok=True)
-        moved = []
-        for item in all_issues:
-            item_path = getattr(item, "path", None) or getattr(getattr(item, "symbol", None), "path", None)
-            if not item_path:
-                continue
-            path = Path(item_path)
-            if path.exists():
-                dest = archive_dir / path.name
-                shutil.move(str(path), str(dest))
-                moved.append(str(path))
-        return _ok({"cleaned": len(moved), "archive_dir": str(archive_dir), "items": moved},
-                   f"Cleaned {len(moved)} items to {archive_dir}.")
 
     def _tool_quarantine_list(self, args: dict[str, Any]) -> dict[str, Any]:
         try:
@@ -763,7 +594,6 @@ class McpServer:
             return _err("path is required")
         if not content:
             return _err("content is required")
-        # Write to staging through the daemon's pipeline
         result = self.daemon.write_file(path, content)
         # Acknowledge any previous feedback for this file
         safe_name = path.replace("/", "__").replace("\\", "__")
@@ -792,27 +622,27 @@ class McpServer:
         agent_md = self.repo_root / "AGENT.md"
         return _ok({
             "repo_root": str(self.repo_root),
-            "staging_dir": str(self.repo_root / STAGING_DIR),
             "feedback_dir": str(self.repo_root / FEEDBACK_DIR),
             "agent_onboarding": str(agent_md) if agent_md.exists() else None,
             "tools": [t["name"] for t in self._tools_list()],
         }, "Server running.")
 
     def _tool_get_safety_score(self, args: dict[str, Any]) -> dict[str, Any]:
-        # Check default and hardened log locations
+        # Check both default and hardened state directories for safety_score.json
         candidates = [
-            Path.home() / ".deadpush" / "guardian.log",
-            Path("/var/db/deadpush/guardian.log"),
+            Path.home() / ".deadpush" / "safety_score.json",
+            Path("/var/db/deadpush/safety_score.json"),
         ]
         score = "No background guardian running (start with deadpush protect --daemon)"
-        for log in candidates:
-            if log.exists():
+        for path in candidates:
+            if path.exists():
                 try:
-                    lines = log.read_text(errors="ignore").strip().splitlines()[-20:]
-                    for ln in reversed(lines):
-                        if "Safety" in ln or "Score:" in ln or "Status:" in ln:
-                            score = ln.strip()
-                            break
+                    import json
+                    data = json.loads(path.read_text(encoding="utf-8"))
+                    score_val = data.get("score")
+                    if score_val is not None:
+                        status = "🟢 Excellent" if score_val >= 90 else "🟡 Good" if score_val >= 70 else "🟠 Caution" if score_val >= 50 else "🔴 At Risk"
+                        score = f"Score: {score_val}/100 | Status: {status} | Updated: {data.get('last_updated', 'unknown')}"
                 except Exception:
                     pass
                 break
@@ -898,16 +728,18 @@ class McpServer:
         content = args.get("content", "")
         if not path:
             return _err("path is required")
-        staging_dir = self.daemon.staging_dir
-        staging_path = (staging_dir / path).resolve()
-        staging_path.parent.mkdir(parents=True, exist_ok=True)
+        rel = path.replace("\\", "/")
         try:
-            staging_path.write_text(content, encoding="utf-8")
-            result = _run_guardrails(staging_path, staging_dir, self.config, self.runtime)
-            staging_path.unlink(missing_ok=True)
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=Path(path).suffix, delete=False, dir=str(self.repo_root)
+            ) as f:
+                f.write(content)
+                tmp_path = Path(f.name)
+            result = _run_guardrails(tmp_path, self.repo_root, self.config, self.runtime, rel_path_override=rel)
         except Exception:
-            staging_path.unlink(missing_ok=True)
             return _err("Could not process file")
+        finally:
+            tmp_path.unlink(missing_ok=True)
 
         # Compute diff against existing file
         dest = (self.repo_root / path).resolve()
@@ -1028,15 +860,6 @@ class McpServer:
             tool_map: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
                 "write_file": self._tool_write_file,
                 "check_file": self._tool_check_file,
-                "scan": self._tool_scan,
-                "get_dead_symbols": self._tool_get_dead_symbols,
-                "get_debris": self._tool_get_debris,
-                "get_test_issues": self._tool_get_test_issues,
-                "get_stale_docs": self._tool_get_stale_docs,
-                "get_layer_violations": self._tool_get_layer_violations,
-                "get_security_boundaries": self._tool_get_security_boundaries,
-                "get_complexity_alerts": self._tool_get_complexity_alerts,
-                "clean": self._tool_clean,
                 "quarantine_list": self._tool_quarantine_list,
                 "quarantine_restore": self._tool_quarantine_restore,
                 "get_feedback": self._tool_get_feedback,
@@ -1066,8 +889,6 @@ class McpServer:
 
     def run(self):
         """Read JSON-RPC requests from stdin and respond on stdout."""
-        self.daemon.start(http=False)
-
         for line in sys.stdin:
             if self._stdio_broken:
                 break

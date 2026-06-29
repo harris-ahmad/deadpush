@@ -12,6 +12,7 @@ Major improvements:
 from __future__ import annotations
 
 import atexit
+from collections import deque
 import fcntl
 import functools
 import hashlib
@@ -50,24 +51,28 @@ from urllib.parse import urlparse, parse_qs
 # =============================================================================
 # Logging
 # =============================================================================
+from logging.handlers import RotatingFileHandler
+
 def setup_logging(log_file: Optional[Path] = None, level=logging.INFO, daemon: bool = False, hardened: bool = False):
     """Setup logging.
 
     In daemon mode: ONLY file logging (headless/silent on stdout/stderr).
     Foreground: file + console.
+    Uses RotatingFileHandler (10MB × 5 files) to prevent unbounded growth.
     """
     if log_file is None:
         log_file = _state_dir(hardened) / "guardian.log"
         log_file.parent.mkdir(parents=True, exist_ok=True)
 
-    handlers = [logging.FileHandler(log_file)]
+    handlers = [RotatingFileHandler(log_file, maxBytes=10_000_000, backupCount=5, encoding="utf-8")]
     if not daemon:
         handlers.append(logging.StreamHandler(sys.stdout))
 
     logging.basicConfig(
         level=level,
         format="%(asctime)s [%(levelname)s] %(message)s",
-        handlers=handlers
+        handlers=handlers,
+        force=True,
     )
     return logging.getLogger("deadpush.guardian")
 
@@ -172,21 +177,39 @@ class DaemonManager:
             return True
 
         # Get actual process start time via ps
+        # macOS uses `etime` ([[DD-]hh:]mm:ss), Linux uses `etimes` (seconds)
         try:
-            r = subprocess.run(
-                ["ps", "-o", "etimes=", "-p", str(pid)],
-                capture_output=True, text=True, timeout=5,
-            )
-            if r.returncode != 0:
-                return False
-            elapsed = int(r.stdout.strip())
-            current_monotonic = time.clock_gettime(time.CLOCK_MONOTONIC)
-            actual_start = current_monotonic - elapsed
-            # Allow 2 second tolerance for clock resolution differences
-            if abs(actual_start - recorded_start) > 2:
-                return False
+            elapsed = None
+            for opt in ("etimes=", "etime="):
+                r = subprocess.run(
+                    ["ps", "-o", opt, "-p", str(pid)],
+                    capture_output=True, text=True, timeout=5,
+                )
+                if r.returncode == 0 and r.stdout.strip():
+                    out = r.stdout.strip()
+                    try:
+                        elapsed = int(out)
+                    except ValueError:
+                        # macOS format: [[DD-]hh:]mm:ss
+                        parts = out.split("-")
+                        days = 0
+                        if len(parts) == 2:
+                            days = int(parts[0])
+                            out = parts[1]
+                        tparts = list(map(int, out.split(":")))
+                        if len(tparts) == 3:
+                            elapsed = tparts[0] * 3600 + tparts[1] * 60 + tparts[2]
+                        elif len(tparts) == 2:
+                            elapsed = tparts[0] * 60 + tparts[1]
+                    break
+            if elapsed is not None:
+                current_monotonic = time.clock_gettime(time.CLOCK_MONOTONIC)
+                actual_start = current_monotonic - elapsed
+                # Allow 2 second tolerance for clock resolution differences
+                if abs(actual_start - recorded_start) > 2:
+                    return False
         except Exception:
-            return True  # Conservative: assume running if check fails
+            pass  # Conservative: assume running if check fails
 
         # Additional verification: check command line contains deadpush
         try:
@@ -345,7 +368,7 @@ class SessionSafetyScore:
     - get_activity_level() and get_session_summary() used in logs + status cmd
     """
 
-    def __init__(self):
+    def __init__(self, hardened: bool = False):
         self.score = 100
         self.incidents = []
         self.recent_window = 60  # seconds
@@ -353,6 +376,11 @@ class SessionSafetyScore:
         self.events_count = 0
         self.session_start = datetime.now()
         self.recent_paths: list[str] = []  # last ~10 distinct-ish paths touched
+        self.hardened = hardened
+
+    def _score_path(self) -> Path:
+        """Path to the safety score JSON file."""
+        return _state_dir(self.hardened) / "safety_score.json"
 
     def mark_clean_shutdown(self):
         """Mark clean shutdown so restart doesn't apply penalty.
@@ -374,6 +402,38 @@ class SessionSafetyScore:
             tmp = path.with_suffix(".tmp")
             tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
             tmp.replace(path)
+        except Exception:
+            pass
+
+    def save_score(self):
+        """Persist current score to JSON file for MCP server to read."""
+        path = self._score_path()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            import json
+            data = {
+                "score": self.score,
+                "event_count": self.events_count,
+                "guardian_pid": os.getpid(),
+                "last_updated": datetime.now().isoformat(),
+                "clean_shutdown": False,
+            }
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            tmp.replace(path)
+        except Exception:
+            pass
+
+    def load_score(self):
+        """Load score from JSON file on startup."""
+        path = self._score_path()
+        if not path.exists():
+            return
+        try:
+            import json
+            data = json.loads(path.read_text(encoding="utf-8"))
+            self.score = data.get("score", 100)
+            self.events_count = data.get("event_count", 0)
         except Exception:
             pass
 
@@ -405,6 +465,7 @@ class SessionSafetyScore:
             # Very bursty - many agents firing at once
             self.score = max(0, self.score - 5)
 
+        self.save_score()
         return self.score
 
     def get_status(self) -> str:
@@ -534,6 +595,28 @@ class GuardianControlHandler(BaseHTTPRequestHandler):
 
     def _get_handler(self):
         return self.control_server.guardian_handler if self.control_server else None
+
+    def _verify_token(self) -> bool:
+        """Verify Bearer token if token authentication is enabled."""
+        server_token = self.control_server.token if self.control_server else None
+        if not server_token:
+            return True  # No token required
+        auth_header = self.headers.get("Authorization", "")
+        if not auth_header.startswith("Bearer "):
+            return False
+        provided_token = auth_header[7:]  # Remove "Bearer " prefix
+        return provided_token == server_token
+
+    def _require_auth(self) -> bool:
+        """Check auth and send 401 if failed. Returns True if authorized."""
+        if not self._verify_token():
+            self.send_response(401)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("WWW-Authenticate", 'Bearer realm="deadpush guardian"')
+            self.end_headers()
+            self.wfile.write(b'{"error": "unauthorized", "message": "Bearer token required"}')
+            return False
+        return True
 
     # ------------------------------------------------------------------
     # Dashboard helpers
@@ -708,6 +791,8 @@ class GuardianControlHandler(BaseHTTPRequestHandler):
             self._send_json({"error": "unknown dashboard page"}, 404)
 
     def do_GET(self):
+        if not self._require_auth():
+            return
         parsed = urlparse(self.path)
         qs = parse_qs(parsed.query)
         path = parsed.path.rstrip("/")
@@ -800,6 +885,8 @@ class GuardianControlHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_POST(self):
+        if not self._require_auth():
+            return
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/")
 
@@ -827,18 +914,11 @@ class GuardianControlHandler(BaseHTTPRequestHandler):
             payload = json.loads(body) if body.strip() else {}
 
             if path == "/trigger-light-analysis":
-                # Light / safe action: run a quick debris scan on the repo root (non-blocking hint)
-                # For deep analysis agents can still call full scan, this is for "is it safe?" quick check
-                from .debris import DebrisDetector
-                detector = DebrisDetector(handler.config)
-                # Quick: just scan for high-risk debris without full graph
-                files = []  # could use crawler but to keep light, just note
-                # In practice, return current quarantine + score as "analysis"
                 result = {
                     "message": "Light analysis triggered. Current guardian state returned.",
                     "safety": handler.safety_score.get_summary(),
                     "quarantine_count": len(handler.quarantine.list_quarantined()),
-                    "recommendation": "Use /quarantine-list for details. Run full `deadpush scan` for deep static analysis if needed."
+                    "recommendation": "Use /quarantine-list for details. Run `deadpush doctor` for a full health check.",
                 }
                 self._send_json(result)
             elif path == "/quarantine/restore":
@@ -874,13 +954,15 @@ class GuardianControlServer:
     DEFAULT_PORT = 14242
     PORT_RANGE = 5  # try up to 5 ports
 
-    def __init__(self, guardian_handler, port: int | None = None, repo_root: Path | None = None, hardened: bool = False):
+    def __init__(self, guardian_handler, port: int | None = None, repo_root: Path | None = None, hardened: bool = False, token: str | None = None):
         self.guardian_handler = guardian_handler
         self.requested_port = port or self.DEFAULT_PORT
         self.port = None
         self.httpd = None
         self.thread = None
         self.logger = logging.getLogger("deadpush.guardian")
+        self.token = token
+        self.require_auth = token is not None
         if repo_root:
             self.port_file = _scoped_portfile(repo_root, hardened)
         else:
@@ -962,15 +1044,31 @@ class GuardianHandler(FileSystemEventHandler or object):
         self.logger = logger or logging.getLogger("deadpush.guardian")
         self.detector = DebrisDetector(config)
         self.quarantine = QuarantineManager(config.repo_root)
-        self.safety_score = SessionSafetyScore()
+        self.safety_score = SessionSafetyScore(hardened=hardened)
+        self.safety_score.load_score()
         self.session_mgr = SessionManager()
 
-        # Rate limiting for multi-agent scenarios
+        # Dynamic rate limiting (based on safety score)
         self.last_intervention_ts = 0.0
-        self.cooldown_seconds = 0.5  # Aggressive but not spammy
+        self._pending_events: deque[tuple[Path, str]] = deque()
 
         # Shadow process (watching for crashes)
         self.shadow_process: subprocess.Popen | None = None
+
+    def _get_cooldown(self) -> float:
+        """Dynamic cooldown based on safety score.
+
+        Lower score = shorter cooldown = more vigilant checking.
+        """
+        score = self.safety_score.score
+        if score >= 80:
+            return 1.0
+        elif score >= 50:
+            return 0.5
+        elif score >= 20:
+            return 0.2
+        else:
+            return 0.05
 
     def on_created(self, event):
         if event.is_directory:
@@ -1092,94 +1190,112 @@ class GuardianHandler(FileSystemEventHandler or object):
             if any(part in skip_names for part in path.parts):
                 return
 
-            # Rate limiting for multi-agent
+            # Dynamic rate limiting: queue events during cooldown, drain when ready
             now = time.time()
-            if now - self.last_intervention_ts < self.cooldown_seconds:
+            cooldown = self._get_cooldown()
+            if now - self.last_intervention_ts < cooldown:
+                self._pending_events.append((path, event_type))
                 return
 
-            try:
-                rel = path.relative_to(self.config.repo_root).as_posix()
-            except (ValueError, Exception):
-                return
+            # Drain queued events first (from previous bursts)
+            self._drain_pending()
 
-            filename = path.name.lower()
-
-            # === STEP 1: Check blocked files (deadpush.toml blocked_files/blocked_patterns) ===
-            if self.config.is_blocked(rel):
-                self._intervene_blocked(path, rel, event_type)
-                return
-
-            # === STEP 2: Run full guardrail pipeline ===
-            from .intercept import _run_guardrails, _write_feedback, GuardrailResult, FEEDBACK_DIR
-
-            old_source = self._git_show(rel)
-            try:
-                source = path.read_text(encoding="utf-8", errors="ignore")
-            except Exception:
-                return
-
-            result = _run_guardrails(
-                path, self.config.repo_root, self.config,
-                _old_source=old_source, _rel_path_override=rel,
-            )
-
-            # === STEP 3: Enforce guardrail results ===
-            if not result.allowed:
-                self._intervene_guardrails(path, rel, result, event_type, old_source=old_source)
-                return  # File was quarantined; don't continue evaluation
-
-            if result.violations:
-                # Warn-level violations — log + write feedback + safety score hit
-                for v in result.violations:
-                    penalty = 8 if v.severity == "high" else 4
-                    self.safety_score.report_incident(penalty, f"Warn: {v.description}", str(path))
-                self.logger.warning(
-                    f"WARN [{event_type.upper()}] {rel} | "
-                    f"{len(result.violations)} warn-level violation(s) | "
-                    f"Safety: {self.safety_score.score}/100"
-                )
-                try:
-                    _write_feedback(self.config.repo_root / FEEDBACK_DIR, rel, result)
-                except Exception:
-                    pass
-                self.session_mgr.record_incident({
-                    "type": "guardrail_warn", "file": rel,
-                    "count": len(result.violations),
-                })
-
-            # === STEP 4: Debris scan (secondary, in addition to guardrails) ===
-            try:
-                from .crawler import FileInfo
-                fi = FileInfo(
-                    path=path,
-                    rel_path=path.relative_to(self.config.repo_root),
-                    size=path.stat().st_size,
-                    is_text=True,
-                    mtime=time.time(),
-                )
-                debris = self.detector.scan([fi])
-                blocking = [d for d in debris if d.block_push]
-                if blocking:
-                    self._intervene_blocking_debris(path, blocking, event_type)
-            except Exception:
-                pass
-
-            # === STEP 5: Record in session ===
-            try:
-                self.session_mgr.record_file_change(rel)
-                self.session_mgr.update_safety_score(self.safety_score.score)
-            except Exception:
-                pass
+            # Process the current event
+            self._process_event(path, event_type)
 
         except Exception as e:
             self.logger.debug(f"Evaluation error on {path}: {e}")
+
+    def _drain_pending(self):
+        """Process all events queued during cooldown."""
+        while self._pending_events:
+            p, et = self._pending_events.popleft()
+            if p.exists():
+                try:
+                    self._process_event(p, et)
+                except Exception as e:
+                    self.logger.debug(f"Pending event error on {p}: {e}")
+                time.sleep(0.01)  # Brief yield between batch items
+
+    def _process_event(self, path: Path, event_type: str):
+        """Core single-event evaluation pipeline."""
+        now = time.time()
+        try:
+            rel = path.relative_to(self.config.repo_root).as_posix()
+        except (ValueError, Exception):
+            return
+
+        self.last_intervention_ts = now
+
+        # === STEP 1: Check blocked files (deadpush.toml blocked_files/blocked_patterns) ===
+        if self.config.is_blocked(rel):
+            self._intervene_blocked(path, rel, event_type)
+            return
+
+        # === STEP 2: Run full guardrail pipeline ===
+        from .intercept import _run_guardrails, _write_feedback, FEEDBACK_DIR
+
+        old_source = self._git_show(rel)
+
+        result = _run_guardrails(
+            path, self.config.repo_root, self.config,
+            old_source=old_source, rel_path_override=rel,
+        )
+
+        # === STEP 3: Enforce guardrail results ===
+        if not result.allowed:
+            self._intervene_guardrails(path, rel, result, event_type, old_source=old_source)
+            return  # File was quarantined; don't continue evaluation
+
+        if result.violations:
+            # Warn-level violations — log + write feedback + safety score hit
+            for v in result.violations:
+                penalty = 8 if v.severity == "high" else 4
+                self.safety_score.report_incident(penalty, f"Warn: {v.description}", str(path))
+            self.logger.warning(
+                f"WARN [{event_type.upper()}] {rel} | "
+                f"{len(result.violations)} warn-level violation(s) | "
+                f"Safety: {self.safety_score.score}/100"
+            )
+            try:
+                _write_feedback(self.config.repo_root / FEEDBACK_DIR, rel, result)
+            except Exception:
+                pass
+            self.session_mgr.record_incident({
+                "type": "guardrail_warn", "file": rel,
+                "count": len(result.violations),
+            })
+
+        # === STEP 4: Debris scan (secondary, in addition to guardrails) ===
+        try:
+            from .types import FileInfo
+            fi = FileInfo(
+                path=path,
+                rel_path=path.relative_to(self.config.repo_root),
+                size=path.stat().st_size,
+                is_text=True,
+                mtime=time.time(),
+            )
+            debris = self.detector.scan([fi])
+            blocking = [d for d in debris if d.block_push]
+            if blocking:
+                self._intervene_blocking_debris(path, blocking, event_type)
+        except Exception:
+            pass
+
+        # === STEP 5: Record in session ===
+        try:
+            self.session_mgr.record_file_change(rel)
+            self.session_mgr.update_safety_score(self.safety_score.score)
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Intervention actions
     # ------------------------------------------------------------------
     def _intervene_blocked(self, path: Path, rel: str, event_type: str):
         """Intervene when a blocked file is written (claude.md, etc.)."""
-        from .intercept import GuardrailResult, Violation, _write_feedback, FEEDBACK_DIR
+        from .intercept import GuardrailResult, Violation
 
         self.last_intervention_ts = time.time()
         score = self.safety_score.report_incident(25, f"Blocked file written: {rel}", str(path))
@@ -1340,6 +1456,14 @@ def _scoped_plist_path(repo_root: Path, hardened: bool = False) -> Path:
     return Path.home() / "Library" / "LaunchAgents" / f"com.deadpush.guardian.{_repo_id(str(repo_root))}.plist"
 
 
+def _scoped_systemd_unit_path(repo_root: Path, hardened: bool = False) -> Path:
+    """Path for Linux systemd unit file (user or system scope)."""
+    rid = _repo_id(str(repo_root))
+    if hardened:
+        return Path("/etc/systemd/system") / f"deadpush-guardian.{rid}.service"
+    return Path.home() / ".config" / "systemd" / "user" / f"deadpush-guardian.{rid}.service"
+
+
 # =============================================================================
 # Shadow Process — Re-spawns guardian if it crashes
 # =============================================================================
@@ -1347,8 +1471,8 @@ def _scoped_plist_path(repo_root: Path, hardened: bool = False) -> Path:
 _SHADOW_SCRIPT = r"""import os, sys, time, signal, subprocess
 guardian_pid = int(sys.argv[1])
 pidfile = sys.argv[2]
-respawn_cmd = sys.argv[3:]
-shadow_pidfile = sys.argv[4]
+respawn_cmd = sys.argv[3:-1]
+shadow_pidfile = sys.argv[-1]
 # TAG: {tag}
 
 def _handle_exit(signum, frame):
@@ -1539,12 +1663,26 @@ def run_guardian(intervention: bool = True, daemon: bool = False, strict: bool =
                 os.dup2(devnull.fileno(), sys.stdout.fileno())
                 os.dup2(devnull.fileno(), sys.stderr.fileno())
 
-            # Close all inherited FDs except stdio (0,1,2)
+            # Re-initialize logging BEFORE closing FDs so the new
+            # RotatingFileHandler has a valid FD that survives the close loop
+            logger = setup_logging(daemon=True, hardened=hardened)
+
+            # Close all inherited FDs except stdio (0,1,2) and the log FD.
+            # Use root logger's handlers (named loggers propagate to root).
             import resource
             max_fd = resource.getrlimit(resource.RLIMIT_NOFILE)[0]
             if max_fd == resource.RLIM_INFINITY:
                 max_fd = 1024
+            log_fd = None
+            for h in logging.getLogger().handlers:
+                try:
+                    if hasattr(h, 'stream') and hasattr(h.stream, 'fileno'):
+                        log_fd = h.stream.fileno()
+                except (OSError, AttributeError, ValueError):
+                    pass
             for fd in range(3, max_fd):
+                if fd == log_fd:
+                    continue
                 try:
                     os.close(fd)
                 except OSError:
@@ -1553,8 +1691,6 @@ def run_guardian(intervention: bool = True, daemon: bool = False, strict: bool =
             daemon_mgr.write_pid()
             atexit.register(daemon_mgr.cleanup)
 
-            # NOW create handler and control_server with fresh logging
-            logger = setup_logging(daemon=True, hardened=hardened)
             handler = GuardianHandler(config, intervention=intervention, strict_mode=strict, daemon=daemon, logger=logger, hardened=hardened)
             control_server = GuardianControlServer(handler, repo_root=config.repo_root, hardened=hardened)
 
@@ -1717,19 +1853,12 @@ def setup_autostart(repo_root: Path, hardened: bool = False) -> str:
     rid = _repo_id(str(repo_root))
 
     if _sys.platform.startswith("linux"):
-        if hardened:
-            unit_dir = Path("/etc/systemd/system")
-            unit_dir.mkdir(parents=True, exist_ok=True)
-            user_part = ""
-            env_line = f'Environment="PATH=/usr/local/bin:/usr/bin:/bin:{home}/.local/bin"'
-            wanted_by = "multi-user.target"
-        else:
-            unit_dir = home / ".config" / "systemd" / "user"
-            unit_dir.mkdir(parents=True, exist_ok=True)
-            user_part = "--user"
-            env_line = f'Environment="PATH=/usr/local/bin:/usr/bin:/bin:{home}/.local/bin"'
-            wanted_by = "default.target"
-        unit_path = unit_dir / f"deadpush-guardian.{rid}.service"
+        unit_path = _scoped_systemd_unit_path(repo_root, hardened)
+        unit_dir = unit_path.parent
+        unit_dir.mkdir(parents=True, exist_ok=True)
+        user_part = "" if hardened else "--user"
+        env_line = f'Environment="PATH=/usr/local/bin:/usr/bin:/bin:{home}/.local/bin"'
+        wanted_by = "multi-user.target" if hardened else "default.target"
         content = f"""[Unit]
 Description=deadpush AI Agent Guardian ({rid}) - persistent background protection
 After=network.target

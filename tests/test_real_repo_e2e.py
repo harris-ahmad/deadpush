@@ -474,37 +474,7 @@ class TestLearningLoop:
 
 
 # ======================================================================
-# SCENARIO 9: Scan & dead code (JS)
-# ======================================================================
-
-class TestScanAndDeadCode:
-    """Full scan discovers dead code in the real JS codebase."""
-
-    def test_scan_runs(self, mcp):
-        """Full scan completes without crashing on real repo."""
-        resp = _call(mcp, "scan", {})
-        data = _ok(resp)
-        assert "files_scanned" in data, f"No files_scanned: {data}"
-        assert data["files_scanned"] > 0, f"No files scanned: {data}"
-
-    def test_dead_symbols_returns_data(self, mcp):
-        """Dead symbols are found in a real JS codebase."""
-        resp = _call(mcp, "get_dead_symbols", {})
-        data = _ok(resp)
-        # The auth repo likely has dead code since it's been iterated on
-        assert "count" in data
-        assert "symbols" in data
-
-    def test_security_boundaries_found(self, mcp):
-        """Real security-sensitive operations detected in auth repo."""
-        resp = _call(mcp, "get_security_boundaries", {})
-        data = _ok(resp)
-        # Auth repo uses crypto, JWT, subprocess-like patterns
-        assert "count_untested" in data
-
-
-# ======================================================================
-# SCENARIO 10: Edge cases on a real repo
+# SCENARIO 9: Edge cases on a real repo
 # ======================================================================
 
 class TestEdgeCases:
