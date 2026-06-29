@@ -33,7 +33,7 @@ anthropic = ["anthropic>=0.45.0"]
 dev = ["pytest>=8.0", "ruff>=0.4", "rich>=13.7.0", "watchdog>=4.0.0"]
 
 [project.scripts]
-deadpush = "deadpush.cli:main"
+deadpush = "deadpush_bootstrap:main"
 
 [project.urls]
 Homepage = "https://github.com/harris-ahmad/deadpush"
@@ -43,6 +43,9 @@ Documentation = "https://github.com/harris-ahmad/deadpush#readme"
 
 [tool.hatch.build.targets.wheel]
 packages = ["deadpush"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"deadpush_bootstrap.py" = "deadpush_bootstrap.py"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

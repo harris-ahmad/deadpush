@@ -104,8 +104,10 @@ The pre-push hook ships as a Python script + `.cmd` shim. It works from PowerShe
 ```bash
 git clone https://github.com/harris-ahmad/deadpush
 cd deadpush
-pip install -e ".[dev,rich]"
+./scripts/dev_install.sh
 ```
+
+On macOS, use `dev_install.sh` instead of bare `pip install -e .` — see [CONTRIBUTING.md](CONTRIBUTING.md) if imports fail outside the repo.
 
 ## Architecture
 
