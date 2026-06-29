@@ -1161,10 +1161,55 @@ class GuardianHandler(FileSystemEventHandler or object):
             pass
         return ""
 
+    def _safe_git_source(self, rel: str) -> str | None:
+        """Return HEAD content only if it passes guardrails (safe to restore)."""
+        source = self._git_show(rel)
+        if not source:
+            return None
+        from .intercept import enforce_content
+        from .rules import RuntimeConfig
+
+        runtime = RuntimeConfig(self.config.repo_root)
+        result = enforce_content(rel, source, self.config, runtime)
+        if not result.allowed:
+            self.logger.warning(
+                f"Refusing git restore for {rel}: HEAD content also violates guardrails"
+            )
+            return None
+        return source
+
+    def _unstage_if_staged(self, rel: str) -> None:
+        """Remove a file from the git index if it is staged."""
+        try:
+            check = subprocess.run(
+                ["git", "diff", "--cached", "--name-only", "--", rel],
+                capture_output=True, text=True, timeout=5,
+                cwd=self.config.repo_root,
+            )
+            if check.returncode != 0 or rel not in {
+                line.strip() for line in check.stdout.splitlines() if line.strip()
+            }:
+                return
+            subprocess.run(
+                ["git", "rm", "--cached", "-f", "--", rel],
+                capture_output=True, text=True, timeout=5,
+                cwd=self.config.repo_root,
+            )
+            self.logger.info(f"Unstaged {rel} from git index")
+        except Exception as e:
+            self.logger.debug(f"Unstage skipped for {rel}: {e}")
+
     def _restore_from_git(self, rel: str) -> bool:
-        """Restore a file from git HEAD. Returns True on success."""
-        old = self._git_show(rel)
-        if not old:
+        """Restore a file from git HEAD when HEAD content is safe."""
+        old = self._safe_git_source(rel)
+        if old is None:
+            try:
+                dest = self.config.repo_root / rel
+                if dest.exists():
+                    dest.unlink()
+                    self.logger.info(f"Removed {rel} (no safe git version to restore)")
+            except Exception as e:
+                self.logger.debug(f"Could not remove unsafe file {rel}: {e}")
             return False
         try:
             dest = self.config.repo_root / rel
@@ -1184,7 +1229,7 @@ class GuardianHandler(FileSystemEventHandler or object):
             if not path.exists():
                 return
             # Skip internal dirs
-            skip_names = {"__pycache__", ".git", "node_modules",
+            skip_names = {"__pycache__", ".git", "node_modules", ".deadpush",
                           ".deadpush-quarantine", ".deadpush-archive",
                           ".deadpush-config-backups"}
             if any(part in skip_names for part in path.parts):
@@ -1227,6 +1272,26 @@ class GuardianHandler(FileSystemEventHandler or object):
 
         self.last_intervention_ts = now
 
+        # Lockdown: at score 0, quarantine every write (no pass-through)
+        if self.intervention and self.safety_score.score <= 0 and path.exists():
+            from .intercept import GuardrailResult, Violation, _write_feedback, FEEDBACK_DIR
+
+            result = GuardrailResult()
+            result.reject(Violation(
+                "lockdown",
+                "Guardian lockdown active (safety score 0): all writes quarantined",
+                0,
+                "critical",
+            ))
+            self._quarantine_and_restore(path, rel, result)
+            self.safety_score.report_incident(5, f"Lockdown quarantine: {rel}", str(path))
+            try:
+                _write_feedback(self.config.repo_root / FEEDBACK_DIR, rel, result)
+            except Exception:
+                pass
+            self.logger.critical(f"LOCKDOWN [{event_type.upper()}] quarantined {rel}")
+            return
+
         # === STEP 1: Check blocked files (deadpush.toml blocked_files/blocked_patterns) ===
         if self.config.is_blocked(rel):
             self._intervene_blocked(path, rel, event_type)
@@ -1239,12 +1304,12 @@ class GuardianHandler(FileSystemEventHandler or object):
 
         result = _run_guardrails(
             path, self.config.repo_root, self.config,
-            old_source=old_source, rel_path_override=rel,
+            old_source=old_source or None, rel_path_override=rel,
         )
 
         # === STEP 3: Enforce guardrail results ===
         if not result.allowed:
-            self._intervene_guardrails(path, rel, result, event_type, old_source=old_source)
+            self._intervene_guardrails(path, rel, result, event_type)
             return  # File was quarantined; don't continue evaluation
 
         if result.violations:
@@ -1303,8 +1368,7 @@ class GuardianHandler(FileSystemEventHandler or object):
         result = GuardrailResult()
         result.reject(Violation("blocked_file", f"File {rel} is in the blocked list and cannot be written", 0, "critical"))
 
-        old_source = self._git_show(rel)
-        self._quarantine_and_restore(path, rel, result, old_source)
+        self._quarantine_and_restore(path, rel, result)
 
         self.logger.warning(
             f"INTERVENTION [{event_type.upper()}] BLOCKED FILE: {rel} | "
@@ -1318,7 +1382,7 @@ class GuardianHandler(FileSystemEventHandler or object):
         except Exception:
             pass
 
-    def _intervene_guardrails(self, path: Path, rel: str, result, event_type: str, old_source: str = ""):
+    def _intervene_guardrails(self, path: Path, rel: str, result, event_type: str):
         """Intervene when guardrails detect block-level violations."""
         from .intercept import _write_feedback, FEEDBACK_DIR
 
@@ -1326,7 +1390,7 @@ class GuardianHandler(FileSystemEventHandler or object):
         penalty = min(25, 5 * len(result.violations))
         score = self.safety_score.report_incident(penalty, f"Guardrail block: {result.violations[0].description}", str(path))
 
-        self._quarantine_and_restore(path, rel, result, old_source)
+        self._quarantine_and_restore(path, rel, result)
 
         self.logger.warning(
             f"INTERVENTION [{event_type.upper()}] GUARDRAIL BLOCK: {rel} | "
@@ -1350,8 +1414,8 @@ class GuardianHandler(FileSystemEventHandler or object):
         except Exception:
             pass
 
-    def _quarantine_and_restore(self, path: Path, rel: str, result, old_source: str):
-        """Quarantine the violating file and restore the original from git."""
+    def _quarantine_and_restore(self, path: Path, rel: str, result) -> None:
+        """Quarantine the violating file, unstage if needed, restore safe git version."""
         if self.intervention and path.exists():
             reason = result.violations[0].description if result.violations else "guardrail violation"
             try:
@@ -1364,33 +1428,43 @@ class GuardianHandler(FileSystemEventHandler or object):
                 except Exception:
                     pass
 
-        # Restore original from git (if the file existed before)
-        if old_source:
-            self._restore_from_git(rel)
+        self._unstage_if_staged(rel)
+        self._restore_from_git(rel)
 
     def _intervene_blocking_debris(self, path: Path, blocking_items, event_type: str):
+        """Quarantine files with block_push debris (secrets, LLM context, etc.)."""
+        from .intercept import GuardrailResult, Violation, _write_feedback, FEEDBACK_DIR
+
         self.last_intervention_ts = time.time()
-        for item in blocking_items:
-            score = self.safety_score.report_incident(12, item.reason, str(path))
-            try:
-                self.session_mgr.record_incident({
-                    "type": "blocking_debris", "reason": item.reason,
-                    "file": str(path), "score": score,
-                })
-                self.session_mgr.update_safety_score(score)
-            except Exception:
-                pass
-            self.logger.warning(
-                f"INTERVENTION [{event_type.upper()}] {item.category} in {path.name} | "
-                f"{item.reason} | Safety: {score}/100"
-            )
-            if self.intervention and item.category == "hardcoded_secret":
-                try:
-                    if path.exists():
-                        quarantined = self.quarantine.quarantine(path, item.reason)
-                        self.logger.critical(f"QUARANTINED FILE WITH HARDCODED SECRET: {quarantined}")
-                except Exception as e:
-                    self.logger.error(f"Failed to quarantine secret file: {e}")
+        rel = path.relative_to(self.config.repo_root).as_posix()
+        top = max(blocking_items, key=lambda d: (d.block_push, d.confidence))
+        score = self.safety_score.report_incident(12, top.reason, str(path))
+
+        result = GuardrailResult()
+        result.reject(Violation("debris", top.reason, 0, "critical"))
+
+        self.logger.warning(
+            f"INTERVENTION [{event_type.upper()}] {top.category} in {path.name} | "
+            f"{top.reason} | Safety: {score}/100"
+        )
+
+        if self.intervention:
+            self._quarantine_and_restore(path, rel, result)
+
+        try:
+            _write_feedback(self.config.repo_root / FEEDBACK_DIR, rel, result)
+        except Exception:
+            pass
+        try:
+            self.session_mgr.record_incident({
+                "type": "blocking_debris",
+                "reason": top.reason,
+                "file": rel,
+                "score": score,
+            })
+            self.session_mgr.update_safety_score(score)
+        except Exception:
+            pass
 
 
 # =============================================================================
