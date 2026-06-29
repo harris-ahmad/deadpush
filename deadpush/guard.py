@@ -1456,6 +1456,14 @@ def _scoped_plist_path(repo_root: Path, hardened: bool = False) -> Path:
     return Path.home() / "Library" / "LaunchAgents" / f"com.deadpush.guardian.{_repo_id(str(repo_root))}.plist"
 
 
+def _scoped_systemd_unit_path(repo_root: Path, hardened: bool = False) -> Path:
+    """Path for Linux systemd unit file (user or system scope)."""
+    rid = _repo_id(str(repo_root))
+    if hardened:
+        return Path("/etc/systemd/system") / f"deadpush-guardian.{rid}.service"
+    return Path.home() / ".config" / "systemd" / "user" / f"deadpush-guardian.{rid}.service"
+
+
 # =============================================================================
 # Shadow Process — Re-spawns guardian if it crashes
 # =============================================================================
@@ -1845,19 +1853,12 @@ def setup_autostart(repo_root: Path, hardened: bool = False) -> str:
     rid = _repo_id(str(repo_root))
 
     if _sys.platform.startswith("linux"):
-        if hardened:
-            unit_dir = Path("/etc/systemd/system")
-            unit_dir.mkdir(parents=True, exist_ok=True)
-            user_part = ""
-            env_line = f'Environment="PATH=/usr/local/bin:/usr/bin:/bin:{home}/.local/bin"'
-            wanted_by = "multi-user.target"
-        else:
-            unit_dir = home / ".config" / "systemd" / "user"
-            unit_dir.mkdir(parents=True, exist_ok=True)
-            user_part = "--user"
-            env_line = f'Environment="PATH=/usr/local/bin:/usr/bin:/bin:{home}/.local/bin"'
-            wanted_by = "default.target"
-        unit_path = unit_dir / f"deadpush-guardian.{rid}.service"
+        unit_path = _scoped_systemd_unit_path(repo_root, hardened)
+        unit_dir = unit_path.parent
+        unit_dir.mkdir(parents=True, exist_ok=True)
+        user_part = "" if hardened else "--user"
+        env_line = f'Environment="PATH=/usr/local/bin:/usr/bin:/bin:{home}/.local/bin"'
+        wanted_by = "multi-user.target" if hardened else "default.target"
         content = f"""[Unit]
 Description=deadpush AI Agent Guardian ({rid}) - persistent background protection
 After=network.target

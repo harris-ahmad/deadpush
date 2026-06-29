@@ -13,16 +13,25 @@ from deadpush.config import Config
 @pytest.fixture
 def hardened_env(tmp_path, monkeypatch):
     """Simulate a writable hardened environment by redirecting state and
-    plist paths to a temp directory."""
+    autostart paths to a temp directory."""
     state_dir = tmp_path / "state"
     state_dir.mkdir(parents=True)
     monkeypatch.setattr(guard, "_state_dir", lambda hardened=False: state_dir)
-    monkeypatch.setattr(
-        guard,
-        "_scoped_plist_path",
-        lambda r, hardened=False: state_dir
-        / f"com.deadpush.guardian.{guard._repo_id(str(r))}.plist",
-    )
+    rid_fn = guard._repo_id
+    if sys.platform == "darwin":
+        monkeypatch.setattr(
+            guard,
+            "_scoped_plist_path",
+            lambda r, hardened=False: state_dir
+            / f"com.deadpush.guardian.{rid_fn(str(r))}.plist",
+        )
+    elif sys.platform.startswith("linux"):
+        monkeypatch.setattr(
+            guard,
+            "_scoped_systemd_unit_path",
+            lambda r, hardened=False: state_dir
+            / f"deadpush-guardian.{rid_fn(str(r))}.service",
+        )
     return state_dir
 
 
@@ -74,15 +83,29 @@ class TestScopedPaths:
         assert label.startswith("com.deadpush.guardian.")
         assert guard._repo_id("/tmp/test-repo") in label
 
+    @pytest.mark.skipif(sys.platform != "darwin", reason="LaunchAgents are macOS-only")
     def test_scoped_plist_path_default_launchagents(self):
         path = guard._scoped_plist_path(Path("/tmp/test-repo"))
         assert str(path).startswith(str(Path.home() / "Library" / "LaunchAgents"))
         assert path.name.endswith(".plist")
 
+    @pytest.mark.skipif(sys.platform != "darwin", reason="LaunchDaemons are macOS-only")
     def test_scoped_plist_path_hardened_launchdaemons(self):
         path = guard._scoped_plist_path(Path("/tmp/test-repo"), hardened=True)
         assert str(path).startswith("/Library/LaunchDaemons")
         assert path.name.endswith(".plist")
+
+    @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="systemd units are Linux-only")
+    def test_scoped_systemd_unit_path_default_user(self):
+        path = guard._scoped_systemd_unit_path(Path("/tmp/test-repo"))
+        assert str(path).startswith(str(Path.home() / ".config/systemd/user"))
+        assert path.name.endswith(".service")
+
+    @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="systemd units are Linux-only")
+    def test_scoped_systemd_unit_path_hardened_system(self):
+        path = guard._scoped_systemd_unit_path(Path("/tmp/test-repo"), hardened=True)
+        assert str(path).startswith("/etc/systemd/system")
+        assert path.name.endswith(".service")
 
 
 class TestRepoId:
@@ -98,6 +121,7 @@ class TestRepoId:
         assert all(c in "0123456789abcdef" for c in rid)
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="LaunchAgents are macOS-only")
 class TestSetupAutostartDefault:
     def test_returns_launchagent_string(self, tmp_path):
         result = guard.setup_autostart(tmp_path, hardened=False)
@@ -119,7 +143,62 @@ class TestSetupAutostartDefault:
         assert str(tmp_path) in text
 
 
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="systemd user units are Linux-only")
+class TestSetupAutostartLinuxDefault:
+    def test_returns_systemd_user_string(self, tmp_path):
+        result = guard.setup_autostart(tmp_path, hardened=False)
+        assert "systemd --user" in result
+
+    def test_creates_user_unit(self, tmp_path):
+        guard.setup_autostart(tmp_path, hardened=False)
+        unit_path = guard._scoped_systemd_unit_path(tmp_path)
+        assert unit_path.exists()
+
+    def test_unit_no_hardened_args(self, tmp_path):
+        guard.setup_autostart(tmp_path, hardened=False)
+        text = guard._scoped_systemd_unit_path(tmp_path).read_text()
+        assert "--hardened" not in text
+
+    def test_unit_has_working_directory(self, tmp_path):
+        guard.setup_autostart(tmp_path, hardened=False)
+        text = guard._scoped_systemd_unit_path(tmp_path).read_text()
+        assert str(tmp_path) in text
+
+
+@pytest.mark.skipif(sys.platform == "darwin", reason="macOS hardened tests use LaunchDaemons")
 class TestSetupAutostartHardened:
+    def test_returns_system_unit_string(self, tmp_path, hardened_env):
+        result = guard.setup_autostart(tmp_path, hardened=True)
+        assert "systemd system" in result
+
+    def test_creates_unit(self, tmp_path, hardened_env):
+        guard.setup_autostart(tmp_path, hardened=True)
+        unit_path = guard._scoped_systemd_unit_path(tmp_path, hardened=True)
+        assert unit_path.exists()
+
+    def test_unit_contains_user_name(self, tmp_path, hardened_env):
+        guard.setup_autostart(tmp_path, hardened=True)
+        text = guard._scoped_systemd_unit_path(tmp_path, hardened=True).read_text()
+        assert "_deadpush" in text
+
+    def test_unit_contains_daemon_and_hardened_args(self, tmp_path, hardened_env):
+        guard.setup_autostart(tmp_path, hardened=True)
+        text = guard._scoped_systemd_unit_path(tmp_path, hardened=True).read_text()
+        assert "--daemon" in text
+        assert "--hardened" in text
+
+    def test_sets_state_dir(self, tmp_path, hardened_env):
+        guard.setup_autostart(tmp_path, hardened=True)
+        assert guard._is_hardened(hardened=True)
+
+    def test_unit_has_working_directory(self, tmp_path, hardened_env):
+        guard.setup_autostart(tmp_path, hardened=True)
+        text = guard._scoped_systemd_unit_path(tmp_path, hardened=True).read_text()
+        assert str(tmp_path) in text
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="LaunchDaemons are macOS-only")
+class TestSetupAutostartHardenedDarwin:
     def test_returns_launchdaemon_string(self, tmp_path, hardened_env):
         result = guard.setup_autostart(tmp_path, hardened=True)
         assert "LaunchDaemon" in result
@@ -139,10 +218,6 @@ class TestSetupAutostartHardened:
         text = guard._scoped_plist_path(tmp_path, hardened=True).read_text()
         assert "--daemon" in text
         assert "--hardened" in text
-
-    def test_sets_state_dir(self, tmp_path, hardened_env):
-        guard.setup_autostart(tmp_path, hardened=True)
-        assert guard._is_hardened(hardened=True)
 
     def test_plist_has_working_directory(self, tmp_path, hardened_env):
         guard.setup_autostart(tmp_path, hardened=True)

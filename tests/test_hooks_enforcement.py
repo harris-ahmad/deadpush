@@ -45,9 +45,9 @@ class TestPostcommitEnforcement:
             "import subprocess\nsubprocess.run('ls', shell=True)\n"
         )
         subprocess.run(["git", "add", "debug.py"], capture_output=True, cwd=temp_repo)
-        # Bypass pre-commit if present
+        # Bypass pre-commit and post-commit hooks so we can test run_postcommit_guardrails directly
         subprocess.run(
-            ["git", "commit", "-m", "bad", "--no-verify"],
+            ["git", "-c", "core.hooksPath=/dev/null", "commit", "-m", "bad", "--no-verify"],
             capture_output=True, cwd=temp_repo,
         )
         head_before = subprocess.run(
