@@ -136,3 +136,37 @@ class TestProtectLifecycle:
         assert not (temp_repo / ".deadpush" / "installed").exists()
         for hook in ("pre-push", "pre-commit", "post-commit"):
             assert not (temp_repo / ".git" / "hooks" / hook).exists(), f"{hook} lingering"
+
+    def test_uninstall_leaves_repo_pristine(self, temp_repo: Path, cli_available):
+        """Empty deadpush bookkeeping dirs must be removed so nothing lingers."""
+        r = _run(["protect", "--soft"], cwd=temp_repo)
+        assert r.returncode == 0, f"protect failed:\n{r.stdout}\n{r.stderr}"
+
+        # Simulate the empty debris a real install/run can leave behind.
+        (temp_repo / ".guardian").mkdir(exist_ok=True)
+        (temp_repo / ".deadpush" / "feedback").mkdir(parents=True, exist_ok=True)
+        (temp_repo / ".deadpush-quarantine").mkdir(exist_ok=True)
+
+        u = _run(["uninstall", "--force"], cwd=temp_repo)
+        assert u.returncode == 0, f"uninstall failed:\n{u.stdout}\n{u.stderr}"
+
+        for leftover in (".deadpush", ".guardian", ".deadpush-quarantine"):
+            assert not (temp_repo / leftover).exists(), f"{leftover} lingering after uninstall"
+
+    def test_uninstall_preserves_user_data(self, temp_repo: Path, cli_available):
+        """Uninstall must never delete quarantined files or real feedback data."""
+        r = _run(["protect", "--soft"], cwd=temp_repo)
+        assert r.returncode == 0, f"protect failed:\n{r.stdout}\n{r.stderr}"
+
+        feedback = temp_repo / ".deadpush" / "feedback" / "runner.py.json"
+        feedback.parent.mkdir(parents=True, exist_ok=True)
+        feedback.write_text('{"blocked": true}')
+        quarantined = temp_repo / ".deadpush-quarantine" / "bad.py"
+        quarantined.parent.mkdir(parents=True, exist_ok=True)
+        quarantined.write_text("import os\nos.system('rm -rf /')\n")
+
+        u = _run(["uninstall", "--force"], cwd=temp_repo)
+        assert u.returncode == 0, f"uninstall failed:\n{u.stdout}\n{u.stderr}"
+
+        assert feedback.exists(), "uninstall deleted real feedback data"
+        assert quarantined.exists(), "uninstall deleted a quarantined file"

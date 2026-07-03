@@ -1155,16 +1155,39 @@ def cmd_uninstall(hardened, force):
     except Exception:
         pass
 
-    # 6. Remove .guardian directory if empty
+    # 6. Remove deadpush's own now-empty directories so the repo is left pristine.
+    #    Everything here is best-effort and strictly non-destructive: a directory is
+    #    only removed when it has no remaining contents, so we never delete user
+    #    config, feedback data, or quarantined files.
     print("[6/6] Cleaning up...")
-    guardian_dir = repo_root / ".guardian"
-    if guardian_dir.exists():
+
+    def _rmdir_if_empty(path: Path) -> bool:
         try:
-            if not any(guardian_dir.iterdir()):
-                guardian_dir.rmdir()
-                print("  Removed empty .guardian directory")
+            if path.is_dir() and not any(path.iterdir()):
+                path.rmdir()
+                return True
         except Exception:
             pass
+        return False
+
+    if _rmdir_if_empty(repo_root / ".guardian"):
+        print("  Removed empty .guardian directory")
+
+    # .deadpush holds deadpush's bookkeeping (install marker, hook checksums,
+    # feedback). Prune now-empty subdirs (e.g. feedback/, hooks/) first, then drop
+    # the dir itself only if nothing user-relevant (config.toml, rules.json, real
+    # feedback data) remains.
+    deadpush_dir = repo_root / ".deadpush"
+    if deadpush_dir.is_dir():
+        for child in list(deadpush_dir.iterdir()):
+            if child.is_dir():
+                _rmdir_if_empty(child)
+    if _rmdir_if_empty(deadpush_dir):
+        print("  Removed empty .deadpush directory")
+
+    # Quarantine dir: remove only when empty — never delete quarantined files.
+    if _rmdir_if_empty(repo_root / ".deadpush-quarantine"):
+        print("  Removed empty .deadpush-quarantine directory")
 
     print()
     print_success(f"deadpush ({'hardened' if hardened else 'default'} mode) uninstalled completely.")

@@ -48,6 +48,14 @@ green macOS + Linux CI including the lifecycle integration test) are met._
   `tests/test_root_immutable.py`.
 
 ### Fixed
+- **Uninstall leaves the repo pristine**: cleanup only removed an empty
+  `.guardian`, leaving behind empty `.deadpush` (e.g. `.deadpush/feedback/`) and
+  `.deadpush-quarantine` directories. It now prunes deadpush's own now-empty
+  bookkeeping dirs — but strictly non-destructively: a directory is removed only
+  when it has no remaining contents, so real feedback data, config, and
+  quarantined files are always preserved. Covered by
+  `tests/test_integration_lifecycle.py`
+  (`test_uninstall_leaves_repo_pristine`, `test_uninstall_preserves_user_data`).
 - **Cross-platform uninstall**: `deadpush uninstall` invoked `launchctl`
   unconditionally, which raised `FileNotFoundError` on Linux and made the command
   exit non-zero. It now unloads/removes the correct service per platform (launchd
