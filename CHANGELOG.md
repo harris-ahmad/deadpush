@@ -11,6 +11,48 @@ _Staged for the next release. The project stays on a 0.2.x beta line until the
 production-readiness gates (blocking lint, lockfiled reproducible builds, and
 green macOS + Linux CI including the lifecycle integration test) are met._
 
+### Security (hardened mode — Tier 0)
+
+A threat-model audit (adversarial agent running as the same UID) found five ways
+a same-UID agent could defeat *hardened* mode even though the daemon and hook
+files were protected. These close them so hardened mode is a real boundary, not
+just defense-in-depth. Covered by `tests/test_tier0_hardening.py` and validated
+end-to-end by `scripts/hardened_qa.sh`.
+
+- **Hardened hooks now execute the root-owned interpreter (H2)**: git hooks used
+  the *user's* interpreter and user-writable `deadpush` package, so a same-UID
+  agent could no-op the guardrails by editing the package — defeating even a
+  root-immutable hook file. Hardened hooks now run `/var/db/deadpush/venv/bin/
+  python` (owned by `_deadpush`, not user-writable). The guardian's auto-repair
+  re-pins this interpreter and re-locks `schg` instead of downgrading.
+- **Guardrail policy is now read from a root-owned dir (H1)**: enforcement read
+  `rules.json` / `learned_patterns.json` from the in-repo `.deadpush/` directory,
+  which the agent can write (it could set every category to `off` or allowlist
+  `.*`). Hardened installs now read/write policy from a root/`_deadpush`-owned
+  tree (`/var/db/deadpush/policy/<repo-id>/`) that the user can traverse and read
+  but not modify. Soft mode is unchanged (in-repo, deterrence only).
+- **Control server enforces a bearer token on mutations (H3)**: the localhost
+  control server shipped with auth wired up but disabled (no token), so any
+  local process — including the agent — could reset the allowlist or restore
+  quarantined files. A random token is now generated per guardian and stored
+  `0600` (root-owned in hardened mode, so the agent can't read it); state-changing
+  `POST`s require it (with a constant-time compare), while read-only `GET`s stay
+  open so the human dashboard still works.
+- **Quarantine restore is confined to the repo tree (H4)**: `restore()` moved a
+  file to the absolute "Original path" read from an agent-writable `.reason`
+  file, letting a crafted `.reason` make the guardian (running as `_deadpush`)
+  write anywhere — a confused-deputy write. The destination is now resolved and
+  required to stay within the repo, else the restore is refused.
+- **Fail-closed can no longer be cleared by the agent (H5)**: the hooks' fail-
+  closed decision keyed only off the agent-deletable in-repo `.deadpush/installed`
+  marker. Hardened setup now also writes a root-owned marker under
+  `/var/db/deadpush/policy/<repo-id>/`, and the hook prelude honors it, so
+  fail-closed holds even if the in-repo marker is deleted. (Combined with H2 the
+  root-owned interpreter is itself un-deletable by the agent.)
+- **Hardened state dir is now `0711` (was `0700`)**: required so the user's git
+  hooks can *traverse* to the root-owned interpreter and policy. The directory is
+  not listable and secret files (the control token) remain `0600`.
+
 ### Added
 - **Fail-closed git hooks**: once a repo is protected (a `.deadpush/installed`
   marker is written), the installed hooks refuse to run when the deadpush

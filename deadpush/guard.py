@@ -100,6 +100,41 @@ def _scoped_portfile(repo_root: Path, hardened: bool = False) -> Path:
     return _state_dir(hardened) / f"guardian.control.port.{_repo_id(str(repo_root))}"
 
 
+def _scoped_token_file(repo_root: Path, hardened: bool = False) -> Path:
+    return _state_dir(hardened) / f"guardian.control.token.{_repo_id(str(repo_root))}"
+
+
+def _load_or_create_control_token(repo_root: Path, hardened: bool = False) -> str:
+    """Return the control-server bearer token, creating it (0600) if absent.
+
+    In hardened mode the token lives under the root/_deadpush-owned state dir
+    with 0600 perms, so a same-UID agent cannot read it and therefore cannot
+    call the mutating control endpoints (allowlist changes, quarantine restore).
+    In soft mode it is user-owned (the agent could read it) — soft mode is
+    deterrence, not a hard boundary — but it still blocks other local users.
+    """
+    import secrets
+
+    token_file = _scoped_token_file(repo_root, hardened)
+    try:
+        if token_file.exists():
+            existing = token_file.read_text(encoding="utf-8").strip()
+            if existing:
+                return existing
+    except Exception:
+        pass
+    token = secrets.token_urlsafe(32)
+    try:
+        token_file.parent.mkdir(parents=True, exist_ok=True)
+        token_file.write_text(token, encoding="utf-8")
+        os.chmod(token_file, 0o600)
+    except Exception:
+        # If we cannot persist the token we still use it in-memory for this run
+        # so the endpoints are not left unauthenticated.
+        pass
+    return token
+
+
 def _scoped_suspend_file(repo_root: Path, hardened: bool = False) -> Path:
     return _state_dir(hardened) / f"mcp_suspended.{_repo_id(str(repo_root))}"
 
@@ -407,6 +442,19 @@ class QuarantineManager:
                 original = self.quarantine_dir.parent / name.split("_", 1)[1]
             else:
                 original = self.quarantine_dir.parent / name
+        # Confine the restore destination to the repo tree. The "Original path"
+        # is read from an agent-writable .reason file, so without this a crafted
+        # .reason could make the guardian (running as _deadpush in hardened mode)
+        # move a file to an arbitrary absolute path — a confused-deputy write.
+        repo_root = self.quarantine_dir.parent
+        try:
+            resolved = original.resolve()
+            resolved.relative_to(repo_root.resolve())
+        except (ValueError, OSError, RuntimeError):
+            logging.getLogger("deadpush.guardian").warning(
+                f"Refusing to restore outside the repo: {original}")
+            return None
+        original = resolved
         if original.exists():
             logging.getLogger("deadpush.guardian").warning(f"Refusing to restore: original already exists at {original}")
             return None
@@ -712,7 +760,8 @@ class GuardianControlHandler(BaseHTTPRequestHandler):
         if not auth_header.startswith("Bearer "):
             return False
         provided_token = auth_header[7:]  # Remove "Bearer " prefix
-        return provided_token == server_token
+        import hmac
+        return hmac.compare_digest(provided_token, server_token)
 
     def _require_auth(self) -> bool:
         """Check auth and send 401 if failed. Returns True if authorized."""
@@ -898,8 +947,10 @@ class GuardianControlHandler(BaseHTTPRequestHandler):
             self._send_json({"error": "unknown dashboard page"}, 404)
 
     def do_GET(self):
-        if not self._require_auth():
-            return
+        # Reads (status/dashboard/quarantine-list) stay open on localhost; only
+        # state-changing POSTs require the token. This keeps the human dashboard
+        # viewable while blocking the agent from mutating policy or restoring
+        # quarantined files (see do_POST -> _require_auth).
         parsed = urlparse(self.path)
         qs = parse_qs(parsed.query)
         path = parsed.path.rstrip("/")
@@ -1867,7 +1918,8 @@ def run_guardian(intervention: bool = True, daemon: bool = False, strict: bool =
             atexit.register(daemon_mgr.cleanup)
 
             handler = GuardianHandler(config, intervention=intervention, strict_mode=strict, daemon=daemon, logger=logger, hardened=hardened)
-            control_server = GuardianControlServer(handler, repo_root=config.repo_root, hardened=hardened)
+            _control_token = _load_or_create_control_token(config.repo_root, hardened)
+            control_server = GuardianControlServer(handler, repo_root=config.repo_root, hardened=hardened, token=_control_token)
 
             # Start shadow process in the final daemon process (post-fork)
             if not hardened:
@@ -1886,7 +1938,8 @@ def run_guardian(intervention: bool = True, daemon: bool = False, strict: bool =
         atexit.register(daemon_mgr.cleanup)
 
         handler = GuardianHandler(config, intervention=intervention, strict_mode=strict, daemon=daemon, logger=logger, hardened=hardened)
-        control_server = GuardianControlServer(handler, repo_root=config.repo_root, hardened=hardened)
+        _control_token = _load_or_create_control_token(config.repo_root, hardened)
+        control_server = GuardianControlServer(handler, repo_root=config.repo_root, hardened=hardened, token=_control_token)
 
         # Start shadow process
         if not hardened:
@@ -2543,6 +2596,65 @@ def _ensure_hardened_venv(_sudo, lines: list[str]) -> None:
     lines.append(f"Installed deadpush into hardened venv from {source}")
 
 
+def _setup_hardened_policy(repo_root: Path, _sudo, lines: list[str]) -> None:
+    """Create the root-owned policy dir + marker for a hardened install.
+
+    This is what makes hardened mode a real boundary: guardrail policy
+    (rules.json / learned_patterns.json) and the fail-closed marker live here,
+    owned by _deadpush and readable-but-not-writable by the user, so a same-UID
+    agent cannot weaken enforcement by editing in-repo `.deadpush/` files. Any
+    existing in-repo policy is migrated in so the operator's current config
+    carries over.
+    """
+    import json as _json
+    import tempfile
+    import time as _time
+    from .config import hardened_policy_dir, hardened_install_marker
+
+    pol_root = _HARDENED_STATE_DIR / "policy"
+    pol_dir = hardened_policy_dir(repo_root)
+    _sudo(["mkdir", "-p", str(pol_dir)])
+
+    def _install_file(dst: Path, content: str) -> None:
+        tmp = None
+        try:
+            with tempfile.NamedTemporaryFile("w", suffix=".tmp", delete=False, encoding="utf-8") as tf:
+                tf.write(content)
+                tmp = tf.name
+            _sudo(["cp", tmp, str(dst)])
+        finally:
+            if tmp:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+
+    # Migrate existing in-repo policy so the operator's current config carries over.
+    for fname in ("rules.json", "learned_patterns.json"):
+        src = repo_root / ".deadpush" / fname
+        dst = pol_dir / fname
+        if src.exists() and not dst.exists():
+            try:
+                _install_file(dst, src.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+
+    # Root-owned marker: its presence is the trustworthy signal that this repo
+    # is a hardened install (the agent can neither forge nor delete it).
+    payload = _json.dumps({
+        "mode": "hardened",
+        "installed_at": _time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "repo": str(repo_root),
+    }, indent=2)
+    _install_file(hardened_install_marker(repo_root), payload)
+
+    # _deadpush owns the policy tree; perms let the user (and thus its git hooks)
+    # traverse + read the authoritative policy but never write it.
+    _sudo(["chown", "-R", "_deadpush:_deadpush", str(pol_root)])
+    _sudo(["chmod", "-R", "a+rX", str(pol_root)])
+    lines.append(f"Created root-owned policy dir {pol_dir}")
+
+
 def setup_hardened_environment(repo_root: Path, auto_load: bool = True) -> str:
     """One-time sudo setup for hardened mode: create _deadpush user, state
     directory, repo ACLs, install daemon plist, and load it.
@@ -2566,14 +2678,19 @@ def setup_hardened_environment(repo_root: Path, auto_load: bool = True) -> str:
 
     _ensure_deadpush_account(_sudo, lines)
 
-    # Create state directory
+    # Create state directory. 0711 (not 0700) so the user can *traverse* it to
+    # execute the root-owned hardened venv interpreter and read the root-owned
+    # policy — but not list it, and secret files (control token) stay 0600.
     state = _HARDENED_STATE_DIR
     _sudo(["mkdir", "-p", str(state)])
     _sudo(["chown", "_deadpush:_deadpush", str(state)])
-    _sudo(["chmod", "0700", str(state)])
+    _sudo(["chmod", "0711", str(state)])
     lines.append(f"Created state dir {state}")
 
     _ensure_hardened_venv(_sudo, lines)
+
+    # Root-owned policy + fail-closed marker (agent cannot tamper with these).
+    _setup_hardened_policy(repo_root, _sudo, lines)
 
     _apply_hardened_traverse_acls(repo_root, _sudo)
     lines.append(f"Granted _deadpush traverse ACLs to {repo_root}")

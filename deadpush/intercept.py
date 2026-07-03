@@ -59,7 +59,8 @@ def _load_learned_patterns(repo_root: Path) -> dict[str, list[dict[str, Any]]]:
     global _LEARNED_PATTERNS
     if _LEARNED_PATTERNS is not None:
         return _LEARNED_PATTERNS
-    path = repo_root / LEARNED_PATTERNS_FILE
+    from .config import policy_dir
+    path = policy_dir(repo_root) / "learned_patterns.json"
     if path.exists():
         try:
             _LEARNED_PATTERNS = json.loads(path.read_text(encoding="utf-8"))
@@ -74,9 +75,15 @@ def _save_learned_patterns(repo_root: Path) -> None:
     global _LEARNED_PATTERNS
     if _LEARNED_PATTERNS is None:
         return
-    path = repo_root / LEARNED_PATTERNS_FILE
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(_LEARNED_PATTERNS, indent=2), encoding="utf-8")
+    from .config import policy_dir
+    path = policy_dir(repo_root) / "learned_patterns.json"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(_LEARNED_PATTERNS, indent=2), encoding="utf-8")
+    except OSError:
+        # In hardened mode the policy dir is root-owned; a same-UID write is
+        # denied by design (suppressions must go through the privileged path).
+        pass
 
 
 def _is_suppressed(category: str, description: str, repo_root: Path) -> bool:

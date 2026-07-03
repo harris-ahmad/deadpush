@@ -11,6 +11,7 @@ Supports:
 
 from __future__ import annotations
 
+import hashlib
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -207,6 +208,74 @@ def remove_install_marker(repo_root: Path) -> None:
         install_marker_path(repo_root).unlink(missing_ok=True)
     except Exception:
         pass
+
+
+# ---------------------------------------------------------------------------
+# Hardened-mode policy locations (root/_deadpush-owned, tamper-resistant).
+#
+# In soft mode the guardrail *policy* an agent could weaken (rules.json,
+# learned_patterns.json) and the fail-closed marker live in the in-repo
+# `.deadpush/` directory — writable by the same-UID agent (soft mode is
+# deterrence, not a hard boundary). In hardened mode they must live somewhere
+# the agent cannot write. They are stored under a root/_deadpush-owned tree
+# that the user can *traverse and read* but not modify, so user-run git hooks
+# still read the authoritative policy while the agent cannot tamper with it.
+# ---------------------------------------------------------------------------
+
+HARDENED_STATE_DIR = Path("/var/db/deadpush")
+HARDENED_POLICY_ROOT = HARDENED_STATE_DIR / "policy"
+HARDENED_VENV_DIR = HARDENED_STATE_DIR / "venv"
+
+
+def hardened_python() -> Path:
+    """Path to the root/_deadpush-owned interpreter used by hardened hooks.
+
+    Hardened git hooks execute this interpreter (and thus the root-owned
+    deadpush package inside the venv) rather than the user's interpreter, so a
+    same-UID agent cannot neuter enforcement by editing a user-writable package.
+    """
+    return HARDENED_VENV_DIR / "bin" / "python"
+
+
+def repo_id(repo_root: Path | str) -> str:
+    """Stable 12-char id for a repo path (matches the guardian's scoping)."""
+    return hashlib.sha256(str(repo_root).encode()).hexdigest()[:12]
+
+
+def hardened_policy_dir(repo_root: Path) -> Path:
+    """Root-owned per-repo policy directory used in hardened mode."""
+    return HARDENED_POLICY_ROOT / repo_id(repo_root)
+
+
+def hardened_install_marker(repo_root: Path) -> Path:
+    """Root-owned marker whose presence means 'this repo is a hardened install'."""
+    return hardened_policy_dir(repo_root) / "installed"
+
+
+def is_hardened_install(repo_root: Path) -> bool:
+    """True when a trustworthy (root-owned) hardened marker exists for this repo.
+
+    The marker lives under a root/_deadpush-owned tree that a same-UID agent
+    can neither create (can't forge a hardened install) nor delete (can't
+    downgrade enforcement), so its presence is authoritative.
+    """
+    try:
+        return hardened_install_marker(repo_root).exists()
+    except Exception:
+        return False
+
+
+def policy_dir(repo_root: Path) -> Path:
+    """Authoritative directory for runtime policy files (rules/learned patterns).
+
+    Hardened installs read policy from the root-owned tree so a same-UID agent
+    cannot weaken enforcement by editing in-repo `.deadpush/` files. Soft
+    installs (and anything not hardened) use the in-repo `.deadpush/` directory
+    exactly as before, so soft-mode behavior is unchanged.
+    """
+    if is_hardened_install(repo_root):
+        return hardened_policy_dir(repo_root)
+    return repo_root / ".deadpush"
 
 
 def _package_version() -> str:

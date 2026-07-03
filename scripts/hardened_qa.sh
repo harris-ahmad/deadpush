@@ -280,6 +280,60 @@ poll 30 "guardian reset a hijacked core.hooksPath" bash -c "
   v=\$(git -C '$REPO' config --get core.hooksPath 2>/dev/null || true)
   [ -z \"\$v\" ] || [ \"\$(cd '$REPO' && git rev-parse --git-path hooks)\" = \"\$v\" ]"
 
+# ── Tier 0 hardening: hardened interpreter, root-owned policy, control token ──
+info "Tier 0: root-owned interpreter, policy, and control-token auth"
+# Resolve the repo id deadpush used (match either the literal or realpath form).
+POL_ID=""
+for cand in "$REPO" "$(cd "$REPO" && pwd -P)"; do
+  _id="$(python3 -c 'import hashlib,sys;print(hashlib.sha256(sys.argv[1].encode()).hexdigest()[:12])' "$cand")"
+  if sudo test -d "/var/db/deadpush/policy/$_id" 2>/dev/null; then POL_ID="$_id"; break; fi
+  [[ -z "$POL_ID" ]] && POL_ID="$_id"
+done
+POL_DIR="/var/db/deadpush/policy/$POL_ID"
+
+# H2 — hooks run the root-owned interpreter, which the agent cannot modify.
+check "pre-push hook runs the root-owned hardened interpreter" \
+  bash -c "grep -q '/var/db/deadpush/venv/bin/python' '$HOOK'"
+check_fails "agent cannot write into the hardened venv (root-owned)" \
+  bash -c "touch /var/db/deadpush/venv/qa_tamper"
+
+# H1/H5 — policy + fail-closed marker live in a root-owned dir the agent can't touch.
+check "root-owned policy dir exists ($POL_DIR)" test -d "$POL_DIR"
+check "root-owned hardened marker exists" test -f "$POL_DIR/installed"
+check_fails "agent cannot write into the root-owned policy dir" \
+  bash -c "touch '$POL_DIR/qa_tamper'"
+check_fails "agent cannot delete the root-owned marker" rm -f "$POL_DIR/installed"
+
+# H1 (functional) — an agent lowering in-repo rules must NOT weaken enforcement.
+mkdir -p "$REPO/.deadpush"
+printf '{"guardrail_levels":{"security":"off","secret":"off","destructive":"off"}}\n' > "$REPO/.deadpush/rules.json"
+printf 'import os\nos.system("rm -rf /")\n' > "$REPO/qa_bypass.py"
+( cd "$REPO" && git add qa_bypass.py && git commit -qm "attempt bypass via rules.json" ) >/dev/null 2>&1 || true
+check_fails "in-repo rules.json cannot disable enforcement (danger absent from HEAD)" \
+  bash -c "git -C '$REPO' show HEAD:qa_bypass.py 2>/dev/null | grep -q 'rm -rf'"
+
+# H2 (functional) — a benign commit must still succeed: this proves the user's
+# git hook can actually execute the root-owned hardened interpreter + package.
+printf 'x = 1\n' > "$REPO/qa_benign.py"
+check "a benign commit still succeeds under the hardened interpreter" \
+  bash -c "cd '$REPO' && git add qa_benign.py && git commit -qm 'benign change'"
+
+# H3 — control token is root-only and unauthenticated mutations are rejected.
+TOKEN_FILE="/var/db/deadpush/guardian.control.token.$POL_ID"
+check "control token file exists (root-owned)" sudo test -f "$TOKEN_FILE"
+check_fails "agent cannot read the control token (0600, root-owned)" bash -c "cat '$TOKEN_FILE'"
+if command -v curl >/dev/null 2>&1; then
+  PORT="$(sudo cat "/var/db/deadpush/guardian.control.port.$POL_ID" 2>/dev/null || true)"
+  if [[ -n "$PORT" ]]; then
+    CODE="$(curl -s -m 5 -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:$PORT/quarantine/restore" -d '{}' 2>/dev/null || true)"
+    check "unauthenticated control mutation is rejected (HTTP 401; got ${CODE:-none})" test "$CODE" = "401"
+  else
+    warn "could not read control port; skipping unauthenticated-mutation check"
+  fi
+else
+  warn "curl not found; skipping unauthenticated-mutation HTTP check"
+fi
+
 info "High-level status"
 check "'deadpush status --hardened' reports RUNNING" \
   bash -c "cd '$REPO' && $DP_CMD status --hardened 2>&1 | grep -qi running"

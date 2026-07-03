@@ -256,7 +256,8 @@ def install_hook(repo_root: Path, *, system: bool = False) -> None:
 #     DEADPUSH_STRICT is set, FAIL CLOSED (block the git operation).
 #   - Otherwise (repo was never protected), fail open so unrelated repos are
 #     not disrupted by a stale global hook path.
-_HOOK_FAILCLOSED_PRELUDE = '''import os
+_HOOK_FAILCLOSED_PRELUDE = '''import hashlib
+import os
 import subprocess
 import sys
 
@@ -277,7 +278,12 @@ def _deadpush_repo_protected():
         root = r.stdout.strip()
         if not root:
             return False
-        return os.path.exists(os.path.join(root, ".deadpush", "installed"))
+        if os.path.exists(os.path.join(root, ".deadpush", "installed")):
+            return True
+        # Hardened installs also record a root-owned marker the same-UID agent
+        # cannot delete, so fail-closed holds even if the in-repo marker is gone.
+        rid = hashlib.sha256(root.encode()).hexdigest()[:12]
+        return os.path.exists(os.path.join("/var/db/deadpush", "policy", rid, "installed"))
     except Exception:
         return False
 
@@ -405,7 +411,13 @@ def _write_hook_file(repo_root: Path, hook_name: str, *, system: bool = False) -
         raise RuntimeError(f"No .git/hooks directory in {repo_root}")
 
     hook_path = hooks_dir / hook_name
-    python_exe = sys.executable
+    # In hardened mode the hook must run the root/_deadpush-owned interpreter
+    # (and its immutable deadpush package), NOT the user's interpreter — a
+    # same-UID agent can edit a user-writable package to no-op the guardrails,
+    # which would defeat even a root-immutable hook file. The hardened venv
+    # interpreter and package are owned by _deadpush and not user-writable.
+    from .config import hardened_python
+    python_exe = str(hardened_python()) if system else sys.executable
     script = _get_hook_script(hook_name, python_exe)
 
     # Remove immutable flag if set (needed for overwrite/update). Clear at the
@@ -789,8 +801,18 @@ def uninstall_deadpush_hooks(repo_root: Path, *, system: bool = False) -> list[s
     return removed
 
 
-def repair_deadpush_hooks(repo_root: Path) -> list[str]:
-    """Re-install deadpush hooks that are missing or tampered. Returns repaired names."""
+def repair_deadpush_hooks(repo_root: Path, *, system: bool | None = None) -> list[str]:
+    """Re-install deadpush hooks that are missing or tampered. Returns repaired names.
+
+    ``system`` controls the lock level of the re-installed hooks. When left as
+    ``None`` it is auto-detected from whether this is a hardened install, so the
+    guardian's own auto-repair re-locks hardened hooks root-immutable (schg) and
+    re-pins the hardened interpreter instead of silently downgrading them to
+    user-immutable (uchg) + the user interpreter.
+    """
+    from .config import is_hardened_install
+    if system is None:
+        system = is_hardened_install(repo_root)
     problems = verify_hooks_installed(repo_root)
     if not problems:
         return []
@@ -802,11 +824,11 @@ def repair_deadpush_hooks(repo_root: Path) -> list[str]:
         if not any(p.startswith(name) for p in problems):
             continue
         if name == "pre-push":
-            install_hook(repo_root)
+            install_hook(repo_root, system=system)
         elif name == "pre-commit":
-            install_precommit_hook(repo_root)
+            install_precommit_hook(repo_root, system=system)
         elif name == "post-commit":
-            install_postcommit_hook(repo_root)
+            install_postcommit_hook(repo_root, system=system)
         repaired.append(name)
     return repaired
 

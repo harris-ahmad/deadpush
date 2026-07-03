@@ -13,6 +13,8 @@ import re
 from pathlib import Path
 from typing import Any
 
+from .config import policy_dir
+
 
 RULES_FILE = ".deadpush/rules.json"
 
@@ -43,7 +45,9 @@ class RuntimeConfig:
 
     def __init__(self, repo_root: Path):
         self.repo_root = repo_root
-        self.rules_path = repo_root / RULES_FILE
+        # Hardened installs read/write policy from a root-owned dir the agent
+        # cannot modify; soft installs use the in-repo `.deadpush/` as before.
+        self.rules_path = policy_dir(repo_root) / "rules.json"
         self._data: dict[str, Any] = {}
         self._compiled: list[tuple[re.Pattern, str]] = []  # (compiled_regex, description)
         self._load()
@@ -53,7 +57,7 @@ class RuntimeConfig:
         """Create a RuntimeConfig from a dict without file I/O (primarily for tests)."""
         rc = cls.__new__(cls)
         rc.repo_root = repo_root
-        rc.rules_path = repo_root / RULES_FILE
+        rc.rules_path = policy_dir(repo_root) / "rules.json"
         rc._data = copy.deepcopy(data)
         rc._merge_defaults()
         rc._rebuild_cache()

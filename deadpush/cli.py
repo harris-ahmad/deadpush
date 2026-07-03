@@ -996,7 +996,7 @@ def cmd_uninstall(hardened, force):
     """
     from .config import load_config
     from .guard import (
-        _scoped_pidfile, _scoped_lockfile, _scoped_portfile,
+        _scoped_pidfile, _scoped_lockfile, _scoped_portfile, _scoped_token_file,
         _scoped_plist_label, _scoped_plist_path, _scoped_systemd_unit_path, _state_dir
     )
     from .hooks import _make_mutable
@@ -1010,6 +1010,7 @@ def cmd_uninstall(hardened, force):
     pidfile = _scoped_pidfile(repo_root, hardened)
     lockfile = _scoped_lockfile(repo_root, hardened)
     portfile = _scoped_portfile(repo_root, hardened)
+    tokenfile = _scoped_token_file(repo_root, hardened)
     plist_label = _scoped_plist_label(repo_root)
     plist_path = _scoped_plist_path(repo_root, hardened)
     state_dir = _state_dir(hardened)
@@ -1093,7 +1094,7 @@ def cmd_uninstall(hardened, force):
 
     # 4. Clean up state files
     print("[4/6] Cleaning state files...")
-    for f in [pidfile, lockfile, portfile]:
+    for f in [pidfile, lockfile, portfile, tokenfile]:
         if hardened:
             subprocess.run(["sudo", "rm", "-f", str(f)], capture_output=True, timeout=10)
         elif f.exists():
