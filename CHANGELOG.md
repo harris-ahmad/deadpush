@@ -24,6 +24,13 @@ green macOS + Linux CI including the lifecycle integration test) are met._
 - **Lifecycle integration test** (`tests/test_integration_lifecycle.py`): drives
   the installed CLI and executes the real generated hooks; runs on macOS + Linux
   in CI.
+- **Hardened-mode QA harness** (`scripts/hardened_qa.sh`): a manual, root-gated
+  end-to-end validator for the hardened guarantees CI cannot cover — privilege
+  separation, an agent-unkillable daemon (and launchd/systemd respawn),
+  root-immutable `schg`/`+i` hooks, repo + `$HOME`-traverse ACLs, real-time
+  quarantine, `core.hooksPath` self-heal, and a verified clean teardown. It runs
+  in a throwaway repo, escalates only via `sudo`, and refuses to run when a
+  `_deadpush` account already exists so it can't disturb a real install.
 - **`core.hooksPath` hijack detection + self-heal**: `git config core.hooksPath
   /dev/null` (or any dir other than `.git/hooks`) silently disabled every hook
   without tripping the checksum/immutability checks. `verify_hooks_installed` now

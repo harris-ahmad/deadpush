@@ -109,6 +109,24 @@ cd deadpush
 
 On macOS, use `dev_install.sh` instead of bare `pip install -e .` — see [CONTRIBUTING.md](CONTRIBUTING.md) if imports fail outside the repo.
 
+### Validating hardened mode
+
+Hardened mode's guarantees (privilege separation, an agent-unkillable daemon,
+root-immutable `schg` hooks, repo ACLs, real-time quarantine, hook self-heal, and
+a clean teardown) require root and a real service manager, so CI can't verify
+them. Run the end-to-end QA harness manually on a clean machine or VM:
+
+```bash
+./scripts/hardened_qa.sh
+```
+
+It provisions a throwaway repo, runs `deadpush protect --hardened`, asserts every
+guarantee against live system state, then uninstalls and verifies nothing is left
+behind. Run it as your normal user (not root); it escalates with `sudo` only where
+needed. It refuses to run if a `_deadpush` account already exists, so it can't
+disturb a real hardened install (pass `--allow-existing` to override, `--keep` to
+skip teardown for inspection).
+
 ## Architecture
 
 deadpush is a closed-loop guardian with four cooperating layers:
