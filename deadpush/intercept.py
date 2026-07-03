@@ -552,12 +552,12 @@ def _write_feedback(feedback_dir: Path, rel_path: str, result: GuardrailResult) 
 def _format_feedback_md(feedback: dict[str, Any]) -> str:
     """Format feedback as markdown for agent consumption."""
     lines = [
-        f"# deadpush Guardrail Feedback",
-        f"",
+        "# deadpush Guardrail Feedback",
+        "",
         f"- **File**: `{feedback.get('file', 'unknown')}`",
         f"- **Status**: {feedback['status']}",
         f"- **Time**: {feedback.get('timestamp', 'unknown')}",
-        f"",
+        "",
     ]
     if feedback.get("violations"):
         lines.append("## Violations")

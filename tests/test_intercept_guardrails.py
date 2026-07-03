@@ -6,10 +6,7 @@ import sys
 from pathlib import Path
 
 import json
-import sys
-from pathlib import Path
 
-import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -23,7 +20,6 @@ from deadpush.intercept import (
     _check_layer_violations,
     _check_sensitive_write,
     _check_destructive_changes,
-    _check_dependency_integrity,
     _run_guardrails,
     enforce_content,
     FEEDBACK_DIR,

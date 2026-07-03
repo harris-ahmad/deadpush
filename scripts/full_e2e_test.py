@@ -253,6 +253,12 @@ def main() -> None:
     parser.add_argument("--repo-dir", default=".", help="Repo to test in")
     parser.add_argument("--simulate-agent", action="store_true", help="Write dangerous test files")
     parser.add_argument("--burst", action="store_true", help="Burst of bad writes")
+    parser.add_argument(
+        "--soft",
+        action="store_true",
+        help="Run protect in --soft (same-UID) mode; required in CI where the "
+             "hardened _deadpush user cannot be created",
+    )
     parser.add_argument("--no-clean", action="store_true", help="Leave guardian running and sandbox in place")
     parser.add_argument(
         "--allow-self-test",
@@ -292,10 +298,19 @@ def main() -> None:
 
     results: dict[str, bool] = {}
 
+    soft_args = ["--soft"] if args.soft else []
+
     print("\n=== 1. deadpush protect ===")
-    deadpush_cmd("protect", repo=repo)
+    protect_res = deadpush_cmd("protect", *soft_args, repo=repo)
+    # protect now exits non-zero if protection is incomplete — treat that as a failure.
+    results["protect"] = protect_res.returncode == 0
+    if protect_res.returncode != 0:
+        print(f"[protect] exit={protect_res.returncode}")
+        print((protect_res.stdout or "")[-800:])
+        print((protect_res.stderr or "")[-400:])
 
     print("\n=== 2. deadpush doctor ===")
+    # doctor checks the default (soft) guardian unless --hardened is given.
     doc = deadpush_cmd("doctor", repo=repo)
     results["doctor"] = doc.returncode == 0
     print(doc.stdout[-800:] if doc.stdout else "")
@@ -309,7 +324,11 @@ def main() -> None:
         (sandbox / name).write_text("# prep\n")
 
     print("\n=== 3. deadpush protect --daemon ===")
-    deadpush_cmd("protect", "--daemon", repo=repo)
+    daemon_res = deadpush_cmd("protect", "--daemon", *soft_args, repo=repo)
+    results["daemon_start"] = daemon_res.returncode == 0
+    if daemon_res.returncode != 0:
+        print(f"[daemon] exit={daemon_res.returncode}")
+        print((daemon_res.stdout or "")[-800:])
     wait_for_file(pidfile_for(repo), timeout=15)
 
     print("\n=== 4. deadpush status ===")

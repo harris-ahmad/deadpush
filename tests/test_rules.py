@@ -3,9 +3,8 @@
 from __future__ import annotations
 
 import json
-import os
 
-from deadpush.rules import RuntimeConfig, GUARDRAIL_LEVELS
+from deadpush.rules import RuntimeConfig
 
 
 class TestRuntimeConfig:

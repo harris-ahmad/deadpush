@@ -45,68 +45,69 @@ class HookRegistry:
 
 hooks = HookRegistry()
 
-def _make_immutable(path: Path) -> bool:
+def _make_immutable(path: Path, *, system: bool = False) -> bool:
     """Set the OS-level immutable flag on `path`.
 
-    On macOS this uses `chflags uchg` — the file cannot be renamed, deleted,
-    or overwritten until the flag is removed (via `_make_mutable`).
+    - Soft mode (``system=False``): USER-immutable — `chflags uchg` (macOS) /
+      `chattr +i` (Linux). The file *owner* can still clear it, so a same-UID
+      agent can undo it; this only deters casual/accidental removal.
+    - Hardened mode (``system=True``): ROOT-immutable — `sudo chflags schg`
+      (macOS) / `sudo chattr +i` (Linux). Only root can clear the flag, so a
+      same-UID agent cannot delete, rename, or overwrite the hook at all.
 
-    On Linux this uses `chattr +i` (may require sudo/capability on some distros).
-
-    Returns True if the flag was set, False if the OS/fs doesn't support it.
-    On failure the caller should log a warning but treat it as non-fatal.
+    Returns True if the flag was set, False if it could not be (unsupported OS/fs
+    or missing privileges). Callers treat False as non-fatal.
     """
     try:
         if sys.platform == "darwin":
-            result = subprocess.run(
-                ["chflags", "uchg", str(path)],
-                capture_output=True, timeout=5,
-            )
-            return result.returncode == 0
+            flag = "schg" if system else "uchg"
+            cmd = (["sudo"] if system else []) + ["chflags", flag, str(path)]
         elif sys.platform.startswith("linux"):
-            result = subprocess.run(
-                ["chattr", "+i", str(path)],
-                capture_output=True, timeout=5,
-            )
-            return result.returncode == 0
-        return False
+            cmd = (["sudo"] if system else []) + ["chattr", "+i", str(path)]
+        else:
+            return False
+        result = subprocess.run(cmd, capture_output=True, timeout=15)
+        return result.returncode == 0
     except Exception:
         return False
 
 
-def _make_mutable(path: Path) -> bool:
-    """Remove the OS-level immutable flag from `path`.
+def _make_mutable(path: Path, *, system: bool = False) -> bool:
+    """Remove the OS-level immutable flag from `path` (reverse of `_make_immutable`).
 
-    The reverse of `_make_immutable`. Must succeed before the file can be
-    updated or overwritten.
+    Must succeed before the file can be updated or removed. With ``system=True``
+    this uses sudo and clears BOTH the system- and user-immutable flags, since a
+    hardened hook may carry either (e.g. after a sudo->non-sudo fallback).
     """
     try:
         if sys.platform == "darwin":
-            subprocess.run(
-                ["chflags", "nouchg", str(path)],
-                capture_output=True, timeout=5,
-            )
-            return True
+            if system:
+                cmd = ["sudo", "chflags", "noschg,nouchg", str(path)]
+            else:
+                cmd = ["chflags", "nouchg", str(path)]
         elif sys.platform.startswith("linux"):
-            subprocess.run(
-                ["chattr", "-i", str(path)],
-                capture_output=True, timeout=5,
-            )
+            cmd = (["sudo"] if system else []) + ["chattr", "-i", str(path)]
+        else:
             return True
+        subprocess.run(cmd, capture_output=True, timeout=15)
         return True
     except Exception:
         return False
 
 
 def _is_immutable(path: Path) -> bool:
-    """Check whether the OS-level immutable flag is set on `path`.
+    """Check whether a USER- or SYSTEM-immutable flag is set on `path`.
 
-    Only supported on macOS. On other platforms returns False.
+    Only supported on macOS (checks both UF_IMMUTABLE/uchg and SF_IMMUTABLE/schg).
+    On other platforms returns False. Recognising schg here is essential: without
+    it the daemon would treat a root-immutable hook as "not immutable" and loop
+    trying to repair a file it cannot rewrite.
     """
     try:
         if sys.platform == "darwin":
             st = path.stat()
-            return bool(st.st_flags & stat.UF_IMMUTABLE)
+            mask = stat.UF_IMMUTABLE | getattr(stat, "SF_IMMUTABLE", 0x00020000)
+            return bool(st.st_flags & mask)
         return False
     except Exception:
         return False
@@ -212,7 +213,7 @@ def run_precommit_guardrails(repo_root: Path) -> tuple[bool, list[dict[str, Any]
         )
         if result.returncode != 0:
             return True, []
-        staged = [l.strip() for l in result.stdout.splitlines() if l.strip()]
+        staged = [line.strip() for line in result.stdout.splitlines() if line.strip()]
     except Exception:
         return True, []
 
@@ -229,7 +230,7 @@ def run_precommit_guardrails(repo_root: Path) -> tuple[bool, list[dict[str, Any]
     return True, []
 
 
-def install_hook(repo_root: Path) -> None:
+def install_hook(repo_root: Path, *, system: bool = False) -> None:
     """
     Install a cross-platform pre-push git hook.
 
@@ -242,10 +243,55 @@ def install_hook(repo_root: Path) -> None:
     - macOS / Linux
     - Any environment where Python can run the deadpush module.
 
+    ``system=True`` (hardened mode) locks the hook root-immutable (schg/sudo).
     Idempotent.
     """
-    _write_hook_file(repo_root, "pre-push")
+    _write_hook_file(repo_root, "pre-push", system=system)
 
+
+# Shared prelude embedded into every generated hook. It decides what to do
+# when the pinned deadpush interpreter cannot be launched at all
+# (FileNotFoundError). Policy:
+#   - If this repo was protected (a `.deadpush/installed` marker exists) OR
+#     DEADPUSH_STRICT is set, FAIL CLOSED (block the git operation).
+#   - Otherwise (repo was never protected), fail open so unrelated repos are
+#     not disrupted by a stale global hook path.
+_HOOK_FAILCLOSED_PRELUDE = '''import os
+import subprocess
+import sys
+
+
+def _deadpush_strict():
+    val = os.environ.get("DEADPUSH_STRICT", "").strip().lower()
+    return val not in ("", "0", "false", "no", "off")
+
+
+def _deadpush_repo_protected():
+    try:
+        r = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if r.returncode != 0:
+            return False
+        root = r.stdout.strip()
+        if not root:
+            return False
+        return os.path.exists(os.path.join(root, ".deadpush", "installed"))
+    except Exception:
+        return False
+
+
+def _deadpush_handle_missing(op):
+    """Called when the deadpush interpreter itself cannot be launched."""
+    if _deadpush_strict() or _deadpush_repo_protected():
+        print("deadpush cannot run but this repo is protected by deadpush.")
+        print("Refusing to " + op + " (fail-closed). Run `deadpush doctor` to diagnose,")
+        print("or `deadpush uninstall` to remove protection from this repo.")
+        sys.exit(1)
+    print("deadpush not installed for this repo — skipping hook.")
+    sys.exit(0)
+'''
 
 def _get_hook_script(hook_name: str, python_exe: str) -> str:
     """Return the script content for a given hook name."""
@@ -257,26 +303,23 @@ deadpush pre-push git hook (installed by deadpush protect).
 Scans outgoing commits for guardrail violations and blocks the push
 if dangerous code is found. Reads stdin for the commit range.
 """
-import subprocess
-import sys
+{_HOOK_FAILCLOSED_PRELUDE}
 
 def main():
     try:
-        cmd = [r"{python_exe}", "-m", "deadpush.cli", "hooks", "run-prepush"]
+        cmd = [r"{python_exe}", "-m", "deadpush_bootstrap", "hooks", "run-prepush"]
         result = subprocess.run(cmd, capture_output=False, text=True, check=False)
         if result.returncode != 0:
             print("deadpush guardrails blocked this push.")
             print("Fix the violations above or use --no-verify (not recommended).")
             sys.exit(1)
     except FileNotFoundError:
-        print("deadpush not available (Python module could not be found).")
-        print("Skipping hook (install with pip install -e . in the deadpush source).")
-        sys.exit(0)
+        _deadpush_handle_missing("push")
 
 if __name__ == "__main__":
     main()
 '''
-    elif hook_name == "pre-commit":
+    if hook_name == "pre-commit":
         return f'''#!/usr/bin/env python3
 """
 deadpush pre-commit guardrails (installed by deadpush hook install-precommit).
@@ -284,12 +327,11 @@ deadpush pre-commit guardrails (installed by deadpush hook install-precommit).
 Blocks commits with prompt injection, hardcoded secrets,
 security violations, and architecture layer violations.
 """
-import subprocess
-import sys
+{_HOOK_FAILCLOSED_PRELUDE}
 
 def main():
     try:
-        cmd = [r"{python_exe}", "-m", "deadpush.cli", "hooks", "run-precommit"]
+        cmd = [r"{python_exe}", "-m", "deadpush_bootstrap", "hooks", "run-precommit"]
         result = subprocess.run(cmd, capture_output=True, text=True, check=False)
         if result.stdout:
             print(result.stdout)
@@ -299,24 +341,22 @@ def main():
             print("deadpush guardrails blocked this commit.")
             sys.exit(1)
     except FileNotFoundError:
-        print("deadpush not available (Python module could not be found).")
-        sys.exit(0)
+        _deadpush_handle_missing("commit")
 
 if __name__ == "__main__":
     main()
 '''
-    elif hook_name == "post-commit":
+    if hook_name == "post-commit":
         return f'''#!/usr/bin/env python3
 """
 deadpush post-commit guardrails (installed by deadpush protect).
 Reverts commits containing dangerous code even if --no-verify was used.
 """
-import subprocess
-import sys
+{_HOOK_FAILCLOSED_PRELUDE}
 
 def main():
     try:
-        cmd = [r"{python_exe}", "-m", "deadpush.cli", "hooks", "run-postcommit"]
+        cmd = [r"{python_exe}", "-m", "deadpush_bootstrap", "hooks", "run-postcommit"]
         result = subprocess.run(cmd, capture_output=True, text=True, check=False)
         if result.stdout:
             for line in result.stdout.splitlines():
@@ -329,7 +369,10 @@ def main():
             print("Review and fix the issues above, then commit again.")
             sys.exit(1)
     except FileNotFoundError:
-        print("deadpush not available (Python module could not be found).")
+        # post-commit runs after the commit exists; blocking here cannot undo it,
+        # so surface the failure loudly but do not hard-exit the commit flow.
+        print("deadpush cannot run post-commit checks (interpreter missing).")
+        print("Run `deadpush doctor` — this commit was NOT scanned.")
         sys.exit(0)
 
 if __name__ == "__main__":
@@ -347,12 +390,13 @@ def _save_hook_checksum(repo_root: Path, hook_name: str, script: str) -> None:
     checksum_file.write_text(sha256_hash, encoding="utf-8")
 
 
-def _write_hook_file(repo_root: Path, hook_name: str) -> None:
+def _write_hook_file(repo_root: Path, hook_name: str, *, system: bool = False) -> None:
     """Write a git hook script to .git/hooks/{hook_name} and save its checksum.
 
-    Used by both the CLI installer and the guardian's auto-restore.
-    The file is made immutable (chflags uchg on macOS, chattr +i on Linux)
-    to prevent the agent from silently moving or deleting it.
+    Used by both the CLI installer and the guardian's auto-restore. The file is
+    made immutable to prevent the agent from silently moving or deleting it:
+    root-immutable (`schg`/sudo) when ``system=True`` (hardened mode), otherwise
+    user-immutable (`uchg`).
     """
     hooks_dir = repo_root / ".git" / "hooks"
     if not hooks_dir.exists():
@@ -364,8 +408,9 @@ def _write_hook_file(repo_root: Path, hook_name: str) -> None:
     python_exe = sys.executable
     script = _get_hook_script(hook_name, python_exe)
 
-    # Remove immutable flag if set (needed for overwrite/update)
-    _make_mutable(hook_path)
+    # Remove immutable flag if set (needed for overwrite/update). Clear at the
+    # requested privilege level so a previously root-immutable hook can be rewritten.
+    _make_mutable(hook_path, system=system)
 
     hook_path.write_text(script, encoding="utf-8")
     try:
@@ -377,7 +422,17 @@ def _write_hook_file(repo_root: Path, hook_name: str) -> None:
 
     # Set immutable flag — the hook file can no longer be renamed, deleted,
     # or overwritten without an explicit `_make_mutable` call.
-    if not _make_immutable(hook_path):
+    made = _make_immutable(hook_path, system=system)
+    if system and not made:
+        # Root-immutable couldn't be set (no cached sudo / unsupported fs). Fall
+        # back to user-immutable so the hook is still deletion-protected, and make
+        # the downgrade loud so the operator can fix privileges and re-run.
+        made = _make_immutable(hook_path, system=False)
+        if made:
+            print(f"  ⚠ Could not set ROOT-immutable (schg) flag on {hook_path}; "
+                  f"fell back to user-immutable. Re-run `deadpush protect` with sudo "
+                  f"available to lock it against a same-UID agent.")
+    if not made:
         print(f"  ⚠ Could not set immutable flag on {hook_path} "
               f"(OS/fs may not support it; hook is still checksum-protected)")
 
@@ -391,7 +446,7 @@ def _write_hook_file(repo_root: Path, hook_name: str) -> None:
     print(f"Installed {hook_name} guardrail hook at {hook_path}")
 
 
-def install_precommit_hook(repo_root: Path) -> None:
+def install_precommit_hook(repo_root: Path, *, system: bool = False) -> None:
     """
     Install a pre-commit git hook that runs guardrails on staged files.
 
@@ -402,11 +457,12 @@ def install_precommit_hook(repo_root: Path) -> None:
     - Architecture layer violations
 
     Uses a Python script for cross-platform support.
+    ``system=True`` (hardened mode) locks the hook root-immutable (schg/sudo).
     """
-    _write_hook_file(repo_root, "pre-commit")
+    _write_hook_file(repo_root, "pre-commit", system=system)
 
 
-def install_postcommit_hook(repo_root: Path) -> None:
+def install_postcommit_hook(repo_root: Path, *, system: bool = False) -> None:
     """
     Install a post-commit git hook that reverts commits containing
     guardrail violations (catches --no-verify bypasses).
@@ -414,8 +470,9 @@ def install_postcommit_hook(repo_root: Path) -> None:
     Runs guardrails on every file in the last commit. If violations are
     found, the commit is undone via `git reset --soft HEAD~1` so the
     changes remain staged but uncommitted.
+    ``system=True`` (hardened mode) locks the hook root-immutable (schg/sudo).
     """
-    _write_hook_file(repo_root, "post-commit")
+    _write_hook_file(repo_root, "post-commit", system=system)
 
 
 def run_postcommit_guardrails(repo_root: Path) -> tuple[bool, list[dict[str, Any]]]:
@@ -430,7 +487,7 @@ def run_postcommit_guardrails(repo_root: Path) -> tuple[bool, list[dict[str, Any
         )
         if result.returncode != 0:
             return True, []
-        files = [l.strip() for l in result.stdout.splitlines() if l.strip()]
+        files = [line.strip() for line in result.stdout.splitlines() if line.strip()]
     except Exception:
         return True, []
 
@@ -456,13 +513,99 @@ def run_postcommit_guardrails(repo_root: Path) -> tuple[bool, list[dict[str, Any
     return True, []
 
 
+# All-zeros object id git uses on the "other" side of a create/delete ref update.
+_ZERO_SHA = "0000000000000000000000000000000000000000"
+# Git's canonical empty tree. Diffing a commit against it yields every file in
+# that commit's tree, which is what we want when a new ref shares no history with
+# anything already on the remote (e.g. the very first push).
+_EMPTY_TREE_SHA = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+
+
+def _git_name_only(repo_root: Path, *args: str) -> list[str]:
+    """`git diff --name-only <args>` -> list of paths (empty list on any error)."""
+    try:
+        result = subprocess.run(
+            ["git", "diff", "--name-only", *args],
+            capture_output=True, text=True, check=False, timeout=15,
+            cwd=repo_root,
+        )
+        if result.returncode != 0:
+            return []
+        return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    except Exception:
+        return []
+
+
+def _prepush_new_ref_base(repo_root: Path, local_sha: str) -> str | None:
+    """Boundary commit for a brand-new ref push (remote side all-zeros).
+
+    Returns the commit already present on the remote that the newly-introduced
+    commits branch off from (suitable for a ``base..local_sha`` diff), or ``None``
+    when the pushed ref shares no history with any remote-tracking branch (first
+    push / disjoint history) — the caller then scans the entire pushed tree.
+    """
+    try:
+        # Commits reachable from local_sha but not from any remote-tracking ref:
+        # exactly the commits this push would introduce to the remote.
+        rv = subprocess.run(
+            ["git", "rev-list", "--reverse", "--topo-order", local_sha, "--not", "--remotes"],
+            capture_output=True, text=True, check=False, timeout=15,
+            cwd=repo_root,
+        )
+        if rv.returncode != 0:
+            return None
+        new_commits = [c for c in rv.stdout.split() if c]
+    except Exception:
+        return None
+
+    if not new_commits:
+        # No commits are new relative to remotes (or there are no remotes at all).
+        # Fall back to a whole-tree scan so a new ref is never let through unscanned.
+        return None
+
+    oldest = new_commits[0]
+    try:
+        # The parent of the oldest introduced commit is the boundary already on
+        # the remote. A root commit has no parent -> signal whole-tree scan.
+        parent = subprocess.run(
+            ["git", "rev-parse", "--verify", "--quiet", f"{oldest}^"],
+            capture_output=True, text=True, check=False, timeout=5,
+            cwd=repo_root,
+        )
+        base = parent.stdout.strip()
+        return base or None
+    except Exception:
+        return None
+
+
+def _prepush_changed_paths(repo_root: Path, local_sha: str, remote_sha: str) -> list[str]:
+    """Resolve the files a single pre-push ref update introduces.
+
+    - Update to an existing branch: diff ``remote_sha..local_sha``.
+    - New branch/ref (remote all-zeros): diff from the boundary commit already on
+      the remote up to ``local_sha``; if the ref shares no history with any remote,
+      scan the entire pushed tree.
+
+    The new-ref path closes a real gap: previously a new branch used ``local_sha``
+    as the whole diff spec, which made ``git diff`` compare the *working tree*
+    against ``local_sha`` and (on a clean tree) scan nothing — so pushing a brand
+    new branch bypassed content enforcement entirely.
+    """
+    if remote_sha != _ZERO_SHA:
+        return _git_name_only(repo_root, f"{remote_sha}..{local_sha}")
+
+    base = _prepush_new_ref_base(repo_root, local_sha)
+    if base:
+        return _git_name_only(repo_root, base, local_sha)
+    return _git_name_only(repo_root, _EMPTY_TREE_SHA, local_sha)
+
+
 def run_prepush_guardrails(repo_root: Path) -> tuple[bool, list[dict[str, Any]]]:
     """Run guardrails on commits being pushed.
 
     Reads the pre-push hook stdin to determine the commit range,
     then runs unified enforcement on all files in those commits.
     """
-    import subprocess
     import sys
 
     violations: list[dict[str, Any]] = []
@@ -476,22 +619,11 @@ def run_prepush_guardrails(repo_root: Path) -> tuple[bool, list[dict[str, Any]]]
         if len(parts) < 4:
             continue
         local_sha, remote_sha = parts[1], parts[3]
-        if remote_sha == "0000000000000000000000000000000000000000":
-            range_spec = local_sha
-        else:
-            range_spec = f"{remote_sha}..{local_sha}"
-
-        try:
-            result = subprocess.run(
-                ["git", "diff", "--name-only", range_spec],
-                capture_output=True, text=True, check=False, timeout=10,
-                cwd=repo_root,
-            )
-            if result.returncode != 0:
-                continue
-            changed = [l.strip() for l in result.stdout.splitlines() if l.strip()]
-        except Exception:
+        # Deleting a remote ref pushes an all-zeros local sha: nothing to scan.
+        if local_sha == _ZERO_SHA:
             continue
+
+        changed = _prepush_changed_paths(repo_root, local_sha, remote_sha)
 
         for rel_path in changed:
             key = (local_sha, rel_path)
@@ -512,9 +644,81 @@ def run_prepush_guardrails(repo_root: Path) -> tuple[bool, list[dict[str, Any]]]
     return True, []
 
 
+def _hookspath_value(repo_root: Path) -> str | None:
+    """Return the effective `core.hooksPath` git setting, or None if unset."""
+    try:
+        r = subprocess.run(
+            ["git", "config", "--get", "core.hooksPath"],
+            capture_output=True, text=True, timeout=5, cwd=repo_root,
+        )
+        if r.returncode != 0:
+            return None
+        return r.stdout.strip() or None
+    except Exception:
+        return None
+
+
+def detect_hookspath_hijack(repo_root: Path) -> str | None:
+    """Detect a `core.hooksPath` that redirects git away from `.git/hooks`.
+
+    deadpush installs its hooks into `.git/hooks`. Setting `core.hooksPath` to
+    anything else (a classic bypass is `git config core.hooksPath /dev/null`)
+    silently disables every deadpush hook without touching the hook files, so the
+    checksum/immutability checks below would still report "OK". This catches that.
+
+    Returns the offending value if the hooks dir is hijacked, else None.
+    """
+    val = _hookspath_value(repo_root)
+    if not val:
+        return None
+    default_hooks = repo_root / ".git" / "hooks"
+    try:
+        configured = Path(val)
+        if not configured.is_absolute():
+            configured = repo_root / configured
+        if configured.resolve() == default_hooks.resolve():
+            return None  # explicitly set to the real hooks dir — not a hijack
+    except Exception:
+        pass
+    return val
+
+
+def restore_hookspath(repo_root: Path) -> bool:
+    """Undo a `core.hooksPath` hijack so the `.git/hooks` deadpush hooks run again.
+
+    Removes any repo-local override first; if a global/system hijack still shadows
+    the default, pins the repo-local `core.hooksPath` back to the real hooks dir
+    (repo-local wins over global). Only touches repo-local config — never global.
+    """
+    changed = False
+    try:
+        subprocess.run(
+            ["git", "config", "--local", "--unset-all", "core.hooksPath"],
+            capture_output=True, text=True, timeout=5, cwd=repo_root,
+        )
+        changed = True
+    except Exception:
+        pass
+    # A global/system hijack survives the local unset; override it locally.
+    if detect_hookspath_hijack(repo_root):
+        try:
+            default_hooks = (repo_root / ".git" / "hooks").resolve()
+            subprocess.run(
+                ["git", "config", "--local", "core.hooksPath", str(default_hooks)],
+                capture_output=True, text=True, timeout=5, cwd=repo_root,
+            )
+            changed = True
+        except Exception:
+            pass
+    return changed and detect_hookspath_hijack(repo_root) is None
+
+
 def verify_hooks_installed(repo_root: Path) -> list[str]:
     """Return hook names that are missing, checksum-mismatched, or not immutable."""
     problems: list[str] = []
+    hijack = detect_hookspath_hijack(repo_root)
+    if hijack:
+        problems.append(f"core.hooksPath (hijacked -> {hijack})")
     hooks_dir = repo_root / ".git" / "hooks"
     for name in ("pre-push", "pre-commit", "post-commit"):
         hook_path = hooks_dir / name
@@ -537,8 +741,13 @@ def verify_hooks_installed(repo_root: Path) -> list[str]:
     return problems
 
 
-def uninstall_deadpush_hooks(repo_root: Path) -> list[str]:
-    """Remove deadpush-installed hooks (checksum-verified). Returns removed hook names."""
+def uninstall_deadpush_hooks(repo_root: Path, *, system: bool = False) -> list[str]:
+    """Remove deadpush-installed hooks (checksum-verified). Returns removed hook names.
+
+    ``system=True`` clears root-immutable (schg) locks via sudo. Even when called
+    without it, a lingering schg lock triggers a sudo escalation retry so hardened
+    hooks can still be removed rather than silently blocking uninstall.
+    """
     removed: list[str] = []
     hooks_dir = repo_root / ".git" / "hooks"
     checksums_dir = repo_root / ".deadpush" / "hooks"
@@ -557,8 +766,20 @@ def uninstall_deadpush_hooks(repo_root: Path) -> list[str]:
                 continue
         elif "deadpush" not in hook_path.read_text(encoding="utf-8", errors="ignore"):
             continue
-        _make_mutable(hook_path)
-        hook_path.unlink(missing_ok=True)
+        _make_mutable(hook_path, system=system)
+        try:
+            hook_path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            # Still locked — likely root-immutable (schg). Escalate to sudo and retry.
+            _make_mutable(hook_path, system=True)
+            try:
+                hook_path.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                continue  # sudo unavailable; leave the hook rather than crash
         checksum_file.unlink(missing_ok=True)
         cmd_shim = hooks_dir / f"{name}.cmd"
         cmd_shim.unlink(missing_ok=True)
@@ -574,6 +795,9 @@ def repair_deadpush_hooks(repo_root: Path) -> list[str]:
     if not problems:
         return []
     repaired: list[str] = []
+    # A hijacked core.hooksPath disables every hook, so undo it first.
+    if any(p.startswith("core.hooksPath") for p in problems) and restore_hookspath(repo_root):
+        repaired.append("core.hooksPath")
     for name in ("pre-push", "pre-commit", "post-commit"):
         if not any(p.startswith(name) for p in problems):
             continue

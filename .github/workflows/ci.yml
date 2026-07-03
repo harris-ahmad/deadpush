@@ -10,13 +10,46 @@ env:
   PYTHONUTF8: "1"
 
 jobs:
-  test:
+  lint:
     runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Verify lockfile is in sync
+        run: uv lock --check
+
+      - name: Install dependencies
+        run: uv sync --extra dev --frozen
+
+      - name: Lint with ruff (blocking)
+        run: uv run ruff check deadpush/ tests/ scripts/
+
+  test:
+    # Unit + integration suite. Runs on Linux across supported Python versions
+    # and on macOS (the primary hardened-mode target). The integration test in
+    # tests/test_integration_lifecycle.py drives the installed CLI and executes
+    # the real generated git hooks — the closest deterministic proxy to a user's
+    # first run, without the flakiness of a background daemon in CI.
+    needs: [lint]
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.11", "3.12", "3.13"]
-
+        include:
+          - os: ubuntu-latest
+            python-version: "3.11"
+          - os: ubuntu-latest
+            python-version: "3.12"
+          - os: ubuntu-latest
+            python-version: "3.13"
+          - os: macos-latest
+            python-version: "3.12"
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
@@ -27,10 +60,7 @@ jobs:
           enable-cache: true
 
       - name: Install dependencies
-        run: uv sync --extra dev
-
-      - name: Lint with ruff (non-blocking)
-        run: uv run ruff check deadpush/ tests/ || true
+        run: uv sync --extra dev --frozen
 
       - name: Run tests
-        run: uv run pytest
+        run: uv run pytest -v

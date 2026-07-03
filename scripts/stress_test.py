@@ -7,7 +7,6 @@ to verify rate limiting, safety scoring, and quarantine under load.
 """
 
 import argparse
-import os
 import random
 import subprocess
 import sys
@@ -63,7 +62,7 @@ def hot_function():
             run_cmd(["git", "add", "hot_file.py"], cwd=repo)
             run_cmd(["git", "commit", "-m", f"Stress write from {threading.current_thread().ident}"], cwd=repo)
             writes += 1
-        except Exception as e:
+        except Exception:
             errors += 1
 
         time.sleep(0.01)  # Very fast writes
@@ -109,7 +108,7 @@ def run_stress_test(num_writers, duration):
         # Get safety score
         ret, out, _ = run_cmd(["deadpush", "mcp", "--danger"], cwd=repo, capture=False)
 
-        print(f"\n=== STRESS TEST RESULTS ===")
+        print("\n=== STRESS TEST RESULTS ===")
         print(f"Duration: {duration_actual:.1f}s")
         print(f"Writers: {num_writers}")
         print(f"Total time: {time.time() - start:.1f}s")

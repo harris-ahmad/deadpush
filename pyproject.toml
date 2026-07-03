@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "deadpush"
-version = "0.2.1"
+dynamic = ["version"]
 description = "Guardrails for the vibe coding era — real-time AI agent guardian with MCP write interception, git hooks, and quarantine"
 readme = "README.md"
 license = {text = "MIT"}
@@ -41,6 +41,11 @@ Source = "https://github.com/harris-ahmad/deadpush"
 "Bug Tracker" = "https://github.com/harris-ahmad/deadpush/issues"
 Documentation = "https://github.com/harris-ahmad/deadpush#readme"
 
+[tool.hatch.version]
+# Single source of truth: deadpush/__init__.py __version__.
+# pyproject metadata and `deadpush.__version__` can never drift.
+path = "deadpush/__init__.py"
+
 [tool.hatch.build.targets.wheel]
 packages = ["deadpush"]
 
@@ -53,3 +58,19 @@ addopts = "--tb=short -q"
 filterwarnings = [
     "ignore::pytest.PytestCollectionWarning",
 ]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "W"]
+ignore = [
+    "E501",  # line length is enforced softly, not as a hard gate
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests and one-off scripts often bind intermediate results for readability;
+# unused locals there are intentional and not a correctness signal.
+"tests/*" = ["F841", "E741"]
+"scripts/*" = ["F841"]

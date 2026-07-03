@@ -5,7 +5,6 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -13,15 +12,9 @@ from deadpush.deps_guard import (
     _levenshtein,
     _check_typosquat,
     _check_suspicious_name,
-    KNOWN_PACKAGES,
     check_deps,
     get_ecosystem,
     parse_deps,
-    _extract_toml_deps,
-    _extract_requirements_txt,
-    _extract_package_json,
-    _extract_cargo_toml,
-    _extract_go_mod,
 )
 from deadpush.intercept import _check_dependency_integrity, Violation
 from deadpush.rules import RuntimeConfig

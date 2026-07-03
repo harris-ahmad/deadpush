@@ -630,7 +630,6 @@ class McpServer:
     def _tool_get_safety_score(self, args: dict[str, Any]) -> dict[str, Any]:
         from .guard import _scoped_safety_score_file, _state_dir
 
-        hardened = (self.repo_root / ".guardian" / "guardian.control.port").exists()
         candidates = [
             _scoped_safety_score_file(self.repo_root, hardened=False),
             _scoped_safety_score_file(self.repo_root, hardened=True),

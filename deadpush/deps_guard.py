@@ -343,7 +343,7 @@ def parse_deps(source: str, rel_path: str) -> list[tuple[str, int]]:
 
 def check_deps(source: str, rel_path: str, old_source: str = "") -> list[dict[str, Any]]:
     """Check a dependency file for typosquats and suspicious additions.
-    
+
     Returns a list of violation dicts with keys:
       - category: "dependency"
       - description: human-readable explanation

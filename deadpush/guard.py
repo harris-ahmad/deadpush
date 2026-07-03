@@ -49,6 +49,32 @@ from urllib.parse import urlparse, parse_qs
 
 
 _HARDENED_STATE_DIR = Path("/var/db/deadpush")
+_HARDENED_VENV_DIR = _HARDENED_STATE_DIR / "venv"
+
+
+def _hardened_python() -> Path:
+    return _HARDENED_VENV_DIR / "bin" / "python"
+
+
+def _deadpush_source_root() -> Path:
+    return Path(__file__).resolve().parent.parent
+
+
+def _find_bootstrap_python() -> str:
+    """Python interpreter for creating the hardened venv (must be system-wide)."""
+    import shutil
+    for candidate in (
+        "/opt/homebrew/bin/python3",
+        "/usr/local/bin/python3",
+        "/usr/bin/python3",
+    ):
+        if Path(candidate).exists():
+            return candidate
+    found = shutil.which("python3")
+    if found:
+        return found
+    import sys
+    return sys.executable
 
 
 def _state_dir(hardened: bool = False) -> Path:
@@ -110,7 +136,7 @@ def _is_hardened(hardened: bool = False) -> bool:
 # =============================================================================
 # Logging
 # =============================================================================
-from logging.handlers import RotatingFileHandler
+from logging.handlers import RotatingFileHandler  # noqa: E402  (kept beside the logging helpers)
 
 def setup_logging(
     log_file: Optional[Path] = None,
@@ -246,7 +272,6 @@ class DaemonManager:
             return False
 
         # Verify process start time matches our recorded start time
-        # to prevent false positive from PID reuse
         if not self.startfile.exists():
             # No start time recorded (old PID file) - conservative: assume running
             return True
@@ -272,9 +297,7 @@ class DaemonManager:
                     except ValueError:
                         # macOS format: [[DD-]hh:]mm:ss
                         parts = out.split("-")
-                        days = 0
                         if len(parts) == 2:
-                            days = int(parts[0])
                             out = parts[1]
                         tparts = list(map(int, out.split(":")))
                         if len(tparts) == 3:
@@ -550,9 +573,12 @@ class SessionSafetyScore:
         return self.score
 
     def get_status(self) -> str:
-        if self.score >= 90: return "🟢 Excellent"
-        if self.score >= 70: return "🟡 Good"
-        if self.score >= 50: return "🟠 Caution"
+        if self.score >= 90:
+            return "🟢 Excellent"
+        if self.score >= 70:
+            return "🟡 Good"
+        if self.score >= 50:
+            return "🟠 Caution"
         return "🔴 At Risk"
 
     def get_activity_level(self) -> str:
@@ -936,7 +962,6 @@ class GuardianControlHandler(BaseHTTPRequestHandler):
                 pattern = params.get("pattern", "")
                 description = params.get("description", "")
                 if pattern:
-                    import re
                     rc.add_allowed_pattern(pattern, description)
                 self._redirect("/dashboard/allowlist")
                 return
@@ -1170,7 +1195,12 @@ class GuardianHandler(FileSystemEventHandler or object):
         if self.shadow_process is not None and self._shadow_alive():
             return
         pidfile = _scoped_pidfile(self.config.repo_root, self.hardened)
-        respawn_cmd = [sys.executable, "-m", "deadpush.cli", "guard", "--daemon"]
+        # Use the deadpush_bootstrap entrypoint (installed as a top-level module)
+        # rather than "-m deadpush.cli": in editable installs the deadpush package
+        # may be reachable only via a .pth that macOS marks hidden (and Python 3.12+
+        # then skips), so "-m deadpush.cli" fails from a non-source cwd. The bootstrap
+        # repairs sys.path first. For normal pip installs this is equivalent.
+        respawn_cmd = [sys.executable, "-m", "deadpush_bootstrap", "guard", "--daemon"]
         if self.hardened:
             respawn_cmd.append("--hardened")
         proc = start_shadow_process(os.getpid(), pidfile, respawn_cmd, self.config.repo_root)
@@ -1745,7 +1775,7 @@ def start_shadow_process(guardian_pid: int, pidfile: Path, respawn_cmd: list[str
             start_new_session=True,
         )
         return proc
-    except Exception as e:
+    except Exception:
         return None
 
 
@@ -1777,13 +1807,9 @@ def run_guardian(intervention: bool = True, daemon: bool = False, strict: bool =
         logger.error("Could not acquire lock. Another instance may be running.")
         return
 
-    # Start shadow process (re-spawns guardian if it crashes)
-    # Not needed in hardened mode — launchd handles restart via KeepAlive
-    shadow_proc = None
-    if not hardened:
-        # We'll create handler after fork, but start shadow here since it runs
-        # in a new session and is immune to fork issues
-        pass  # Shadow will be started post-fork in the child
+    # Shadow process (re-spawns guardian if it crashes) is started post-fork in
+    # the child so it runs in a new session, immune to fork issues.
+    # Not needed in hardened mode — launchd handles restart via KeepAlive.
 
     # Create the Local Control Interface object (don't start it yet)
     # We'll create the handler and control_server after fork to avoid
@@ -2006,7 +2032,43 @@ def _run_observer(handler: GuardianHandler, logger, daemon_mgr: DaemonManager | 
 # Basic Auto-Start Support (systemd user / launchd)
 # Called / documented from protect for "survive reboots with minimal intervention"
 # =============================================================================
-def setup_autostart(repo_root: Path, hardened: bool = False) -> str:
+def _is_system_path(path: Path) -> bool:
+    s = str(path)
+    return s.startswith("/Library/") or s.startswith("/etc/")
+
+
+def _write_privileged_file(path: Path, content: str, sudo_fn=None) -> None:
+    """Write a config file that may require root (LaunchDaemons, systemd system units)."""
+    import os
+    import subprocess
+    import tempfile
+
+    if not _is_system_path(path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
+        return
+
+    def _sudo(cmd, check=True, timeout=60):
+        if sudo_fn is not None:
+            return sudo_fn(cmd, check=check, timeout=timeout)
+        full = ["sudo"] + cmd
+        r = subprocess.run(full, capture_output=True, text=True, timeout=timeout)
+        if check and r.returncode != 0:
+            raise RuntimeError(f"{' '.join(full)} failed: {r.stderr.strip()}")
+        return r
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=path.suffix, delete=False) as f:
+        f.write(content)
+        tmp = f.name
+    try:
+        _sudo(["mkdir", "-p", str(path.parent)])
+        _sudo(["cp", tmp, str(path)])
+        _sudo(["chmod", "644", str(path)], check=False)
+    finally:
+        os.unlink(tmp)
+
+
+def setup_autostart(repo_root: Path, hardened: bool = False, _sudo=None) -> str:
     """Generate OS-specific auto-start configuration for the guardian daemon.
 
     This helps fulfill "survive across sessions/reboots with minimal user intervention".
@@ -2021,14 +2083,16 @@ def setup_autostart(repo_root: Path, hardened: bool = False) -> str:
     """
     import sys as _sys
     home = Path.home()
-    exe = _sys.executable
+    if hardened:
+        exe = str(_hardened_python())
+    else:
+        exe = _sys.executable
     rid = _repo_id(str(repo_root))
 
     if _sys.platform.startswith("linux"):
         unit_path = _scoped_systemd_unit_path(repo_root, hardened)
-        unit_dir = unit_path.parent
-        unit_dir.mkdir(parents=True, exist_ok=True)
-        user_part = "" if hardened else "--user"
+        if not _is_system_path(unit_path):
+            unit_path.parent.mkdir(parents=True, exist_ok=True)
         env_line = f'Environment="PATH=/usr/local/bin:/usr/bin:/bin:{home}/.local/bin"'
         wanted_by = "multi-user.target" if hardened else "default.target"
         content = f"""[Unit]
@@ -2037,7 +2101,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart={exe} -m deadpush.cli guard --daemon{' --hardened' if hardened else ''}
+ExecStart={exe} -m deadpush_bootstrap guard --daemon{' --hardened' if hardened else ''}
 Restart=always
 RestartSec=5
 WorkingDirectory={repo_root}
@@ -2048,7 +2112,7 @@ Nice=10
 [Install]
 WantedBy={wanted_by}
 """
-        unit_path.write_text(content)
+        _write_privileged_file(unit_path, content, _sudo)
         return f"""Linux{' systemd system' if hardened else ' systemd --user'} unit written:
   {unit_path}
 
@@ -2066,14 +2130,20 @@ Useful commands:
         plist_label = _scoped_plist_label(repo_root)
         plist_path = _scoped_plist_path(repo_root, hardened)
         log_dir = _state_dir(hardened)
-        log_dir.mkdir(parents=True, exist_ok=True)
+        if not hardened:
+            log_dir.mkdir(parents=True, exist_ok=True)
         hardened_args = ""
         user_name = ""
         if hardened:
             hardened_args = "\n        <string>--hardened</string>"
-            user_name = """    <key>UserName</key>
+            user_name = """
+    <key>UserName</key>
     <string>_deadpush</string>
-"""
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/var/db/deadpush/venv/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>"""
         content = f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -2084,7 +2154,7 @@ Useful commands:
     <array>
         <string>{exe}</string>
         <string>-m</string>
-        <string>deadpush.cli</string>
+        <string>deadpush_bootstrap</string>
         <string>guard</string>
         <string>--daemon</string>{hardened_args}
     </array>
@@ -2110,15 +2180,15 @@ Useful commands:
 </dict>
 </plist>
 """
-        plist_path.write_text(content)
+        _write_privileged_file(plist_path, content, _sudo)
         return f"""macOS{' LaunchDaemon' if hardened else ' LaunchAgent'} plist written:
   {plist_path}
 
 To load (start now + on{' boot' if hardened else ' login/reboot'}):
-  {'sudo launchctl load -w' if hardened else 'launchctl load'} {plist_path}
+  {'sudo launchctl bootstrap system' if hardened else 'launchctl load'} {plist_path}
 
 To unload / stop:
-  {'sudo launchctl unload -w' if hardened else 'launchctl unload'} {plist_path}
+  {'sudo launchctl bootout system ' + plist_label if hardened else 'launchctl unload ' + str(plist_path)}
 
 Logs: tail -f {log_dir}/guardian.{rid}.launchd.*.log
 (Also file logs at {log_dir}/guardian.log )
@@ -2128,49 +2198,298 @@ Logs: tail -f {log_dir}/guardian.{rid}.launchd.*.log
         return f"""Auto-start unit generation not supported on this platform ({_sys.platform}).
 You can still achieve "survive reboot" by:
   - Adding `deadpush guard --daemon` to your shell's startup (~/.bashrc, ~/.zshrc, etc) with nohup or similar, or
-  - Using your distro's service manager manually pointing at: {exe} -m deadpush.cli guard --daemon
+  - Using your distro's service manager manually pointing at: {exe} -m deadpush_bootstrap guard --daemon
   - Or cron with @reboot (advanced).
 See `deadpush guard --daemon` for the core persistent mode.
 """
 
 
+def _launchctl_bootstrap_system(plist_path: Path, label: str, _sudo, repo_root: Path | None = None) -> None:
+    """Load a system LaunchDaemon (bootstrap on modern macOS, load as fallback)."""
+    import time
+
+    plist_s = str(plist_path)
+    expected_py = str(_hardened_python())
+
+    # Preflight: hardened venv must be importable as _deadpush
+    _sudo(["-u", "_deadpush", expected_py, "-c", "import deadpush.cli"], check=True)
+
+    # Fully unload stale job (plist edits do not apply until bootout + bootstrap)
+    _sudo(["launchctl", "bootout", f"system/{label}"], check=False)
+    _sudo(["launchctl", "bootout", "system", plist_s], check=False)
+    _sudo(["launchctl", "unload", "-w", plist_s], check=False)
+    time.sleep(1)
+
+    r = _sudo(["launchctl", "bootstrap", "system", plist_s], check=False)
+    if r.returncode != 0:
+        err = (r.stderr or r.stdout or "").lower()
+        if "already" not in err and "loaded" not in err:
+            _sudo(["launchctl", "load", "-w", plist_s])
+
+    _sudo(["launchctl", "enable", f"system/{label}"], check=False)
+    _sudo(["launchctl", "kickstart", "-k", f"system/{label}"], check=False)
+    time.sleep(2)
+
+    status = _sudo(["launchctl", "print", f"system/{label}"], check=False)
+    out = (status.stdout or "") + (status.stderr or "")
+    if "state = running" in out and expected_py in out:
+        return
+
+    rid = _repo_id(str(repo_root)) if repo_root else "unknown"
+    err_log = _HARDENED_STATE_DIR / f"guardian.{rid}.launchd.err.log"
+    log_tail = _sudo(["tail", "-30", str(err_log)], check=False).stdout or ""
+    raise RuntimeError(
+        "LaunchDaemon did not enter running state after bootstrap.\n"
+        f"Expected interpreter: {expected_py}\n"
+        f"launchctl print:\n{out.strip()}\n"
+        f"stderr log ({err_log}):\n{log_tail.strip() or '(empty)'}"
+    )
+
+
+def guardian_is_running(repo_root: Path, hardened: bool = False) -> bool:
+    """Return True if the guardian daemon is running for this repo."""
+    pidfile = _scoped_pidfile(repo_root, hardened)
+    lockfile = _scoped_lockfile(repo_root, hardened)
+
+    if not hardened:
+        return DaemonManager(pidfile, lockfile).is_running()
+
+    shared_port = repo_root / ".guardian" / "guardian.control.port"
+    if shared_port.exists():
+        try:
+            import socket
+            port = int(shared_port.read_text().strip())
+            with socket.create_connection(("127.0.0.1", port), timeout=0.5):
+                return True
+        except Exception:
+            pass
+
+    label = _scoped_plist_label(repo_root)
+    try:
+        r = subprocess.run(
+            ["sudo", "launchctl", "print", f"system/{label}"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if r.returncode == 0 and "state = running" in r.stdout:
+            return True
+    except Exception:
+        pass
+
+    try:
+        r = subprocess.run(
+            ["sudo", "cat", str(pidfile)],
+            capture_output=True, text=True, timeout=10,
+        )
+        if r.returncode == 0:
+            pid = int(r.stdout.strip())
+            os.kill(pid, 0)
+            return True
+    except Exception:
+        pass
+    return False
+
+
 # =============================================================================
 # Hardened environment setup (privilege separation)
 # =============================================================================
-def _apply_hardened_repo_acls(repo_root: Path) -> None:
+def _apply_hardened_traverse_acls(repo_root: Path, _sudo) -> None:
+    """Grant _deadpush traverse access to parent dirs (e.g. ~/Documents mode 700)."""
+    repo_root = repo_root.resolve()
+    home = Path.home().resolve()
+    _SYSTEM_SKIP = {Path("/"), Path("/Users")}
+
+    if sys.platform == "darwin":
+        traverse = "_deadpush allow list,search,readattr,readextattr,readsecurity"
+        cur = repo_root.parent
+        while cur != cur.parent:
+            if cur in _SYSTEM_SKIP:
+                break
+            try:
+                under_home = cur.is_relative_to(home)
+            except AttributeError:
+                under_home = str(cur).startswith(str(home) + os.sep) or cur == home
+            if not under_home:
+                break
+            if cur.exists():
+                _sudo(["chmod", "+a", traverse, str(cur)])
+            cur = cur.parent
+    elif sys.platform.startswith("linux"):
+        cur = repo_root.parent
+        while cur != cur.parent:
+            if cur == Path("/"):
+                break
+            try:
+                under_home = cur.is_relative_to(home)
+            except AttributeError:
+                under_home = str(cur).startswith(str(home) + os.sep) or cur == home
+            if not under_home:
+                break
+            if cur.exists():
+                _sudo(["setfacl", "-m", "u:_deadpush:--x", str(cur)], check=False)
+            cur = cur.parent
+
+
+def _apply_hardened_repo_acls(repo_root: Path, _sudo=None) -> None:
     """Grant _deadpush read + intervention ACLs on the protected repo tree."""
     import subprocess as _sp
+
+    def run(cmd, **kwargs):
+        if _sudo is not None:
+            return _sudo(cmd, **kwargs)
+        return _sp.run(["sudo"] + cmd, capture_output=True, text=True, timeout=30, **kwargs)
 
     repo_root = repo_root.resolve()
     quarantine_dir = repo_root / ".deadpush-quarantine"
     quarantine_dir.mkdir(parents=True, exist_ok=True)
 
     if sys.platform == "darwin":
-        # Read + quarantine/restore: write and delete_child on the repo tree.
         intervention = (
             "_deadpush allow list,readattr,readsecurity,search,read,readextattr,"
             "write,append,add_file,add_subdirectory,delete,delete_child,"
             "file_inherit,directory_inherit"
         )
-        _sp.run(
-            ["sudo", "chmod", "+a", intervention, str(repo_root)],
-            capture_output=True, text=True, timeout=30, check=False,
-        )
+        run(["chmod", "+a", intervention, str(repo_root)])
         guardian_dir = repo_root / ".guardian"
         guardian_dir.mkdir(parents=True, exist_ok=True)
-        _sp.run(
-            ["sudo", "chmod", "+a",
+        run(
+            ["chmod", "+a",
              "_deadpush allow write,append,add_file,add_subdirectory,delete_child,file_inherit,directory_inherit",
              str(guardian_dir)],
-            capture_output=True, text=True, timeout=15, check=False,
+            timeout=15,
         )
     elif sys.platform.startswith("linux"):
-        _sp.run(["sudo", "setfacl", "-R", "-m", "u:_deadpush:rwx", str(repo_root)],
-                capture_output=True, timeout=30, check=False)
+        run(["setfacl", "-R", "-m", "u:_deadpush:rwx", str(repo_root)])
         guardian_dir = repo_root / ".guardian"
         guardian_dir.mkdir(parents=True, exist_ok=True)
-        _sp.run(["sudo", "setfacl", "-R", "-m", "u:_deadpush:rwx", str(guardian_dir)],
-                capture_output=True, timeout=15, check=False)
+        run(["setfacl", "-R", "-m", "u:_deadpush:rwx", str(guardian_dir)], timeout=15)
+
+
+def _deadpush_account_valid() -> bool:
+    """Return True if _deadpush resolves in the passwd database."""
+    import pwd
+    try:
+        pwd.getpwnam("_deadpush")
+        return True
+    except KeyError:
+        return False
+
+
+def _find_free_system_id(kind: str, start: int = 400, end: int = 499) -> str:
+    """Find an unused UID/GID in a safe system range (macOS dscl)."""
+    import subprocess
+
+    r = subprocess.run(
+        ["dscl", ".", "-list", f"/{kind}", "UniqueID" if kind == "Users" else "PrimaryGroupID"],
+        capture_output=True, text=True, timeout=30,
+    )
+    used: set[int] = set()
+    if r.returncode == 0:
+        for line in r.stdout.splitlines():
+            parts = line.split()
+            if len(parts) >= 2:
+                try:
+                    used.add(int(parts[-1]))
+                except ValueError:
+                    pass
+    for candidate in range(start, end):
+        if candidate not in used:
+            return str(candidate)
+    raise RuntimeError(f"No free {'UID' if kind == 'Users' else 'GID'} in range {start}-{end - 1}")
+
+
+def _ensure_deadpush_account(_sudo, lines: list[str]) -> None:
+    """Create or repair the _deadpush system user used by hardened mode."""
+    import grp
+    import subprocess
+    import sys as _sys
+
+    if _deadpush_account_valid():
+        lines.append("User _deadpush already exists")
+        return
+
+    if _sys.platform == "darwin":
+        # Remove broken dscl records (exist in Directory Service but not in passwd).
+        if subprocess.run(
+            ["dscl", ".", "-read", "/Users/_deadpush"],
+            capture_output=True, timeout=10,
+        ).returncode == 0:
+            _sudo(["dscl", ".", "-delete", "/Users/_deadpush"], check=False)
+            lines.append("Removed broken _deadpush user record")
+
+        try:
+            grp.getgrnam("_deadpush")
+        except KeyError:
+            if subprocess.run(
+                ["dscl", ".", "-read", "/Groups/_deadpush"],
+                capture_output=True, timeout=10,
+            ).returncode == 0:
+                _sudo(["dscl", ".", "-delete", "/Groups/_deadpush"], check=False)
+                lines.append("Removed broken _deadpush group record")
+            gid = _find_free_system_id("Groups")
+            _sudo(["dscl", ".", "-create", "/Groups/_deadpush"])
+            _sudo(["dscl", ".", "-create", "/Groups/_deadpush", "PrimaryGroupID", gid])
+            _sudo(["dscl", ".", "-create", "/Groups/_deadpush", "RealName", "deadpush Guardian"])
+            lines.append(f"Created _deadpush group (GID {gid})")
+        else:
+            lines.append("Group _deadpush already exists")
+
+        gid = str(grp.getgrnam("_deadpush").gr_gid)
+        uid = _find_free_system_id("Users")
+        _sudo(["dscl", ".", "-create", "/Users/_deadpush"])
+        _sudo(["dscl", ".", "-create", "/Users/_deadpush", "UserShell", "/usr/bin/false"])
+        _sudo(["dscl", ".", "-create", "/Users/_deadpush", "NFSHomeDirectory", "/var/empty"])
+        _sudo(["dscl", ".", "-create", "/Users/_deadpush", "UniqueID", uid])
+        _sudo(["dscl", ".", "-create", "/Users/_deadpush", "PrimaryGroupID", gid])
+        _sudo(["dscl", ".", "-create", "/Users/_deadpush", "RealName", "deadpush Guardian"])
+        _sudo(["dscl", ".", "-passwd", "/Users/_deadpush", "*"], check=False)
+        _sudo(["dscl", ".", "-append", "/Groups/_deadpush", "GroupMembership", "_deadpush"], check=False)
+        lines.append(f"Created _deadpush user (UID {uid}, GID {gid})")
+    else:
+        try:
+            grp.getgrnam("_deadpush")
+            lines.append("Group _deadpush already exists")
+        except KeyError:
+            _sudo(["groupadd", "--system", "_deadpush"])
+            lines.append("Created _deadpush system group")
+        _sudo([
+            "useradd", "--system", "--no-create-home",
+            "--shell", "/usr/sbin/nologin",
+            "--home-dir", "/var/empty",
+            "--gid", "_deadpush",
+            "_deadpush",
+        ])
+        lines.append("Created _deadpush system user")
+
+    if not _deadpush_account_valid():
+        raise RuntimeError(
+            "_deadpush account setup failed — user not visible to the system. "
+            "Try: sudo dscl . -delete /Users/_deadpush && deadpush protect --daemon"
+        )
+
+
+def _ensure_hardened_venv(_sudo, lines: list[str]) -> None:
+    """Install deadpush into a dedicated venv owned by _deadpush (not the dev venv)."""
+
+    venv = _HARDENED_VENV_DIR
+    py = venv / "bin" / "python"
+    if not py.exists():
+        bootstrap_py = _find_bootstrap_python()
+        _sudo([bootstrap_py, "-m", "venv", str(venv)])
+        lines.append(f"Created hardened venv at {venv}")
+    else:
+        lines.append(f"Hardened venv already exists at {venv}")
+
+    _sudo(["chown", "-R", "_deadpush:_deadpush", str(venv)])
+
+    source = _deadpush_source_root()
+    if not (source / "pyproject.toml").exists():
+        raise RuntimeError(f"deadpush source not found at {source}")
+
+    pip = str(venv / "bin" / "pip")
+    _sudo([pip, "install", "--upgrade", "pip"], check=False)
+    _sudo([pip, "install", str(source)])
+    _sudo(["chown", "-R", "_deadpush:_deadpush", str(venv)])
+    lines.append(f"Installed deadpush into hardened venv from {source}")
 
 
 def setup_hardened_environment(repo_root: Path, auto_load: bool = True) -> str:
@@ -2182,9 +2501,6 @@ def setup_hardened_environment(repo_root: Path, auto_load: bool = True) -> str:
 
     Returns a multi-line summary of what was done.
     """
-    import os
-    import pwd
-    import grp
     import subprocess
     import sys as _sys
 
@@ -2197,56 +2513,26 @@ def setup_hardened_environment(repo_root: Path, auto_load: bool = True) -> str:
             raise RuntimeError(f"{' '.join(full)} failed: {r.stderr.strip()}")
         return r
 
-    # 1. Create _deadpush group (dedicated, minimal privileges)
-    try:
-        grp.getgrnam("_deadpush")
-        lines.append("Group _deadpush already exists")
-    except KeyError:
-        if _sys.platform == "darwin":
-            _sudo(["dscl", ".", "-create", "/Groups/_deadpush", "PrimaryGroupID", "499"])
-            lines.append("Created _deadpush group (GID 499)")
-        else:
-            _sudo(["groupadd", "--system", "_deadpush"])
-            lines.append("Created _deadpush system group")
+    _ensure_deadpush_account(_sudo, lines)
 
-    # 2. Create _deadpush user (platform-specific)
-    try:
-        pwd.getpwnam("_deadpush")
-        lines.append("User _deadpush already exists")
-    except KeyError:
-        if _sys.platform == "darwin":
-            _sudo([
-                "dscl", ".", "-create", "/Users/_deadpush",
-                "UniqueID", "499",
-                "PrimaryGroupID", "499",  # Use _deadpush group, not wheel
-                "NFSHomeDirectory", "/var/empty",
-                "UserShell", "/usr/bin/false",
-                "RealName", "deadpush Guardian",
-            ])
-            lines.append("Created _deadpush user (UID 499, system account)")
-        else:
-            _sudo([
-                "useradd", "--system", "--no-create-home",
-                "--shell", "/usr/sbin/nologin",
-                "--home-dir", "/var/empty",
-                "--gid", "_deadpush",
-                "_deadpush",
-            ])
-            lines.append("Created _deadpush system user")
-
-    # 3. Create state directory
+    # Create state directory
     state = _HARDENED_STATE_DIR
     _sudo(["mkdir", "-p", str(state)])
     _sudo(["chown", "_deadpush:_deadpush", str(state)])
     _sudo(["chmod", "0700", str(state)])
     lines.append(f"Created state dir {state}")
 
-    # 4. Intervention ACLs on repo (quarantine, restore, feedback)
-    _apply_hardened_repo_acls(repo_root)
+    _ensure_hardened_venv(_sudo, lines)
+
+    _apply_hardened_traverse_acls(repo_root, _sudo)
+    lines.append(f"Granted _deadpush traverse ACLs to {repo_root}")
+
+    # Intervention ACLs on repo (quarantine, restore, feedback)
+    _apply_hardened_repo_acls(repo_root, _sudo)
     lines.append(f"Granted _deadpush intervention ACLs on {repo_root}")
 
     # 5. Write plist / systemd unit in hardened mode
-    autostart_info = setup_autostart(repo_root, hardened=True)
+    autostart_info = setup_autostart(repo_root, hardened=True, _sudo=_sudo)
     _ = autostart_info  # we already wrote the unit, just use it
     lines.append("Generated daemon configuration")
 
@@ -2254,7 +2540,8 @@ def setup_hardened_environment(repo_root: Path, auto_load: bool = True) -> str:
     if auto_load:
         if _sys.platform == "darwin":
             plist_path = _scoped_plist_path(repo_root, hardened=True)
-            _sudo(["launchctl", "load", "-w", str(plist_path)])
+            label = _scoped_plist_label(repo_root)
+            _launchctl_bootstrap_system(plist_path, label, _sudo, repo_root)
             lines.append(f"Loaded launchd daemon: {plist_path}")
         elif _sys.platform.startswith("linux"):
             rid = _repo_id(str(repo_root))

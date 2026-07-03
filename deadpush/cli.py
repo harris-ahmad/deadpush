@@ -16,6 +16,26 @@ def _auto_merge_ignore_files(repo_root: Path, new_patterns: set[str]):
     merge_guardian_ignore_files(repo_root, new_patterns)
 
 
+def _wait_for_guardian(repo_root: Path, hardened: bool, attempts: int = 12, delay: float = 0.5) -> bool:
+    """Poll until the guardian reports running, or give up.
+
+    launchd/systemd (and the double-fork daemon path) start the guardian
+    asynchronously, so a single immediate check races the daemon's startup.
+    """
+    import time
+
+    from .guard import guardian_is_running
+
+    for _ in range(max(1, attempts)):
+        try:
+            if guardian_is_running(repo_root, hardened=hardened):
+                return True
+        except Exception:
+            pass
+        time.sleep(delay)
+    return False
+
+
 @click.group()
 @click.version_option(package_name="deadpush")
 def main():
@@ -94,7 +114,12 @@ def cmd_protect(enable, daemon, soft, hardened, allow_self_protect):
         use_hardened = True
     if soft and hardened:
         print_error("Cannot use --soft with --hardened")
-        return
+        raise SystemExit(2)
+
+    # Track failures that make protection incomplete. A production install must
+    # exit non-zero (and tell the user) rather than print a warning and pretend
+    # everything is fine.
+    critical_failures: list[str] = []
 
     # If hardened mode, do the one-time privilege separation setup first
     if use_hardened:
@@ -104,9 +129,11 @@ def cmd_protect(enable, daemon, soft, hardened, allow_self_protect):
             summary = setup_hardened_environment(config.repo_root, auto_load=start_background)
             print(summary)
         except Exception as e:
-            print_warning(f"Hardened environment setup failed: {e}")
-            print_warning("Try running with sudo directly, or check system logs.")
-            return
+            print_error(f"Hardened environment setup failed: {e}")
+            print_error("Try running with sudo directly, or check system logs.")
+            print_error("Nothing was protected. Re-run `deadpush protect` after fixing the above,")
+            print_error("or use `deadpush protect --soft` for a same-UID (dev-only) guardian.")
+            raise SystemExit(1)
     elif start_background:
         print_warning("Running in --soft mode: guardian uses your UID and can be killed by agents.")
 
@@ -116,19 +143,20 @@ def cmd_protect(enable, daemon, soft, hardened, allow_self_protect):
     print("\n[1/3] Installing git hooks (pre-push, pre-commit, post-commit)...")
     try:
         from .hooks import install_hook
-        install_hook(config.repo_root)
+        install_hook(config.repo_root, system=use_hardened)
     except Exception as e:
-        print_warning(f"Pre-push hook installation issue: {e}")
-        print_warning("  (Tip: ensure this is a git repo with .git/hooks/)")
+        print_error(f"Pre-push hook installation failed: {e}")
+        print_error("  (Tip: ensure this is a git repo with .git/hooks/)")
+        critical_failures.append("pre-push hook not installed")
     try:
         from .hooks import install_precommit_hook
-        install_precommit_hook(config.repo_root)
+        install_precommit_hook(config.repo_root, system=use_hardened)
         print("  Also installed pre-commit guardrail hook.")
     except Exception as e:
         print_warning(f"Pre-commit hook installation issue: {e}")
     try:
         from .hooks import install_postcommit_hook
-        install_postcommit_hook(config.repo_root)
+        install_postcommit_hook(config.repo_root, system=use_hardened)
         print("  Also installed post-commit guardrail hook (catches --no-verify bypass).")
     except Exception as e:
         print_warning(f"Post-commit hook installation issue: {e}")
@@ -138,10 +166,23 @@ def cmd_protect(enable, daemon, soft, hardened, allow_self_protect):
         if problems:
             print_warning(f"  Hook verification issues: {', '.join(problems)}")
             print_warning("  Re-run `deadpush protect` to repair hooks.")
+        elif use_hardened:
+            print_success("  All git guardrail hooks verified (root-immutable / schg — "
+                          "a same-UID agent cannot delete or modify them).")
         else:
             print_success("  All git guardrail hooks verified (checksums OK).")
     except Exception as e:
         print_warning(f"Hook verification skipped: {e}")
+
+    # Record that this repo is protected. The marker pins the interpreter and
+    # lets the installed hooks *fail closed* if deadpush later goes missing.
+    try:
+        from .config import write_install_marker
+        marker = write_install_marker(config.repo_root, hardened=use_hardened)
+        print(f"  Protection marker written ({marker.relative_to(config.repo_root)}).")
+    except Exception as e:
+        print_error(f"Could not write protection marker: {e}")
+        critical_failures.append("protection marker not written")
     try:
         from .hooks import setup_mcp_discovery
         setup_mcp_discovery(config.repo_root)
@@ -184,50 +225,72 @@ def cmd_protect(enable, daemon, soft, hardened, allow_self_protect):
             pass
 
         # Auto-start helpers for reboot survival (AGENT priority 2)
-        try:
-            from .guard import run_guardian, setup_autostart, _scoped_plist_path
-            autostart_info = setup_autostart(config.repo_root, hardened=use_hardened)
-            if autostart_info:
-                print("\n[Auto-start for reboots]")
-                print(autostart_info)
-        except Exception as e:
-            print_warning(f"Autostart helper generation skipped (non-fatal): {e}")
+        if not use_hardened:
+            try:
+                from .guard import run_guardian, setup_autostart, _scoped_plist_path
+                autostart_info = setup_autostart(config.repo_root, hardened=False)
+                if autostart_info:
+                    print("\n[Auto-start for reboots]")
+                    print(autostart_info)
+            except Exception as e:
+                print_warning(f"Autostart helper generation skipped (non-fatal): {e}")
 
         # In hardened mode, the daemon was already loaded by setup_hardened_environment().
         # In default mode, bootstrap the launchd plist so guardian runs under launchd.
         if not use_hardened:
+            from .guard import run_guardian, _scoped_plist_path
             plist_path = _scoped_plist_path(config.repo_root)
             _bootstrapped = False
-            if plist_path.exists():
+            if sys.platform == "darwin" and plist_path.exists():
                 try:
-                    import subprocess, os
+                    import subprocess
+                    import os
                     uid = os.getuid()
                     result = subprocess.run(
                         ["launchctl", "bootstrap", f"gui/{uid}", str(plist_path)],
                         capture_output=True, text=True, timeout=10,
                     )
-                    if result.returncode == 0:
+                    stderr = (result.stderr or "").strip()
+                    # returncode 0 == freshly loaded; 17/EALREADY == already loaded.
+                    # Any other non-zero code is a real failure we must surface.
+                    if result.returncode == 0 or result.returncode == 17 or "already" in stderr.lower():
                         _bootstrapped = True
                     else:
-                        _bootstrapped = True
-                except Exception:
-                    pass
+                        print_warning(
+                            f"  launchd bootstrap failed (code {result.returncode})"
+                            + (f": {stderr}" if stderr else "")
+                        )
+                except Exception as e:
+                    print_warning(f"  launchd bootstrap error: {e}")
 
-            # If bootstrap failed or on non-macOS, fall back to direct daemon launch
+            # If launchd didn't take (non-macOS, no plist, or bootstrap failure),
+            # fall back to launching the daemon directly.
             if not _bootstrapped:
-                print("  (launchd bootstrap unavailable — starting guardian directly)")
+                print("  (launchd unavailable — starting guardian directly)")
                 try:
-                    run_guardian(intervention=True, daemon=True, strict=False, hardened=use_hardened)
+                    run_guardian(intervention=True, daemon=True, strict=False, hardened=False)
                 except SystemExit:
+                    # Expected: the double-fork parent exits; the daemon child lives on.
                     pass
                 except Exception as e:
-                    print_warning(f"Daemon launch had issue (try `deadpush guard --daemon`): {e}")
-            else:
-                print_success("✅ Guardian launched under launchd (auto-restarts if killed).")
-        else:
-            print_success("✅ Guardian running as _deadpush under launchd.")
+                    print_warning(f"Direct daemon launch had issue: {e}")
 
-        print_success("✅ Protection setup + daemon launch complete!")
+            # Verify the guardian actually came up rather than assuming success.
+            if _wait_for_guardian(config.repo_root, hardened=False):
+                print_success("✅ Guardian is running (verified).")
+            else:
+                print_error("Guardian did not start after setup.")
+                print_error("  Diagnose: deadpush doctor")
+                print_error("  Retry:    deadpush guard --daemon")
+                critical_failures.append("guardian not running")
+        else:
+            if _wait_for_guardian(config.repo_root, hardened=True):
+                print_success("✅ Guardian running as _deadpush under launchd (verified).")
+            else:
+                print_error("Hardened setup finished but guardian is not running.")
+                print_error("  Re-run: deadpush protect --daemon")
+                print_error("  Logs:   sudo tail /var/db/deadpush/guardian.*.launchd.err.log")
+                critical_failures.append("guardian not running (hardened)")
 
         # Prominent MCP / Local Control instructions for AI agents (the key new feature in AGENT.md)
         print("\n=== For your AI coding agents (Claude, Cursor, Windsurf, etc.) ===")
@@ -250,6 +313,17 @@ def cmd_protect(enable, daemon, soft, hardened, allow_self_protect):
         print("For AI agents, also tell them to use:")
         print("    deadpush mcp")
         print("as their tool server (gives them guardrailed writes).")
+
+    # Final verdict — a production install must not report success if any
+    # critical step failed. Exit non-zero so scripts/CI and users can trust it.
+    print()
+    if critical_failures:
+        print_error("Protection is INCOMPLETE. Unresolved issues:")
+        for problem in critical_failures:
+            print_error(f"  - {problem}")
+        print_error("Run `deadpush doctor` for details, then re-run `deadpush protect`.")
+        raise SystemExit(1)
+    print_success("✅ Protection verified. Run `deadpush doctor` anytime to re-check.")
 
 
 @main.group("session")
@@ -370,24 +444,39 @@ def cmd_status(repo, hardened):
     This is the primary way to check on your always-on protector without reading logs manually.
     """
     from .config import load_config
-    from .guard import DaemonManager, _scoped_pidfile, _scoped_lockfile, _scoped_portfile, _scoped_log_file, _state_dir
+    from .guard import guardian_is_running, _scoped_pidfile, _scoped_portfile, _scoped_log_file
 
     config = load_config(explicit_root=Path(repo).resolve() if repo else None)
     repo_root = config.repo_root
-    pid_dir = _state_dir(hardened)
     pidfile = _scoped_pidfile(repo_root, hardened)
-    lockfile = _scoped_lockfile(repo_root, hardened)
-    dm = DaemonManager(pidfile, lockfile)
-    running = dm.is_running()
+    running = guardian_is_running(repo_root, hardened)
+    if not running and not hardened:
+        # Auto-detect hardened guardian when user omits --hardened
+        if guardian_is_running(repo_root, hardened=True):
+            hardened = True
+            pidfile = _scoped_pidfile(repo_root, hardened)
+            running = True
 
     print_header("deadpush Status", f"AI Agent Guardian - {repo_root.name}")
 
     if running:
         try:
-            pid = int(pidfile.read_text().strip())
-            print_success(f"🟢 Guardian is RUNNING (PID {pid})")
+            if pidfile.exists():
+                pid = int(pidfile.read_text().strip())
+            else:
+                import subprocess
+                r = subprocess.run(
+                    ["sudo", "cat", str(pidfile)],
+                    capture_output=True, text=True, timeout=10,
+                )
+                pid = int(r.stdout.strip()) if r.returncode == 0 else None
+            if pid:
+                mode = " (hardened)" if hardened else ""
+                print_success(f"🟢 Guardian is RUNNING{mode} (PID {pid})")
+            else:
+                print_success(f"🟢 Guardian is RUNNING{' (hardened)' if hardened else ''}")
         except Exception:
-            print_success("🟢 Guardian is RUNNING")
+            print_success(f"🟢 Guardian is RUNNING{' (hardened)' if hardened else ''}")
     else:
         print_warning(f"🔴 Guardian is NOT currently running for {repo_root.name}.")
         print("   Start it with the hands-off command:")
@@ -876,7 +965,7 @@ def cmd_stop(repo, hardened, force):
             for hook in hooks_dir.iterdir():
                 if hook.is_file() and not hook.name.endswith(".sample"):
                     _make_mutable(hook)
-            print(f"  Removed immutable flag from hooks")
+            print("  Removed immutable flag from hooks")
     except Exception:
         pass
 
@@ -908,17 +997,12 @@ def cmd_uninstall(hardened, force):
     from .config import load_config
     from .guard import (
         _scoped_pidfile, _scoped_lockfile, _scoped_portfile,
-        _scoped_plist_label, _scoped_plist_path, _state_dir,
-        _HARDENED_STATE_DIR
+        _scoped_plist_label, _scoped_plist_path, _state_dir
     )
     from .hooks import _make_mutable
     import subprocess
     import os
     import shutil
-
-    if hardened:
-        from .guard import _use_hardened
-        _use_hardened()
 
     config = load_config()
     repo_root = config.repo_root
@@ -929,7 +1013,6 @@ def cmd_uninstall(hardened, force):
     plist_label = _scoped_plist_label(repo_root)
     plist_path = _scoped_plist_path(repo_root, hardened)
     state_dir = _state_dir(hardened)
-    shared_port_file = repo_root / ".guardian" / "guardian.control.port"
 
     if not force:
         mode = "hardened" if hardened else "default"
@@ -1026,17 +1109,34 @@ def cmd_uninstall(hardened, force):
         subprocess.run(["sudo", "dscl", ".", "-delete", "/Users/_deadpush"], capture_output=True, timeout=10)
         subprocess.run(["sudo", "dscl", ".", "-delete", "/Groups/_deadpush"], capture_output=True, timeout=10)
         print("  Removed _deadpush user and group, cleared ACLs")
-    else:
-        # Remove immutable flags from hooks
-        try:
-            hooks_dir = config.repo_root / ".git" / "hooks"
-            if hooks_dir.exists():
-                for hook in hooks_dir.iterdir():
-                    if hook.is_file() and not hook.name.endswith(".sample"):
-                        _make_mutable(hook)
-                print("  Removed immutable flags from hooks")
-        except Exception:
-            pass
+
+    # Remove immutable flags from hooks. In hardened mode these are root-immutable
+    # (schg), so clearing requires sudo — pass system=hardened.
+    try:
+        hooks_dir = config.repo_root / ".git" / "hooks"
+        if hooks_dir.exists():
+            for hook in hooks_dir.iterdir():
+                if hook.is_file() and not hook.name.endswith(".sample"):
+                    _make_mutable(hook, system=hardened)
+            print("  Removed immutable flags from hooks")
+    except Exception:
+        pass
+
+    # Remove deadpush-installed git hooks so nothing lingers after uninstall.
+    try:
+        from .hooks import uninstall_deadpush_hooks
+        removed_hooks = uninstall_deadpush_hooks(repo_root, system=hardened)
+        if removed_hooks:
+            print(f"  Removed git hooks: {', '.join(removed_hooks)}")
+    except Exception as e:
+        print_warning(f"  Could not remove git hooks: {e}")
+
+    # Remove the protection marker so hooks no longer fail closed on this repo.
+    try:
+        from .config import remove_install_marker
+        remove_install_marker(repo_root)
+    except Exception:
+        pass
 
     # 6. Remove .guardian directory if empty
     print("[6/6] Cleaning up...")
@@ -1074,27 +1174,21 @@ def cmd_doctor(repo, hardened):
     """
     from .config import load_config
     from .guard import (
-        _scoped_pidfile, _scoped_lockfile, _scoped_portfile,
-        _scoped_plist_label, _scoped_plist_path, _scoped_safety_score_file,
+        _scoped_pidfile, _scoped_portfile,
+        _scoped_plist_label, _scoped_safety_score_file,
         _scoped_log_file, _state_dir,
-        DaemonManager,
+        guardian_is_running,
     )
     import subprocess
     import os
     import json
 
-    if hardened:
-        from .guard import _use_hardened
-        _use_hardened()
-
     config = load_config(explicit_root=Path(repo).resolve() if repo else None)
     repo_root = config.repo_root
 
     pidfile = _scoped_pidfile(repo_root, hardened)
-    lockfile = _scoped_lockfile(repo_root, hardened)
     portfile = _scoped_portfile(repo_root, hardened)
     plist_label = _scoped_plist_label(repo_root)
-    plist_path = _scoped_plist_path(repo_root, hardened)
     state_dir = _state_dir(hardened)
     safety_score_file = _scoped_safety_score_file(repo_root, hardened)
     log_file = _scoped_log_file(repo_root, hardened)
@@ -1115,14 +1209,25 @@ def cmd_doctor(repo, hardened):
         print(f"  {status} {name}" + (f" — {detail}" if detail else ""))
 
     # 1. Guardian process
-    dm = DaemonManager(pidfile, lockfile)
-    running = dm.is_running()
+    running = guardian_is_running(repo_root, hardened)
     check("Guardian process", running, f"PID file: {pidfile}" + (" (running)" if running else " (not running)"))
 
     if running:
         try:
-            pid = int(pidfile.read_text().strip())
-            check("Process alive", True, f"PID {pid}")
+            if pidfile.exists():
+                pid_text = pidfile.read_text().strip()
+            elif hardened:
+                r = subprocess.run(
+                    ["sudo", "cat", str(pidfile)],
+                    capture_output=True, text=True, timeout=10,
+                )
+                pid_text = r.stdout.strip() if r.returncode == 0 else ""
+            else:
+                pid_text = ""
+            if pid_text:
+                check("Process alive", True, f"PID {pid_text}")
+            else:
+                check("Process alive", True, "responding on control port or launchd")
         except Exception:
             check("Process alive", False, "PID file exists but unreadable")
     else:
@@ -1131,14 +1236,16 @@ def cmd_doctor(repo, hardened):
     # 2. Launchd / systemd
     if hardened:
         try:
-            r = subprocess.run(["sudo", "launchctl", "list", plist_label], capture_output=True, text=True, timeout=10)
-            loaded = r.returncode == 0 and plist_label in r.stdout
+            r = subprocess.run(
+                ["sudo", "launchctl", "print", f"system/{plist_label}"],
+                capture_output=True, text=True, timeout=10,
+            )
+            loaded = r.returncode == 0 and "state = running" in r.stdout
             check("LaunchDaemon loaded", loaded, plist_label)
         except Exception:
             check("LaunchDaemon loaded", False, "Could not check")
     else:
         try:
-            uid = os.getuid()
             r = subprocess.run(["launchctl", "list", plist_label], capture_output=True, text=True, timeout=10)
             loaded = r.returncode == 0 and plist_label in r.stdout
             check("LaunchAgent loaded", loaded, plist_label)
@@ -1147,6 +1254,41 @@ def cmd_doctor(repo, hardened):
 
     # 3. State directory
     check("State directory", state_dir.exists() and state_dir.is_dir(), str(state_dir))
+
+    # 3b. Protection marker + hook integrity (drives fail-closed behavior)
+    from .config import read_install_marker
+    marker = read_install_marker(repo_root)
+    if marker is None:
+        check("Protection marker", False, "repo not protected — run `deadpush protect`")
+    else:
+        pinned = marker.get("python", "?") if isinstance(marker, dict) else "?"
+        interp_ok = (not isinstance(marker, dict)) or (not pinned) or Path(pinned).exists()
+        check(
+            "Protection marker",
+            interp_ok,
+            f"python={pinned}" if interp_ok else f"pinned interpreter missing: {pinned}",
+        )
+        if not interp_ok:
+            print("      → Hooks will fail closed. Re-run `deadpush protect` to re-pin.")
+
+    try:
+        from .hooks import verify_hooks_installed
+        hook_problems = verify_hooks_installed(repo_root)
+        hookspath_problems = [p for p in hook_problems if p.startswith("core.hooksPath")]
+        file_problems = [p for p in hook_problems if not p.startswith("core.hooksPath")]
+        check(
+            "Git hooks",
+            not file_problems,
+            "pre-push, pre-commit, post-commit OK" if not file_problems else ", ".join(file_problems),
+        )
+        if hookspath_problems:
+            check("core.hooksPath", False, hookspath_problems[0].replace("core.hooksPath ", ""))
+            print("      → git hooks are being bypassed. Run `deadpush protect` to restore "
+                  "(a running guardian auto-repairs this).")
+        else:
+            check("core.hooksPath", True, "not hijacked")
+    except Exception as e:
+        check("Git hooks", False, f"could not verify: {e}")
 
     # 4. Port file
     if portfile.exists():
@@ -1195,11 +1337,19 @@ def cmd_doctor(repo, hardened):
 
         # Check state dir permissions
         try:
+            import pwd
             import stat
             st = state_dir.stat()
             mode = stat.S_IMODE(st.st_mode)
-            owner_ok = st.st_uid == os.getuid() or st.st_uid == 0  # root or current user
             mode_ok = mode == 0o700
+            if hardened:
+                try:
+                    dead_uid = pwd.getpwnam("_deadpush").pw_uid
+                    owner_ok = st.st_uid == dead_uid
+                except KeyError:
+                    owner_ok = False
+            else:
+                owner_ok = st.st_uid == os.getuid()
             check("State dir permissions", mode_ok and owner_ok, f"mode={oct(mode)}, uid={st.st_uid}")
         except Exception:
             check("State dir permissions", False, "could not check")
@@ -1316,6 +1466,16 @@ def cmd_init(mode, daemon, force):
             print_error(f"Hardened setup failed: {e}")
             print_warning("Try running with sudo directly: sudo deadpush init --mode hardened")
             return 1
+        # Hooks were installed above as user-immutable. Now that privilege
+        # separation (and a cached sudo credential) is in place, re-lock them
+        # root-immutable (schg) so a same-UID agent cannot delete or modify them.
+        try:
+            install_hook(repo_root, system=True)
+            install_precommit_hook(repo_root, system=True)
+            install_postcommit_hook(repo_root, system=True)
+            print_success("  Git hooks locked root-immutable (schg).")
+        except Exception as e:
+            print_warning(f"  Could not lock hooks root-immutable: {e}")
     else:
         try:
             autostart_info = setup_autostart(repo_root, hardened=False)

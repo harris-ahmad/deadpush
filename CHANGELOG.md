@@ -5,7 +5,88 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.0.0] - 2026-06-27
+## [Unreleased]
+
+_Staged for the next release. The project stays on a 0.2.x beta line until the
+production-readiness gates (blocking lint, lockfiled reproducible builds, and
+green macOS + Linux CI including the lifecycle integration test) are met._
+
+### Added
+- **Fail-closed git hooks**: once a repo is protected (a `.deadpush/installed`
+  marker is written), the installed hooks refuse to run when the deadpush
+  interpreter goes missing, instead of silently allowing the push/commit.
+  `DEADPUSH_STRICT=1` forces fail-closed everywhere.
+- **`protect` verifies and reports failure**: `deadpush protect` now polls that
+  the guardian actually started, and exits non-zero with actionable guidance if
+  hooks, the marker, or the daemon did not come up (no more false "success").
+- **`doctor` protection checks**: reports the protection marker (and whether the
+  pinned interpreter still exists) plus git-hook integrity.
+- **Lifecycle integration test** (`tests/test_integration_lifecycle.py`): drives
+  the installed CLI and executes the real generated hooks; runs on macOS + Linux
+  in CI.
+- **`core.hooksPath` hijack detection + self-heal**: `git config core.hooksPath
+  /dev/null` (or any dir other than `.git/hooks`) silently disabled every hook
+  without tripping the checksum/immutability checks. `verify_hooks_installed` now
+  flags it, `repair_deadpush_hooks` restores it (repo-local only, overriding a
+  global hijack if needed), the running guardian auto-repairs it every cycle, and
+  `doctor` reports it. Covered by `tests/test_hookspath_hijack.py`.
+- **Root-immutable hooks in hardened mode**: hardened installs now lock the git
+  hooks ROOT-immutable (`sudo chflags schg` on macOS, `sudo chattr +i` on Linux)
+  instead of only user-immutable (`uchg`). A same-UID agent can no longer clear
+  the flag to delete or rewrite a hook — only root can. Soft mode keeps the
+  owner-clearable `uchg`. `_is_immutable` now recognises `schg` (so the guardian
+  never loops trying to "repair" a locked hook it cannot rewrite), `uninstall`
+  clears it via sudo (with an automatic escalation fallback), and if `schg` can't
+  be set it fails safe to `uchg` with a loud warning. Covered by
+  `tests/test_root_immutable.py`.
+
+### Changed
+- **Robust hook/daemon entrypoint**: generated hooks, the launchd/systemd units,
+  and the shadow respawn command now launch via `deadpush_bootstrap` instead of
+  `-m deadpush.cli`, so they work in editable installs where macOS hides the
+  `.pth` file (previously the guardian and hooks failed to import deadpush from a
+  non-source working directory).
+- **Single source of truth for version**: `pyproject.toml` derives the version
+  from `deadpush/__init__.py` (hatchling dynamic version); metadata and
+  `deadpush.__version__` can no longer drift.
+
+### CI / tooling
+- Ruff is now a **blocking** gate; the codebase is lint-clean.
+- `uv.lock` is committed and CI runs `uv lock --check` + `uv sync --frozen` for
+  reproducible builds.
+- CI test matrix runs on **macOS and Linux** across supported Python versions.
+
+### Fixed
+- **launchctl bootstrap bug**: `protect` no longer marks the guardian as
+  bootstrapped when `launchctl bootstrap` fails; it now falls back to a direct
+  daemon launch and verifies the result.
+- `uninstall` now also removes the deadpush git hooks and the protection marker,
+  so a full uninstall truly leaves nothing behind.
+- **Pre-push scanning of new branches**: pushing a brand-new branch (remote side
+  all-zeros) previously diffed the working tree against the tip and scanned
+  nothing, letting a first push bypass content enforcement. New commits are now
+  resolved against the boundary already on the remote (or the whole tree when
+  there is no shared history) and scanned. Covered by `tests/test_prepush_newbranch.py`.
+- **Test isolation / macOS notification spam**: the autostart unit tests wrote
+  real plists into `~/Library/LaunchAgents` (path derived from `$HOME`, not the
+  temp repo), triggering a macOS "app can run in the background" notification per
+  run and littering hundreds of stale plists. They now use the isolated
+  `hardened_env` fixture.
+
+### Packaging
+- **Homebrew formula rewrite** (`Formula/deadpush.rb`): switched from a fragile
+  `pip3 install --prefix` to `virtualenv_install_with_resources` with runtime
+  dependencies pinned to the `uv.lock` versions (`click`, `pathspec`, `watchdog`),
+  a Homebrew-audit-clean `desc`, and a `--version` test. Passes `brew style`.
+  A release helper (`scripts/brew_release.sh`) fills the source `sha256` and runs
+  audit/install/test. Note: `brew install` requires the repo to be **public** with
+  the release tag pushed; the `sha256` is a placeholder until then.
+
+---
+
+## [1.0.0] - unreleased
+
+_Historical notes previously drafted under a 1.0.0 heading; not yet released._
 
 ### Added
 - **Log rotation**: RotatingFileHandler (10MB × 5 files) prevents unbounded log growth

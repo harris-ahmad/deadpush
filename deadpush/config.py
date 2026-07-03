@@ -11,11 +11,13 @@ Supports:
 
 from __future__ import annotations
 
-import os
+import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
-import tomllib
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    import pathspec
 
 
 @dataclass
@@ -143,6 +145,94 @@ class Config:
                 "blocked_patterns": self.block.blocked_patterns,
             },
         }
+
+
+INSTALL_MARKER_REL = ".deadpush/installed"
+
+
+def install_marker_path(repo_root: Path) -> Path:
+    """Path to the local marker recording that this repo was protected.
+
+    The presence of this file is what lets git hooks *fail closed* when the
+    deadpush interpreter later goes missing (deleted venv, moved install):
+    a protected repo must refuse the operation rather than silently allow it.
+    The file is intentionally machine-local (records an absolute interpreter
+    path) and is added to .gitignore so it is never committed.
+    """
+    return repo_root / ".deadpush" / "installed"
+
+
+def write_install_marker(repo_root: Path, *, hardened: bool = False) -> Path:
+    """Record that this repo is protected, pinning the interpreter to use.
+
+    Returns the marker path. Best-effort ignore-list maintenance ensures the
+    marker (which contains a machine-specific interpreter path) is not
+    accidentally committed.
+    """
+    import json
+    import sys
+    import time
+
+    marker = install_marker_path(repo_root)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "version": _package_version(),
+        "python": sys.executable,
+        "mode": "hardened" if hardened else "default",
+        "installed_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "platform": sys.platform,
+    }
+    marker.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    _ensure_gitignored(repo_root, INSTALL_MARKER_REL)
+    return marker
+
+
+def read_install_marker(repo_root: Path) -> dict[str, Any] | None:
+    """Return the parsed install marker, or None if the repo isn't protected."""
+    import json
+
+    marker = install_marker_path(repo_root)
+    if not marker.exists():
+        return None
+    try:
+        return json.loads(marker.read_text(encoding="utf-8"))
+    except Exception:
+        # A present-but-unreadable marker still means "this repo was protected".
+        return {}
+
+
+def remove_install_marker(repo_root: Path) -> None:
+    """Remove the protection marker (used by `uninstall`)."""
+    try:
+        install_marker_path(repo_root).unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def _package_version() -> str:
+    try:
+        from . import __version__
+
+        return __version__
+    except Exception:
+        return "unknown"
+
+
+def _ensure_gitignored(repo_root: Path, rel_pattern: str) -> None:
+    """Idempotently ensure `rel_pattern` is present in the repo's .gitignore."""
+    gitignore = repo_root / ".gitignore"
+    try:
+        existing = ""
+        if gitignore.exists():
+            existing = gitignore.read_text(encoding="utf-8")
+            lines = {line.strip() for line in existing.splitlines()}
+            if rel_pattern in lines:
+                return
+        prefix = "" if (not existing or existing.endswith("\n")) else "\n"
+        with gitignore.open("a", encoding="utf-8") as f:
+            f.write(f"{prefix}{rel_pattern}\n")
+    except Exception:
+        pass
 
 
 def is_guardian_dev_repo(repo_root: Path) -> bool:

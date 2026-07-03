@@ -9,13 +9,10 @@ Usage:
 """
 
 import argparse
-import os
 import random
-import shutil
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -99,7 +96,7 @@ def agent_worker(repo, agent_id, duration, results):
             run_cmd(["git", "add", filename], cwd=repo)
             run_cmd(["git", "commit", "-m", f"Agent {agent_id} write {writes}"], cwd=repo)
             writes += 1
-        except Exception as e:
+        except Exception:
             pass
 
         time.sleep(random.uniform(0.5, 2.0))

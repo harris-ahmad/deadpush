@@ -7,7 +7,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import pytest
 from deadpush import guard
-from deadpush.config import Config
 
 
 @pytest.fixture
@@ -33,6 +32,68 @@ def hardened_env(tmp_path, monkeypatch):
             / f"deadpush-guardian.{rid_fn(str(r))}.service",
         )
     return state_dir
+
+
+class TestEnsureDeadpushAccount:
+    def test_skips_when_user_already_valid(self, monkeypatch):
+        monkeypatch.setattr(guard, "_deadpush_account_valid", lambda: True)
+        lines: list[str] = []
+        calls: list[list[str]] = []
+
+        def _sudo(cmd, check=True, timeout=60):
+            calls.append(cmd)
+            return None
+
+        guard._ensure_deadpush_account(_sudo, lines)
+        assert lines == ["User _deadpush already exists"]
+        assert calls == []
+
+    def test_find_free_system_id_skips_used(self, monkeypatch):
+        from types import SimpleNamespace
+
+        monkeypatch.setattr(
+            "subprocess.run",
+            lambda *args, **kwargs: SimpleNamespace(
+                returncode=0, stdout="foo 401\nbar 402\n",
+            ),
+        )
+        assert guard._find_free_system_id("Users", start=400, end=405) == "400"
+
+    def test_darwin_repairs_broken_user_with_separate_dscl_calls(self, monkeypatch):
+        from types import SimpleNamespace
+
+        valid_checks = iter([False, True])
+        monkeypatch.setattr(guard, "_deadpush_account_valid", lambda: next(valid_checks))
+        monkeypatch.setattr(guard, "_find_free_system_id", lambda kind: "450")
+
+        class FakeGrp:
+            gr_gid = 449
+
+        monkeypatch.setattr("grp.getgrnam", lambda name: FakeGrp())
+
+        def fake_run(cmd, **kwargs):
+            if cmd[:3] == ["dscl", ".", "-read"] and cmd[3] == "/Users/_deadpush":
+                return SimpleNamespace(returncode=0)
+            return SimpleNamespace(returncode=1)
+
+        monkeypatch.setattr("subprocess.run", fake_run)
+
+        sudo_cmds: list[list[str]] = []
+
+        def _sudo(cmd, check=True, timeout=60):
+            sudo_cmds.append(cmd)
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        lines: list[str] = []
+        monkeypatch.setattr("sys.platform", "darwin")
+        guard._ensure_deadpush_account(_sudo, lines)
+
+        assert ["dscl", ".", "-delete", "/Users/_deadpush"] in sudo_cmds
+        assert ["dscl", ".", "-create", "/Users/_deadpush"] in sudo_cmds
+        assert ["dscl", ".", "-create", "/Users/_deadpush", "UserShell", "/usr/bin/false"] in sudo_cmds
+        assert ["dscl", ".", "-create", "/Users/_deadpush", "UniqueID", "450"] in sudo_cmds
+        assert "Removed broken _deadpush user record" in lines
+        assert "Created _deadpush user (UID 450, GID 449)" in lines
 
 
 class TestStateDir:
@@ -123,21 +184,25 @@ class TestRepoId:
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="LaunchAgents are macOS-only")
 class TestSetupAutostartDefault:
-    def test_returns_launchagent_string(self, tmp_path):
+    # NOTE: these MUST take `hardened_env`. Without it, setup_autostart writes a
+    # real plist into ~/Library/LaunchAgents (the path is derived from Path.home(),
+    # not from tmp_path), which litters the developer's machine and triggers a
+    # macOS "App can run in the background" notification on every test run.
+    def test_returns_launchagent_string(self, tmp_path, hardened_env):
         result = guard.setup_autostart(tmp_path, hardened=False)
         assert "LaunchAgent" in result
 
-    def test_creates_plist_in_launchagents(self, tmp_path):
+    def test_creates_plist_in_launchagents(self, tmp_path, hardened_env):
         guard.setup_autostart(tmp_path, hardened=False)
         plist_path = guard._scoped_plist_path(tmp_path)
         assert plist_path.exists()
 
-    def test_plist_no_hardened_args(self, tmp_path):
+    def test_plist_no_hardened_args(self, tmp_path, hardened_env):
         guard.setup_autostart(tmp_path, hardened=False)
         text = guard._scoped_plist_path(tmp_path).read_text()
         assert "--hardened" not in text
 
-    def test_plist_has_working_directory(self, tmp_path):
+    def test_plist_has_working_directory(self, tmp_path, hardened_env):
         guard.setup_autostart(tmp_path, hardened=False)
         text = guard._scoped_plist_path(tmp_path).read_text()
         assert str(tmp_path) in text
@@ -145,21 +210,23 @@ class TestSetupAutostartDefault:
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="systemd user units are Linux-only")
 class TestSetupAutostartLinuxDefault:
-    def test_returns_systemd_user_string(self, tmp_path):
+    # See note above: without `hardened_env` these write real unit files into
+    # ~/.config/systemd/user, polluting the developer's machine.
+    def test_returns_systemd_user_string(self, tmp_path, hardened_env):
         result = guard.setup_autostart(tmp_path, hardened=False)
         assert "systemd --user" in result
 
-    def test_creates_user_unit(self, tmp_path):
+    def test_creates_user_unit(self, tmp_path, hardened_env):
         guard.setup_autostart(tmp_path, hardened=False)
         unit_path = guard._scoped_systemd_unit_path(tmp_path)
         assert unit_path.exists()
 
-    def test_unit_no_hardened_args(self, tmp_path):
+    def test_unit_no_hardened_args(self, tmp_path, hardened_env):
         guard.setup_autostart(tmp_path, hardened=False)
         text = guard._scoped_systemd_unit_path(tmp_path).read_text()
         assert "--hardened" not in text
 
-    def test_unit_has_working_directory(self, tmp_path):
+    def test_unit_has_working_directory(self, tmp_path, hardened_env):
         guard.setup_autostart(tmp_path, hardened=False)
         text = guard._scoped_systemd_unit_path(tmp_path).read_text()
         assert str(tmp_path) in text
