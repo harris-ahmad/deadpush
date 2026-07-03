@@ -335,3 +335,72 @@ class TestMcpHardened:
         with pytest.raises((AttributeError, TypeError, RuntimeError)):
             run_mcp()
         assert not guard._is_hardened(hardened=False)
+
+
+class TestTeardownHardenedEnvironment:
+    """teardown_hardened_environment must reverse setup on BOTH platforms and
+    never crash on a missing tool (the launchctl/dscl-on-Linux class of bug)."""
+
+    @staticmethod
+    def _recorder():
+        calls: list[list[str]] = []
+
+        def _sudo(cmd, check=True, timeout=60):
+            calls.append(cmd)
+            return None
+
+        return calls, _sudo
+
+    def test_linux_uses_setfacl_and_userdel(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(guard.sys, "platform", "linux")
+        (tmp_path / ".guardian").mkdir()
+        calls, _sudo = self._recorder()
+
+        actions = guard.teardown_hardened_environment(tmp_path, _sudo=_sudo)
+
+        repo = str(tmp_path.resolve())
+        guardian = str((tmp_path / ".guardian").resolve())
+        assert ["setfacl", "-R", "-x", "u:_deadpush", repo] in calls
+        assert ["setfacl", "-R", "-x", "u:_deadpush", guardian] in calls
+        assert ["userdel", "_deadpush"] in calls
+        assert ["groupdel", "_deadpush"] in calls
+        # No macOS-only tools on Linux.
+        assert not any(c[0] in ("dscl", "chmod") for c in calls)
+        assert "Removed _deadpush user and group" in actions
+
+    def test_darwin_uses_chmod_and_dscl(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(guard.sys, "platform", "darwin")
+        (tmp_path / ".guardian").mkdir()
+        calls, _sudo = self._recorder()
+
+        guard.teardown_hardened_environment(tmp_path, _sudo=_sudo)
+
+        repo = str(tmp_path.resolve())
+        assert ["chmod", "-R", "-N", repo] in calls
+        assert ["dscl", ".", "-delete", "/Users/_deadpush"] in calls
+        assert ["dscl", ".", "-delete", "/Groups/_deadpush"] in calls
+        # No Linux-only tools on macOS.
+        assert not any(c[0] in ("setfacl", "userdel", "groupdel") for c in calls)
+
+    def test_acls_revoked_before_account_deleted(self, tmp_path, monkeypatch):
+        """Name-based ACL removal must run before the account is deleted."""
+        monkeypatch.setattr(guard.sys, "platform", "linux")
+        calls, _sudo = self._recorder()
+
+        guard.teardown_hardened_environment(tmp_path, _sudo=_sudo)
+
+        last_setfacl = max(i for i, c in enumerate(calls) if c[0] == "setfacl")
+        first_userdel = next(i for i, c in enumerate(calls) if c[0] == "userdel")
+        assert last_setfacl < first_userdel
+
+    def test_missing_tool_does_not_raise(self, tmp_path, monkeypatch):
+        """A missing service/ACL tool (e.g. dscl on Linux) must be a no-op."""
+        monkeypatch.setattr(guard.sys, "platform", "linux")
+
+        def boom(*a, **k):
+            raise FileNotFoundError("setfacl")
+
+        monkeypatch.setattr("subprocess.run", boom)
+        # No _sudo -> uses subprocess directly; must swallow the error.
+        actions = guard.teardown_hardened_environment(tmp_path)
+        assert isinstance(actions, list)

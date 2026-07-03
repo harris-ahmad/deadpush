@@ -2292,41 +2292,92 @@ def guardian_is_running(repo_root: Path, hardened: bool = False) -> bool:
 # =============================================================================
 # Hardened environment setup (privilege separation)
 # =============================================================================
-def _apply_hardened_traverse_acls(repo_root: Path, _sudo) -> None:
-    """Grant _deadpush traverse access to parent dirs (e.g. ~/Documents mode 700)."""
+# macOS ACE granted to _deadpush on parent dirs so it can traverse into the repo.
+_HARDENED_TRAVERSE_ACE = "_deadpush allow list,search,readattr,readextattr,readsecurity"
+
+
+def _hardened_traverse_dirs(repo_root: Path):
+    """Yield existing parent dirs (under $HOME) that need _deadpush traverse access.
+
+    Walks up from the repo toward $HOME, stopping at the filesystem root or a
+    system dir. Shared by setup (grant) and teardown (revoke) so the two can
+    never drift out of sync.
+    """
     repo_root = repo_root.resolve()
     home = Path.home().resolve()
-    _SYSTEM_SKIP = {Path("/"), Path("/Users")}
+    skip = {Path("/"), Path("/Users")}
+    cur = repo_root.parent
+    while cur != cur.parent:
+        if cur in skip:
+            break
+        try:
+            under_home = cur.is_relative_to(home)
+        except AttributeError:
+            under_home = str(cur).startswith(str(home) + os.sep) or cur == home
+        if not under_home:
+            break
+        if cur.exists():
+            yield cur
+        cur = cur.parent
+
+
+def _apply_hardened_traverse_acls(repo_root: Path, _sudo) -> None:
+    """Grant _deadpush traverse access to parent dirs (e.g. ~/Documents mode 700)."""
+    if sys.platform == "darwin":
+        for cur in _hardened_traverse_dirs(repo_root):
+            _sudo(["chmod", "+a", _HARDENED_TRAVERSE_ACE, str(cur)])
+    elif sys.platform.startswith("linux"):
+        for cur in _hardened_traverse_dirs(repo_root):
+            _sudo(["setfacl", "-m", "u:_deadpush:--x", str(cur)], check=False)
+
+
+def teardown_hardened_environment(repo_root: Path, _sudo=None) -> list[str]:
+    """Reverse ``setup_hardened_environment``: revoke every _deadpush ACL (repo
+    tree, ``.guardian``, and the parent traverse dirs) and delete the _deadpush
+    user/group.
+
+    Platform-aware (macOS ``chmod``/``dscl``, Linux ``setfacl``/``userdel``) and
+    strictly best-effort: a missing tool (e.g. ``dscl`` on Linux) or an absent
+    ACL/account entry is a no-op, never a hard failure. ACLs are revoked BEFORE
+    the account is deleted so name-based removal still resolves. Returns a list
+    of human-readable actions taken.
+    """
+    import subprocess as _sp
+
+    actions: list[str] = []
+
+    def run(cmd):
+        try:
+            if _sudo is not None:
+                return _sudo(cmd, check=False)
+            return _sp.run(["sudo", *cmd], capture_output=True, text=True, timeout=30)
+        except Exception:
+            return None
+
+    repo_root = repo_root.resolve()
+    guardian_dir = repo_root / ".guardian"
 
     if sys.platform == "darwin":
-        traverse = "_deadpush allow list,search,readattr,readextattr,readsecurity"
-        cur = repo_root.parent
-        while cur != cur.parent:
-            if cur in _SYSTEM_SKIP:
-                break
-            try:
-                under_home = cur.is_relative_to(home)
-            except AttributeError:
-                under_home = str(cur).startswith(str(home) + os.sep) or cur == home
-            if not under_home:
-                break
-            if cur.exists():
-                _sudo(["chmod", "+a", traverse, str(cur)])
-            cur = cur.parent
+        run(["chmod", "-R", "-N", str(repo_root)])
+        if guardian_dir.exists():
+            run(["chmod", "-R", "-N", str(guardian_dir)])
+        for cur in _hardened_traverse_dirs(repo_root):
+            run(["chmod", "-a", _HARDENED_TRAVERSE_ACE, str(cur)])
+        actions.append("Cleared _deadpush ACLs")
+        run(["dscl", ".", "-delete", "/Users/_deadpush"])
+        run(["dscl", ".", "-delete", "/Groups/_deadpush"])
+        actions.append("Removed _deadpush user and group")
     elif sys.platform.startswith("linux"):
-        cur = repo_root.parent
-        while cur != cur.parent:
-            if cur == Path("/"):
-                break
-            try:
-                under_home = cur.is_relative_to(home)
-            except AttributeError:
-                under_home = str(cur).startswith(str(home) + os.sep) or cur == home
-            if not under_home:
-                break
-            if cur.exists():
-                _sudo(["setfacl", "-m", "u:_deadpush:--x", str(cur)], check=False)
-            cur = cur.parent
+        run(["setfacl", "-R", "-x", "u:_deadpush", str(repo_root)])
+        if guardian_dir.exists():
+            run(["setfacl", "-R", "-x", "u:_deadpush", str(guardian_dir)])
+        for cur in _hardened_traverse_dirs(repo_root):
+            run(["setfacl", "-x", "u:_deadpush", str(cur)])
+        actions.append("Cleared _deadpush ACLs")
+        run(["userdel", "_deadpush"])
+        run(["groupdel", "_deadpush"])
+        actions.append("Removed _deadpush user and group")
+    return actions
 
 
 def _apply_hardened_repo_acls(repo_root: Path, _sudo=None) -> None:

@@ -40,6 +40,22 @@ green macOS + Linux CI including the lifecycle integration test) are met._
   be set it fails safe to `uchg` with a loud warning. Covered by
   `tests/test_root_immutable.py`.
 
+### Fixed
+- **Cross-platform uninstall**: `deadpush uninstall` invoked `launchctl`
+  unconditionally, which raised `FileNotFoundError` on Linux and made the command
+  exit non-zero. It now unloads/removes the correct service per platform (launchd
+  plist on macOS, systemd unit on Linux — the systemd unit was previously never
+  removed) and treats a missing/inactive service manager as a no-op.
+- **Hardened-mode teardown parity on Linux**: hardened setup already supported
+  Linux (`useradd`/`groupadd`/`setfacl`), but uninstall only ran macOS
+  `dscl`/`chmod -N`, so it crashed on Linux and orphaned the `_deadpush`
+  account/ACLs. Added `teardown_hardened_environment`, a platform-aware,
+  best-effort reversal that revokes every `_deadpush` ACL (repo tree,
+  `.guardian`, and parent traverse dirs — a shared walk with setup so the two
+  can't drift) and deletes the account (macOS `dscl`, Linux `userdel`/`groupdel`),
+  revoking ACLs before removing the account. Covered by
+  `tests/test_hardened.py::TestTeardownHardenedEnvironment`.
+
 ### Changed
 - **Robust hook/daemon entrypoint**: generated hooks, the launchd/systemd units,
   and the shadow respawn command now launch via `deadpush_bootstrap` instead of

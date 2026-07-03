@@ -1116,19 +1116,16 @@ def cmd_uninstall(hardened, force):
             shutil.rmtree(state_dir)
             print(f"  Removed {state_dir}")
 
-    # 5. Remove hardened user/group and ACLs
+    # 5. Remove hardened user/group and ACLs (platform-aware: chmod/dscl on
+    #    macOS, setfacl/userdel on Linux; best-effort, never crashes uninstall).
     if hardened:
         print("[5/6] Removing hardened user, group, and ACLs...")
-        # Remove ACLs from repo
-        subprocess.run(["sudo", "chmod", "-R", "-N", str(repo_root)], capture_output=True, timeout=30)
-        # Remove .guardian dir ACLs
-        guardian_dir = repo_root / ".guardian"
-        if guardian_dir.exists():
-            subprocess.run(["sudo", "chmod", "-R", "-N", str(guardian_dir)], capture_output=True, timeout=10)
-        # Remove user and group
-        subprocess.run(["sudo", "dscl", ".", "-delete", "/Users/_deadpush"], capture_output=True, timeout=10)
-        subprocess.run(["sudo", "dscl", ".", "-delete", "/Groups/_deadpush"], capture_output=True, timeout=10)
-        print("  Removed _deadpush user and group, cleared ACLs")
+        from .guard import teardown_hardened_environment
+        try:
+            for line in teardown_hardened_environment(repo_root):
+                print(f"  {line}")
+        except Exception as e:
+            print_warning(f"  Hardened teardown issue: {e}")
 
     # Remove immutable flags from hooks. In hardened mode these are root-immutable
     # (schg), so clearing requires sudo — pass system=hardened.
