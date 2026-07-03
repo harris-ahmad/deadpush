@@ -997,7 +997,7 @@ def cmd_uninstall(hardened, force):
     from .config import load_config
     from .guard import (
         _scoped_pidfile, _scoped_lockfile, _scoped_portfile,
-        _scoped_plist_label, _scoped_plist_path, _state_dir
+        _scoped_plist_label, _scoped_plist_path, _scoped_systemd_unit_path, _state_dir
     )
     from .hooks import _make_mutable
     import subprocess
@@ -1054,22 +1054,42 @@ def cmd_uninstall(hardened, force):
         dm.force_cleanup()
         print("  Guardian stopped")
 
-    # 2. Unload launchd
-    print("[2/6] Unloading launchd service...")
-    if hardened:
-        subprocess.run(["sudo", "launchctl", "bootout", "system", plist_label], capture_output=True, timeout=10)
-    else:
-        uid = os.getuid()
-        subprocess.run(["launchctl", "bootout", f"gui/{uid}/{plist_label}"], capture_output=True, timeout=10)
-    print("  Launchd service unloaded")
+    # 2. Unload the OS service (launchd on macOS, systemd on Linux). A missing
+    #    service manager (e.g. no `launchctl` on Linux) must never crash uninstall.
+    print("[2/6] Unloading background service...")
+    try:
+        if sys.platform == "darwin":
+            if hardened:
+                subprocess.run(["sudo", "launchctl", "bootout", "system", plist_label], capture_output=True, timeout=10)
+            else:
+                uid = os.getuid()
+                subprocess.run(["launchctl", "bootout", f"gui/{uid}/{plist_label}"], capture_output=True, timeout=10)
+            print("  Launchd service unloaded")
+        elif sys.platform.startswith("linux"):
+            unit = _scoped_systemd_unit_path(repo_root, hardened).name
+            scope = [] if hardened else ["--user"]
+            subprocess.run(["systemctl", *scope, "disable", "--now", unit], capture_output=True, timeout=10)
+            print("  systemd unit disabled")
+    except Exception:
+        pass  # service manager absent (e.g. launchctl on Linux) or not running
 
-    # 3. Remove plist
-    print("[3/6] Removing plist...")
-    if hardened:
-        subprocess.run(["sudo", "rm", "-f", str(plist_path)], capture_output=True, timeout=10)
-    elif plist_path.exists():
-        plist_path.unlink()
-    print(f"  Removed {plist_path.name}")
+    # 3. Remove the service unit file (launchd plist on macOS, systemd unit on Linux).
+    print("[3/6] Removing service unit...")
+    unit_path = _scoped_systemd_unit_path(repo_root, hardened) if sys.platform.startswith("linux") else plist_path
+    try:
+        if hardened:
+            subprocess.run(["sudo", "rm", "-f", str(unit_path)], capture_output=True, timeout=10)
+        elif unit_path.exists():
+            unit_path.unlink()
+        print(f"  Removed {unit_path.name}")
+    except Exception:
+        pass
+    if sys.platform.startswith("linux"):
+        try:
+            subprocess.run(["systemctl", *([] if hardened else ["--user"]), "daemon-reload"],
+                           capture_output=True, timeout=10)
+        except Exception:
+            pass
 
     # 4. Clean up state files
     print("[4/6] Cleaning state files...")
