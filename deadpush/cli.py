@@ -49,8 +49,8 @@ def main():
 @click.option("--no-intervention", is_flag=True, help="Warning mode only (no blocking/quarantine)")
 @click.option("--daemon", is_flag=True, help="Run as background daemon")
 @click.option("--strict", is_flag=True, help="Enable strict intervention mode")
-@click.option("--soft", is_flag=True, help="Dev-only: run as your UID (agent can kill guardian)")
-@click.option("--hardened", is_flag=True, help="Run as _deadpush user (default unless --soft)")
+@click.option("--soft", is_flag=True, help="Run as your own UID (this is the default)")
+@click.option("--hardened", is_flag=True, help="Opt into hardened mode: run under a root-owned _deadpush user (requires sudo)")
 def cmd_guard(repo, no_intervention, daemon, strict, soft, hardened):
     """
     Start the AI Agent Guardian.
@@ -60,12 +60,11 @@ def cmd_guard(repo, no_intervention, daemon, strict, soft, hardened):
     from .guard import run_guardian
     import os
     intervention = not no_intervention
-    use_hardened = not soft
-    if hardened:
-        use_hardened = True
     if soft and hardened:
         print_error("Cannot use --soft with --hardened")
         return
+    # Soft (same-UID) is the default; hardened (privilege separation, sudo) is opt-in.
+    use_hardened = bool(hardened)
     if repo:
         os.chdir(Path(repo).resolve())
     run_guardian(intervention=intervention, daemon=daemon, strict=strict, hardened=use_hardened)
@@ -74,8 +73,8 @@ def cmd_guard(repo, no_intervention, daemon, strict, soft, hardened):
 @main.command("protect")
 @click.option("--enable", is_flag=True, help="Enable persistent background guardian (auto-starts daemon after setup)")
 @click.option("--daemon", is_flag=True, help="Start the guardian as a persistent background daemon after performing full setup")
-@click.option("--soft", is_flag=True, help="Dev-only: same-UID guardian (agent can pkill it; not production-safe)")
-@click.option("--hardened", is_flag=True, help="Explicitly request hardened mode (default unless --soft)")
+@click.option("--soft", is_flag=True, help="Same-UID guardian at your own privileges (this is the default)")
+@click.option("--hardened", is_flag=True, help="Opt into hardened mode: privilege separation via a root-owned _deadpush user (requires sudo)")
 @click.option(
     "--allow-self-protect",
     is_flag=True,
@@ -109,12 +108,13 @@ def cmd_protect(enable, daemon, soft, hardened, allow_self_protect):
         return
 
     start_background = bool(enable or daemon)
-    use_hardened = not soft
-    if hardened:
-        use_hardened = True
     if soft and hardened:
         print_error("Cannot use --soft with --hardened")
         raise SystemExit(2)
+    # Soft (same-UID) is the default so the documented `pip install deadpush &&
+    # deadpush protect --daemon` one-liner never silently requires sudo. Hardened
+    # mode (privilege separation via a root-owned _deadpush user) is opt-in.
+    use_hardened = bool(hardened)
 
     # Track failures that make protection incomplete. A production install must
     # exit non-zero (and tell the user) rather than print a warning and pretend
@@ -135,7 +135,8 @@ def cmd_protect(enable, daemon, soft, hardened, allow_self_protect):
             print_error("or use `deadpush protect --soft` for a same-UID (dev-only) guardian.")
             raise SystemExit(1)
     elif start_background:
-        print_warning("Running in --soft mode: guardian uses your UID and can be killed by agents.")
+        print_warning("Running in soft mode (default): the guardian runs at your UID, so an "
+                      "agent could kill it. Use `--hardened` for a root-backed boundary (requires sudo).")
 
     print_header("deadpush Protect", "One-command setup for AI Agent Guardian (persistent background protection)")
 

@@ -2647,15 +2647,26 @@ def _ensure_hardened_venv(_sudo, lines: list[str]) -> None:
 
     _sudo(["chown", "-R", "_deadpush:_deadpush", str(venv)])
 
+    # How we populate the hardened venv depends on how deadpush itself was installed:
+    #  - dev/source checkout (a pyproject.toml sits above the package): install the
+    #    working tree so hardened mode tracks local changes.
+    #  - normal pip/wheel install (site-packages has no pyproject.toml): install the
+    #    matching version from PyPI. Previously this path raised "source not found",
+    #    so `deadpush protect --hardened` was broken for every pip-installed user.
     source = _deadpush_source_root()
-    if not (source / "pyproject.toml").exists():
-        raise RuntimeError(f"deadpush source not found at {source}")
+    if (source / "pyproject.toml").exists():
+        target = str(source)
+        origin = f"source {source}"
+    else:
+        from . import __version__ as _dp_version
+        target = f"deadpush=={_dp_version}"
+        origin = f"PyPI ({target})"
 
     pip = str(venv / "bin" / "pip")
     _sudo([pip, "install", "--upgrade", "pip"], check=False)
-    _sudo([pip, "install", str(source)])
+    _sudo([pip, "install", target])
     _sudo(["chown", "-R", "_deadpush:_deadpush", str(venv)])
-    lines.append(f"Installed deadpush into hardened venv from {source}")
+    lines.append(f"Installed deadpush into hardened venv from {origin}")
 
 
 def _setup_hardened_policy(repo_root: Path, _sudo, lines: list[str]) -> None:

@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-07-04
+
+### Fixed
+- **`protect`/`guard` now default to soft mode (critical first-run fix)**: the
+  default was hardened (`use_hardened = not soft`), so the documented one-liner
+  `pip install deadpush && deadpush protect --daemon` silently triggered a `sudo`
+  password prompt — and on a normal (non-editable) pip install it then failed
+  outright. Soft (same-UID) mode is now the default; hardened mode is opt-in via
+  `--hardened`. This matches the README and `SECURITY.md`.
+- **Hardened mode works from a pip/wheel install**: `_ensure_hardened_venv`
+  assumed a source checkout and looked for a `pyproject.toml` above the package,
+  raising `deadpush source not found at .../site-packages` for every
+  pip-installed user who ran `--hardened`. It now installs the matching version
+  from PyPI (`deadpush==<version>`) when there is no local source tree, and still
+  installs the working tree for dev checkouts.
+
 ## [0.2.2] - 2026-07-04
 
 First public release on PyPI (`0.2.1` was burned by PyPI's deleted-filename
