@@ -64,3 +64,43 @@ jobs:
 
       - name: Run tests
         run: uv run pytest -v
+
+  # Dogfood the server-side `deadpush scan` command on our own PR/push range.
+  # ADVISORY (continue-on-error) on purpose: this repo is a security tool whose
+  # source (deadpush/intercept.py) and test fixtures deliberately contain the very
+  # secret/dangerous-code patterns the scanner detects, so a blocking self-scan
+  # would false-positive on legitimate detector code. Downstream users wire the
+  # scan in as a *required* check via examples/github/deadpush.yml — see README.
+  dogfood-scan:
+    needs: [lint]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --extra dev --frozen
+
+      - name: deadpush scan (advisory)
+        continue-on-error: true
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE="${{ github.event.pull_request.base.sha }}"
+            HEAD="${{ github.event.pull_request.head.sha }}"
+          else
+            BASE="${{ github.event.before }}"
+            HEAD="${{ github.sha }}"
+          fi
+          ZERO="0000000000000000000000000000000000000000"
+          if [ -z "$BASE" ] || [ "$BASE" = "$ZERO" ]; then
+            uv run deadpush scan --all --ref "$HEAD"
+          else
+            uv run deadpush scan --base "$BASE" --head "$HEAD"
+          fi

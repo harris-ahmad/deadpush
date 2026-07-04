@@ -434,6 +434,12 @@ _ENFORCEABLE_NAMES = frozenset({
     ".gitconfig", ".terraformrc", ".htaccess", ".editorconfig",
 })
 
+# deadpush's own state dirs (and git internals): never content-scan these.
+_DEADPUSH_OWN_DIRS = frozenset({
+    ".git", ".deadpush", ".deadpush-quarantine", ".deadpush-archive",
+    ".deadpush-config-backups", ".guardian",
+})
+
 
 def is_enforceable_path(rel_path: str) -> bool:
     """Whether a path should be content-scanned by the git hooks.
@@ -447,6 +453,13 @@ def is_enforceable_path(rel_path: str) -> bool:
     name = Path(rel_path).name
     lower = name.lower()
     suffix = Path(rel_path).suffix.lower()
+
+    # Never scan deadpush's own bookkeeping (feedback records quote the very secrets
+    # deadpush caught) or the git internals — scanning them produces self-referential
+    # violations and lets `git add -A` weaponize deadpush's own logs.
+    parts = {p for p in Path(rel_path).parts}
+    if parts & _DEADPUSH_OWN_DIRS:
+        return False
 
     if suffix in _BINARY_EXTENSIONS:
         return False

@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+#
+# deadpush — server-side enforcement (git pre-receive hook).
+#
+# Install: copy this file to your bare repository's hooks directory, e.g.
+#   /srv/git/myrepo.git/hooks/pre-receive
+# then make it executable:
+#   chmod +x /srv/git/myrepo.git/hooks/pre-receive
+# and ensure `deadpush` is installed for the OS user your git server runs as:
+#   pip install deadpush
+#
+# It reads the ref updates git passes on stdin and REJECTS the whole push if any
+# incoming commit contains block-level violations (hardcoded secrets, dangerous
+# code, LLM/AI context files, etc.). Because this runs on the SERVER, a push made
+# with `git push --no-verify`, via git plumbing, or after killing the developer's
+# local guardian cannot bypass it.
+#
+# Fail-closed: if deadpush is missing or errors, the push is rejected.
+
+set -euo pipefail
+
+DEADPUSH_BIN="${DEADPUSH_BIN:-deadpush}"
+
+if ! command -v "$DEADPUSH_BIN" >/dev/null 2>&1; then
+  echo "deadpush: '$DEADPUSH_BIN' not found on the git server." >&2
+  echo "          Install it (pip install deadpush) or set DEADPUSH_BIN to its path." >&2
+  echo "          Rejecting push (fail closed)." >&2
+  exit 1
+fi
+
+# git sets GIT_DIR in the hook environment, so all of deadpush's `git` calls target
+# this repository regardless of the working directory. stdin (the ref updates) is
+# inherited by the exec'd process.
+exec "$DEADPUSH_BIN" hooks run-prereceive

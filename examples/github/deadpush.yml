@@ -1,0 +1,36 @@
+# deadpush — server-side enforcement (GitHub Actions)
+#
+# Copy this file to `.github/workflows/deadpush.yml` in your own repo, then make it
+# a required check: Settings -> Branches -> Branch protection rules -> require the
+# "deadpush" status check to pass before merging.
+#
+# Why this matters: the pre-commit / pre-push hooks and the guardian daemon all run
+# on the developer's (or agent's) machine, so a determined agent can bypass them with
+# `--no-verify`, git plumbing, or by killing the daemon. This check runs on GitHub's
+# runners instead, so a commit with hardcoded secrets or dangerous code is blocked
+# from the protected branch no matter what happened locally.
+
+name: deadpush
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  deadpush:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history so deadpush can diff base..head. Required.
+          fetch-depth: 0
+
+      - name: deadpush scan
+        uses: harris-ahmad/deadpush/.github/actions/scan@main
+        # Optionally pin the deadpush version for reproducibility:
+        # with:
+        #   version: "0.2.4"

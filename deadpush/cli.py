@@ -479,11 +479,26 @@ def cmd_status(repo, hardened):
         except Exception:
             print_success(f"🟢 Guardian is RUNNING{' (hardened)' if hardened else ''}")
     else:
-        print_warning(f"🔴 Guardian is NOT currently running for {repo_root.name}.")
-        print("   Start it with the hands-off command:")
-        print("     deadpush protect --daemon")
-        print("   Or:")
-        print("     deadpush guard --daemon")
+        from .guard import guardian_killed_uncleanly, guardian_persistence_installed
+        killed = guardian_killed_uncleanly(repo_root, hardened)
+        installed = guardian_persistence_installed(repo_root, hardened)
+        if killed:
+            print_warning(f"🔴 Guardian is NOT running for {repo_root.name} — a stale PID file is present.")
+            print_error("   This looks like the guardian was KILLED or crashed (a clean stop removes it).")
+            print("   If you did not stop it yourself, an agent or process may have terminated it.")
+            print("   Restart:  deadpush protect --daemon")
+            print("   For a guardian a same-UID agent cannot kill, use hardened mode:")
+            print("     deadpush protect --daemon --hardened")
+        elif installed:
+            print_warning(f"🔴 Guardian is INSTALLED but NOT running for {repo_root.name} — possible tamper.")
+            print("   It was set up to run persistently, but nothing is alive now.")
+            print("   Restart:  deadpush protect --daemon")
+        else:
+            print_warning(f"🔴 Guardian is NOT currently running for {repo_root.name}.")
+            print("   Start it with the hands-off command:")
+            print("     deadpush protect --daemon")
+            print("   Or:")
+            print("     deadpush guard --daemon")
 
     log = _scoped_log_file(repo_root, hardened)
     if log.exists():
@@ -714,6 +729,81 @@ def cmd_hooks_run_prepush():
     from .hooks import run_prepush_guardrails
     passed, violations = run_prepush_guardrails(config.repo_root)
     sys.exit(0 if passed else 1)
+
+
+@cmd_hooks.command("run-prereceive")
+def cmd_hooks_run_prereceive():
+    """Server-side enforcement (called by a git `pre-receive` hook).
+
+    Reads pre-receive stdin and REJECTS the push (exit 1) if any incoming commit
+    contains block-level violations. Install this on your git server (GitLab,
+    Gitea, or a bare repo) — it runs off the developer's machine, so `--no-verify`,
+    git plumbing, or killing the local daemon cannot bypass it.
+    """
+    config = load_config()
+    from .hooks import run_prereceive_guardrails
+    passed, violations = run_prereceive_guardrails(config.repo_root)
+    sys.exit(0 if passed else 1)
+
+
+@main.command("scan")
+@click.option("--base", default=None,
+              help="Base commit SHA. Scans commits in --base..--head (e.g. a PR's base sha).")
+@click.option("--head", default=None, help="Head commit to scan up to (default: HEAD).")
+@click.option("--all", "scan_all", is_flag=True,
+              help="Scan every file in --ref's tree instead of a commit range.")
+@click.option("--ref", default="HEAD", help="Ref whose whole tree to scan with --all (default: HEAD).")
+@click.option("--repo", type=click.Path(exists=True, file_okay=False), default=None,
+              help="Repo root (default: auto-detect from cwd).")
+@click.option("--format", "fmt", type=click.Choice(["text", "json"]), default="text",
+              help="Output format (default: text).")
+def cmd_scan(base, head, scan_all, ref, repo, fmt):
+    """Scan git history for block-level guardrail violations (CI / server-side).
+
+    Exits non-zero if any block-level violation is found, so it can gate a merge.
+    Wire it into a GitHub Actions check (with branch protection) or a pre-receive
+    hook: because it runs OFF the agent's machine, `--no-verify` and git plumbing
+    cannot bypass it.
+
+    Examples:
+      deadpush scan --base "$BASE_SHA" --head "$HEAD_SHA"   # PR / push range
+      deadpush scan --all                                    # whole tree at HEAD
+    """
+    import json as _json
+
+    from .hooks import scan_range, scan_tree, _print_violations
+
+    config = load_config(explicit_root=Path(repo).resolve() if repo else None)
+    repo_root = config.repo_root
+    head = head or "HEAD"
+
+    if base is not None:
+        violations = scan_range(repo_root, base, head)
+        target = f"{base[:8] if len(base) >= 8 else base}..{head}"
+    else:
+        tree_ref = ref if scan_all else head
+        violations = scan_tree(repo_root, tree_ref)
+        target = tree_ref
+
+    if fmt == "json":
+        print(_json.dumps({
+            "target": target,
+            "clean": not violations,
+            "count": len(violations),
+            "violations": violations,
+        }, indent=2))
+    else:
+        if violations:
+            _print_violations(
+                f"deadpush — scan of {target} found {len(violations)} block-level violation(s):",
+                violations,
+                "Rejected. Remove the flagged content before this can be merged/pushed.",
+            )
+        else:
+            print_success(f"deadpush — scan of {target} is clean (no block-level violations).")
+
+    sys.exit(1 if violations else 0)
+
 
 @main.command("intercept")
 @click.option("--daemon", is_flag=True, help="Run as persistent background daemon")
@@ -1252,7 +1342,20 @@ def cmd_doctor(repo, hardened):
 
     # 1. Guardian process
     running = guardian_is_running(repo_root, hardened)
-    check("Guardian process", running, f"PID file: {pidfile}" + (" (running)" if running else " (not running)"))
+    if running:
+        check("Guardian process", True, f"PID file: {pidfile} (running)")
+    else:
+        from .guard import guardian_killed_uncleanly, guardian_persistence_installed
+        if guardian_killed_uncleanly(repo_root, hardened):
+            check("Guardian process", False,
+                  "NOT running — stale PID file present (killed/crashed, not a clean stop)")
+            print("      → If you did not stop it, an agent/process may have killed it. "
+                  "Restart: deadpush protect --daemon (or --hardened for an unkillable guardian).")
+        elif guardian_persistence_installed(repo_root, hardened):
+            check("Guardian process", False,
+                  "INSTALLED but NOT running — possible tamper. Restart: deadpush protect --daemon")
+        else:
+            check("Guardian process", False, f"not running (PID file: {pidfile})")
 
     if running:
         try:

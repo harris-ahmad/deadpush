@@ -50,9 +50,15 @@ It enforces at three points that share **one enforcement kernel**
 
 1. **Git hooks** — `pre-commit`, `post-commit`, `pre-push`.
 2. **Guardian daemon** — a filesystem watcher that quarantines dangerous writes in
-   real time and maintains a monotonic Safety Score.
+   real time, re-scans every new commit to catch out-of-band commits (git plumbing
+   or `--no-verify`, which skip the hooks) and reverts them, and maintains a
+   monotonic Safety Score.
 3. **MCP server** — guardrailed `write_file`/`check_file` tools for agents that
    integrate over MCP.
+4. **Server-side enforcement (off the agent's machine)** — `deadpush scan` wired in
+   as a GitHub Actions check (with branch protection) and/or a `pre-receive` hook on
+   self-hosted git. This layer runs where the agent has no shell, so it is the only
+   one a same-UID agent cannot bypass locally (see below).
 
 ### The adversary
 
@@ -93,6 +99,16 @@ the overwhelmingly common case (an agent doing something dangerous *without tryi
 to evade the guard*), and it makes deliberate evasion noisy and inconvenient. It is
 **not** a hard security boundary against a determined same-UID adversary, and it is
 not marketed as one.
+
+In particular, a same-UID agent can **kill the daemon** (`pkill`, `launchctl
+unload`, …). Soft mode cannot prevent this — no user-privileged process can stop
+another process at the same privilege from being killed. What soft mode does is make
+a kill **loud instead of silent**: the shadow process respawns the guardian, the
+restart is logged as a possible-tamper event, and `deadpush status` / `deadpush
+doctor` report a killed guardian (a stale PID file with no live process) distinctly
+from a clean stop. To make the guardian genuinely unkillable by a same-UID agent,
+use hardened mode; to make a kill *irrelevant* to what actually ships, use the
+server-side check.
 
 ### Hardened mode — a real same-UID boundary
 
@@ -152,10 +168,11 @@ promise. Treat deadpush as **defense-in-depth**, never as your only control.
   cannot be silently switched off.
 - **Local hooks can be bypassed by design.** `git push --no-verify`,
   `git commit --no-verify`, or driving git's plumbing directly will skip the hooks
-  — git intentionally allows the operator to opt out. The daemon still sees writes
-  in real time, and hardened mode keeps enforcement from being *disabled*, but a
-  user who explicitly opts out is honored. Use server-side branch protection to
-  make bypass non-authoritative.
+  — git intentionally allows the operator to opt out. deadpush closes this two ways:
+  the daemon re-scans every new commit and reverts out-of-band commits that carry
+  violations, and — authoritatively — the **server-side check** (`deadpush scan` via
+  GitHub Actions or a `pre-receive` hook) runs where the agent cannot opt out, so a
+  bypassed local commit is still rejected at the remote. Enable it (see below).
 - **Range scanning sees net changes.** Pre-push scans the net diff of what is being
   pushed (whole tree for a brand-new branch; `remote_sha..local_sha` for an
   update). Content that is added and then removed **within** a single pushed range
@@ -173,6 +190,11 @@ promise. Treat deadpush as **defense-in-depth**, never as your only control.
 
 - Use **`--hardened`** on repositories where an agent runs unattended and you want a
   boundary rather than deterrence.
+- **Wire up the server-side check** — the one layer that runs off the agent's
+  machine and cannot be bypassed with `--no-verify`, plumbing, or a killed daemon:
+  add `deadpush scan` as a GitHub Actions check (`examples/github/deadpush.yml`) and
+  make it a required status check, or install the `pre-receive` hook on self-hosted
+  git (`docs/server-side/pre-receive.md`).
 - Keep **server-side controls** on: protected branches, required checks, and
   push/secret scanning on your git host. Local and server-side controls are
   complementary.

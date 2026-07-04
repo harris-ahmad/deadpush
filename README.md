@@ -99,6 +99,38 @@ Then run `deadpush protect --daemon` in any repo you care about.
 
 The pre-push hook ships as a Python script + `.cmd` shim. It works from PowerShell, Command Prompt, and Git Bash. The `deadpush protect` command records the exact Python interpreter so everything works even inside virtualenvs.
 
+## Server-side enforcement (uncircumventable)
+
+The local guardian and git hooks run on the developer's (or agent's) machine, so a
+determined agent can bypass them with `git push --no-verify`, git plumbing, or by
+killing the daemon. The fix is to also enforce **off** that machine, where the agent
+has no shell. deadpush ships a `deadpush scan` command that scans a commit range (or
+whole tree) and exits non-zero on any block-level violation, plus two ways to run it:
+
+**GitHub / GitLab.com — a required status check.** Copy
+[`examples/github/deadpush.yml`](examples/github/deadpush.yml) to
+`.github/workflows/deadpush.yml`, then require the `deadpush` check under branch
+protection. A commit with secrets or dangerous code is blocked from the protected
+branch no matter what happened locally.
+
+```yaml
+- uses: harris-ahmad/deadpush/.github/actions/scan@main
+```
+
+**Self-hosted git (bare / Gitea / GitLab) — a `pre-receive` hook.** Install
+[`examples/server-side/pre-receive`](examples/server-side/pre-receive) on the server;
+it rejects the entire push if any incoming commit has a violation. Full instructions:
+[`docs/server-side/pre-receive.md`](docs/server-side/pre-receive.md).
+
+```bash
+deadpush scan --base "$BASE_SHA" --head "$HEAD_SHA"   # a PR / push range
+deadpush scan --all                                    # whole tree at HEAD
+```
+
+This is the only layer a same-UID agent cannot bypass. Use it together with local
+protection (and `--hardened` for an unkillable local guardian). See
+[SECURITY.md](SECURITY.md) for the full threat model.
+
 ## Development
 
 ```bash

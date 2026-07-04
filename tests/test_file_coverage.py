@@ -46,6 +46,12 @@ SKIPPED = [
     "libfoo.so", "app.exe", "data.sqlite", "keystore.p12", "font.woff2",
     # unknown / data formats we intentionally don't scan
     "data.csv", "notes.unknownext", "table.parquet",
+    # deadpush's own state + git internals: scanning them re-flags deadpush's own
+    # feedback records (which quote caught secrets) and lets `git add -A` weaponize
+    # deadpush's logs. Even a .py/.json inside these dirs must be skipped.
+    ".deadpush/feedback/.env.json", ".deadpush/hooks/pre-push.sha256",
+    ".deadpush-quarantine/20200101_evil.py", ".deadpush-archive/x.json",
+    ".git/config", ".git/hooks/pre-commit", ".guardian/state.json",
 ]
 
 

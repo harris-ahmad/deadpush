@@ -23,7 +23,7 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 try:
     from watchdog.observers import Observer
@@ -1212,6 +1212,11 @@ class GuardianHandler(FileSystemEventHandler or object):
         # Shadow process (watching for crashes)
         self.shadow_process: subprocess.Popen | None = None
 
+        # Out-of-band commit detection (git plumbing / --no-verify bypass the hooks).
+        # We poll HEAD each loop and independently re-scan any new commit.
+        self._last_head: str | None = None
+        self._scanned_commits: set[str] = set()
+
     def _get_cooldown(self) -> float:
         """Dynamic cooldown based on safety score.
 
@@ -1326,6 +1331,171 @@ class GuardianHandler(FileSystemEventHandler or object):
                 self.logger.info(f"Reinstalled hooks: {', '.join(repaired)}")
         except Exception as e:
             self.logger.debug(f"Hook integrity check skipped: {e}")
+
+    # ------------------------------------------------------------------
+    # Out-of-band commit detection (git plumbing / --no-verify bypass)
+    # ------------------------------------------------------------------
+    def _git_head(self) -> str | None:
+        """Current HEAD commit sha, or None (unborn branch / not a repo)."""
+        try:
+            r = subprocess.run(
+                ["git", "rev-parse", "--verify", "--quiet", "HEAD"],
+                capture_output=True, text=True, timeout=5, cwd=self.config.repo_root,
+            )
+            return r.stdout.strip() or None
+        except Exception:
+            return None
+
+    def _check_head_commit(self) -> None:
+        """Detect commits that bypassed the hooks and re-enforce on them.
+
+        The pre-commit/pre-push hooks only fire for git *porcelain*; `git commit-tree`
+        + `git update-ref` (and `git commit --no-verify`) advance HEAD with no hook,
+        and nothing else watches HEAD. Polling it here is the one commit-time layer a
+        same-UID agent cannot dodge by choosing a different git command. Every new
+        commit is re-scanned with the same enforcement kernel; because a hook-approved
+        commit never carries block-level violations, any commit that reaches HEAD *with*
+        them must have bypassed the hooks — so it is handled as an out-of-band bypass.
+        """
+        try:
+            head = self._git_head()
+            if not head:
+                return
+            if self._last_head is None:
+                # First observation: adopt current HEAD as baseline; don't rescan history.
+                self._last_head = head
+                return
+            if head == self._last_head or head in self._scanned_commits:
+                return
+            prev = self._last_head
+            self._scanned_commits.add(head)
+            self._last_head = head
+            self._inspect_commit(head, prev)
+        except Exception as e:
+            self.logger.debug(f"HEAD check error: {e}")
+
+    def _commit_changed_paths(self, sha: str) -> list[str]:
+        """Paths introduced/modified by a commit (root commits handled via --root)."""
+        try:
+            r = subprocess.run(
+                ["git", "diff-tree", "--no-commit-id", "--name-only", "-r", "--root", sha],
+                capture_output=True, text=True, timeout=15, cwd=self.config.repo_root,
+            )
+            if r.returncode != 0:
+                return []
+            return [ln.strip() for ln in r.stdout.splitlines() if ln.strip()]
+        except Exception:
+            return []
+
+    def _git_show_at(self, sha: str, rel: str) -> str | None:
+        try:
+            r = subprocess.run(
+                ["git", "show", f"{sha}:{rel}"],
+                capture_output=True, text=True, timeout=5, cwd=self.config.repo_root,
+            )
+            return r.stdout if r.returncode == 0 else None
+        except Exception:
+            return None
+
+    def _scan_commit(self, sha: str) -> dict[str, Any]:
+        """{rel_path: GuardrailResult} for files in a commit with BLOCK-level violations."""
+        from .intercept import enforce_content, is_enforceable_path
+        from .rules import RuntimeConfig
+
+        runtime = RuntimeConfig(self.config.repo_root)
+        offending: dict[str, Any] = {}
+        for rel in self._commit_changed_paths(sha):
+            if not is_enforceable_path(rel):
+                continue
+            content = self._git_show_at(sha, rel)
+            if content is None:
+                continue
+            try:
+                result = enforce_content(rel, content, self.config, runtime)
+            except Exception:
+                continue
+            if not result.allowed:
+                offending[rel] = result
+        return offending
+
+    def _is_linear_child(self, sha: str, prev: str) -> bool:
+        """True when `sha` is a single-parent commit directly on top of `prev`, so
+        `git reset --soft prev` cleanly undoes exactly it (and nothing else)."""
+        try:
+            r = subprocess.run(
+                ["git", "rev-list", "--parents", "-n", "1", sha],
+                capture_output=True, text=True, timeout=5, cwd=self.config.repo_root,
+            )
+            if r.returncode != 0:
+                return False
+            parts = r.stdout.split()  # "<sha> <parent1> [<parent2> ...]"
+            return len(parts) == 2 and parts[1] == prev
+        except Exception:
+            return False
+
+    def _reset_soft(self, target: str) -> bool:
+        """Undo the tip commit non-destructively (all changes stay staged)."""
+        try:
+            r = subprocess.run(
+                ["git", "reset", "--soft", target],
+                capture_output=True, text=True, timeout=10, cwd=self.config.repo_root,
+            )
+            return r.returncode == 0
+        except Exception:
+            return False
+
+    def _inspect_commit(self, sha: str, prev: str) -> None:
+        """Re-enforce a newly observed commit; act if it bypassed the hooks."""
+        offending = self._scan_commit(sha)
+        if not offending:
+            return
+
+        n_viol = sum(len(r.violations) for r in offending.values())
+        top = next(iter(offending.values())).violations[0].description
+        self.logger.critical(
+            f"OUT-OF-BAND COMMIT {sha[:8]} bypassed git hooks: "
+            f"{n_viol} block-level violation(s) in {len(offending)} file(s) — top: {top}"
+        )
+        score = self.safety_score.report_incident(
+            min(50, 10 * len(offending)),
+            f"Out-of-band commit {sha[:8]} bypassed hooks ({n_viol} violations)",
+            sha,
+        )
+
+        # Undo the sneaky commit when it is a clean linear advance: `git reset --soft`
+        # keeps every change staged, so nothing is lost — the payload is quarantined
+        # out of the worktree/index below. Non-linear moves (merge/rebase/pull/reset)
+        # are quarantined + alerted but never auto-rewound (too destructive to assume).
+        reverted = False
+        if self._is_linear_child(sha, prev):
+            reverted = self._reset_soft(prev)
+            if reverted:
+                self._last_head = prev
+                self._scanned_commits.add(prev)
+                self.logger.warning(
+                    f"Reverted out-of-band commit {sha[:8]} (git reset --soft {prev[:8]})"
+                )
+
+        # HEAD is now back at the parent; quarantine each payload file and restore the
+        # safe version — the same path a real-time block takes.
+        for rel, result in offending.items():
+            path = self.config.repo_root / rel
+            try:
+                self._quarantine_and_restore(path, rel, result)
+            except Exception as e:
+                self.logger.error(f"Failed to quarantine out-of-band file {rel}: {e}")
+
+        try:
+            self.session_mgr.record_incident({
+                "type": "out_of_band_commit",
+                "commit": sha,
+                "reverted": reverted,
+                "files": list(offending.keys()),
+                "score": score,
+            })
+            self.session_mgr.update_safety_score(score)
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # MCP suspension (disables agent's MCP access when score is critical)
@@ -1920,6 +2090,23 @@ def run_guardian(intervention: bool = True, daemon: bool = False, strict: bool =
         logger.error("Could not acquire lock. Another instance may be running.")
         return
 
+    # A clean stop removes the PID/start files (DaemonManager.cleanup on graceful
+    # SIGTERM / `deadpush stop`). If they are still here while the daemon is not
+    # running, the previous instance was killed or crashed — surface it loudly so a
+    # same-UID agent killing the guardian in soft mode is visible, not silent.
+    try:
+        prior_unclean = pidfile.exists() or daemon_mgr.startfile.exists()
+    except Exception:
+        prior_unclean = False
+
+    def _note_unclean_restart(h) -> None:
+        if not prior_unclean:
+            return
+        try:
+            h.session_mgr.record_incident({"type": "guardian_unclean_restart"})
+        except Exception:
+            pass
+
     # Shadow process (re-spawns guardian if it crashes) is started post-fork in
     # the child so it runs in a new session, immune to fork issues.
     # Not needed in hardened mode — launchd handles restart via KeepAlive.
@@ -1976,10 +2163,18 @@ def run_guardian(intervention: bool = True, daemon: bool = False, strict: bool =
                 except OSError:
                     pass
 
+            if prior_unclean:
+                logger.warning(
+                    "GUARDIAN RESTART (possible tamper): a previous guardian did not shut "
+                    "down cleanly (stale PID file present). If you did not stop it, an agent "
+                    "or process may have killed it. Soft mode cannot prevent a same-UID kill "
+                    "— use hardened mode for an unkillable guardian."
+                )
             daemon_mgr.write_pid(config.repo_root)
             atexit.register(daemon_mgr.cleanup)
 
             handler = GuardianHandler(config, intervention=intervention, strict_mode=strict, daemon=daemon, logger=logger, hardened=hardened)
+            _note_unclean_restart(handler)
             _control_token = _load_or_create_control_token(config.repo_root, hardened)
             control_server = GuardianControlServer(handler, repo_root=config.repo_root, hardened=hardened, token=_control_token)
 
@@ -1996,10 +2191,17 @@ def run_guardian(intervention: bool = True, daemon: bool = False, strict: bool =
             daemon_mgr.cleanup()
     else:
         logger.info("Starting in FOREGROUND mode...")
+        if prior_unclean:
+            logger.warning(
+                "GUARDIAN RESTART (possible tamper): a previous guardian did not shut "
+                "down cleanly (stale PID file present). If you did not stop it, an agent "
+                "or process may have killed it."
+            )
         daemon_mgr.write_pid(config.repo_root)
         atexit.register(daemon_mgr.cleanup)
 
         handler = GuardianHandler(config, intervention=intervention, strict_mode=strict, daemon=daemon, logger=logger, hardened=hardened)
+        _note_unclean_restart(handler)
         _control_token = _load_or_create_control_token(config.repo_root, hardened)
         control_server = GuardianControlServer(handler, repo_root=config.repo_root, hardened=hardened, token=_control_token)
 
@@ -2092,6 +2294,7 @@ def _run_observer(handler: GuardianHandler, logger, daemon_mgr: DaemonManager | 
                 handler._check_shadow()
                 handler._check_suspension()
                 handler._check_hook_integrity()
+                handler._check_head_commit()
                 time.sleep(1)
             except Exception as e:
                 if not running:
@@ -2402,6 +2605,45 @@ def guardian_is_running(repo_root: Path, hardened: bool = False) -> bool:
     except Exception:
         pass
     return False
+
+
+def guardian_persistence_installed(repo_root: Path, hardened: bool = False) -> bool:
+    """True when the guardian is set up to run persistently (launchd/systemd) or the
+    repo is marked protected — i.e. it *should* be running. Used to distinguish
+    'never installed' from 'installed but not running (possible tamper)'."""
+    try:
+        if _scoped_plist_path(repo_root, hardened).exists():
+            return True
+    except Exception:
+        pass
+    try:
+        if _scoped_systemd_unit_path(repo_root, hardened).exists():
+            return True
+    except Exception:
+        pass
+    try:
+        from .config import install_marker_path
+        if install_marker_path(repo_root).exists():
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def guardian_killed_uncleanly(repo_root: Path, hardened: bool = False) -> bool:
+    """True when a stale PID/start file remains but the guardian is not running.
+
+    A clean stop (`deadpush stop` / graceful SIGTERM) removes these files via
+    DaemonManager.cleanup(), so their presence while nothing is alive is evidence
+    the daemon was killed or crashed rather than stopped intentionally.
+    """
+    if guardian_is_running(repo_root, hardened):
+        return False
+    pidfile = _scoped_pidfile(repo_root, hardened)
+    try:
+        return pidfile.exists() or pidfile.with_suffix(".start").exists()
+    except Exception:
+        return False
 
 
 # =============================================================================

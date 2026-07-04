@@ -1,0 +1,84 @@
+name: "deadpush scan"
+description: "Scan pushed/PR commits for block-level guardrail violations (secrets, dangerous code, LLM-context files) and fail the check on any finding."
+branding:
+  icon: "shield"
+  color: "red"
+
+inputs:
+  base:
+    description: "Base commit SHA (scans base..head). Defaults to the PR base sha / push before-sha."
+    required: false
+    default: ""
+  head:
+    description: "Head commit SHA to scan up to. Defaults to the PR head sha / triggering sha."
+    required: false
+    default: ""
+  version:
+    description: "deadpush version to install (default: latest on PyPI)."
+    required: false
+    default: ""
+  format:
+    description: "Output format: text or json."
+    required: false
+    default: "text"
+  python-version:
+    description: "Python version used to run deadpush."
+    required: false
+    default: "3.12"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ inputs.python-version }}
+
+    - name: Install deadpush
+      shell: bash
+      run: |
+        if [ -n "${{ inputs.version }}" ]; then
+          python -m pip install --upgrade "deadpush==${{ inputs.version }}"
+        else
+          python -m pip install --upgrade deadpush
+        fi
+
+    - name: Resolve commit range
+      id: range
+      shell: bash
+      run: |
+        BASE="${{ inputs.base }}"
+        HEAD="${{ inputs.head }}"
+        if [ -z "$HEAD" ]; then
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            HEAD="${{ github.event.pull_request.head.sha }}"
+          else
+            HEAD="${{ github.sha }}"
+          fi
+        fi
+        if [ -z "$BASE" ]; then
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE="${{ github.event.pull_request.base.sha }}"
+          else
+            BASE="${{ github.event.before }}"
+          fi
+        fi
+        echo "base=$BASE" >> "$GITHUB_OUTPUT"
+        echo "head=$HEAD" >> "$GITHUB_OUTPUT"
+
+    - name: Run deadpush scan
+      shell: bash
+      run: |
+        BASE="${{ steps.range.outputs.base }}"
+        HEAD="${{ steps.range.outputs.head }}"
+        ZERO="0000000000000000000000000000000000000000"
+        # A missing/zero base (first push of a branch, or a force-created ref) has no
+        # trustworthy boundary, so scan the whole tree at HEAD (poison-proof, matches
+        # deadpush's pre-push behaviour for new branches).
+        if [ -z "$BASE" ] || [ "$BASE" = "$ZERO" ]; then
+          echo "No trustworthy base sha; scanning the entire tree at $HEAD"
+          deadpush scan --all --ref "$HEAD" --format "${{ inputs.format }}"
+        else
+          echo "Scanning range $BASE..$HEAD"
+          deadpush scan --base "$BASE" --head "$HEAD" --format "${{ inputs.format }}"
+        fi

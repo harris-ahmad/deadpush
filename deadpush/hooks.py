@@ -117,7 +117,11 @@ def _is_immutable(path: Path) -> bool:
 GUARDIAN_IGNORE_PATTERNS = {
     "claude.md", ".cursorrules", ".claude_instructions", ".copilot-instructions.md",
     "windsurf_rules.md", "agents.md", "llm_context.txt", "ai_prompt.md",
-    ".deadpush-autoignore", ".deadpush-quarantine/", ".deadpush-archive/",
+    # deadpush's own state must never be committed — otherwise `git add -A` sweeps in
+    # feedback records (which quote the secrets deadpush caught) and the hooks then
+    # flag deadpush's own logs instead of the real payload.
+    ".deadpush/", ".deadpush-autoignore", ".deadpush-quarantine/", ".deadpush-archive/",
+    ".deadpush-config-backups/",
     "**/scratch*.md", "**/temp*.py", "**/tmp*.go", "**/playground.*",
     "node_modules/", "__pycache__/", ".venv/", "venv/", "target/", "dist/",
 }
@@ -612,6 +616,86 @@ def run_prepush_guardrails(repo_root: Path) -> tuple[bool, list[dict[str, Any]]]
         return False, violations
 
     return True, []
+
+
+# =============================================================================
+# Shared scan engine — used by `deadpush scan` (CI / GitHub Actions) and the
+# server-side pre-receive hook. Both are enforcement layers that run OFF the
+# agent's machine, so `--no-verify`, git plumbing, or killing the local daemon
+# cannot bypass them. They reuse the exact same kernel as the local hooks.
+# =============================================================================
+
+def scan_range(repo_root: Path, base_sha: str, head_sha: str) -> list[dict[str, Any]]:
+    """Block-level violations for the files a `base_sha..head_sha` range introduces.
+
+    A zero/empty ``base_sha`` (or the empty-tree sha) means "no trustworthy
+    boundary" (e.g. a brand-new branch), so the entire pushed tree at ``head_sha``
+    is scanned — the same poison-proof behaviour as the D4 pre-push fix.
+    """
+    changed = scan_range_paths(repo_root, base_sha, head_sha)
+    return _enforce_git_paths(repo_root, changed, git_ref=head_sha)
+
+
+def scan_tree(repo_root: Path, ref: str = "HEAD") -> list[dict[str, Any]]:
+    """Block-level violations for every enforceable file in ``ref``'s tree."""
+    changed = _git_name_only(repo_root, _EMPTY_TREE_SHA, ref)
+    return _enforce_git_paths(repo_root, changed, git_ref=ref)
+
+
+def run_prereceive_guardrails(repo_root: Path) -> tuple[bool, list[dict[str, Any]]]:
+    """Server-side enforcement, called by a git ``pre-receive`` hook.
+
+    Reads pre-receive stdin (``<old-value> SP <new-value> SP <ref-name>`` per ref)
+    — note this differs from pre-push's stdin format and ordering — and rejects the
+    whole push if any incoming commit carries block-level violations.
+
+    ``old-value`` is the server's current tip for the ref (a trustworthy boundary
+    the pushing client cannot forge, unlike local ``refs/remotes/*``), so we diff
+    ``old..new``. A new ref has an all-zeros ``old-value`` and is whole-tree scanned.
+    At pre-receive time the incoming objects are already in the repo's quarantine
+    and reachable by sha, so ``git show <new>:<path>`` works in the bare repo.
+    """
+    import sys
+
+    violations: list[dict[str, Any]] = []
+    lines = sys.stdin.read().strip().splitlines()
+    if not lines:
+        return True, []
+
+    seen: set[tuple[str, str]] = set()
+    for line in lines:
+        parts = line.strip().split()
+        if len(parts) < 3:
+            continue
+        old_sha, new_sha = parts[0], parts[1]
+        # Deleting a ref pushes an all-zeros new-value: nothing to scan.
+        if new_sha == _ZERO_SHA:
+            continue
+
+        for rel_path in scan_range_paths(repo_root, old_sha, new_sha):
+            key = (new_sha, rel_path)
+            if key in seen:
+                continue
+            seen.add(key)
+            violations.extend(_enforce_git_paths(repo_root, [rel_path], git_ref=new_sha))
+
+    if violations:
+        _print_violations(
+            f"deadpush — Pre-receive guardrails REJECTED this push: {len(violations)} violation(s) in incoming commits:",
+            violations,
+            "The push was rejected by the server. Remove the flagged content and push again.",
+        )
+        return False, violations
+
+    return True, []
+
+
+def scan_range_paths(repo_root: Path, base_sha: str, head_sha: str) -> list[str]:
+    """The enforceable paths a `base_sha..head_sha` range introduces (no scanning)."""
+    base = (base_sha or "").strip()
+    if not base or base == _ZERO_SHA:
+        base = _ZERO_SHA
+    return _prepush_changed_paths(repo_root, head_sha, base)
 
 
 def _hookspath_value(repo_root: Path) -> str | None:

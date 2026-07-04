@@ -7,6 +7,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.4] - 2026-07-04
+
+### Added
+
+- **Server-side enforcement — the one layer a same-UID agent cannot bypass locally.**
+  The local hooks and guardian run on the developer's machine, so `--no-verify`, git
+  plumbing, or killing the daemon can evade them. These run the same enforcement
+  kernel OFF that machine:
+  - `deadpush scan --base <sha> --head <sha>` / `deadpush scan --all` scans a commit
+    range (or whole tree) and exits non-zero on any block-level violation. New refs
+    (zero base) are whole-tree scanned so the boundary cannot be poisoned.
+  - A GitHub Actions check: [`examples/github/deadpush.yml`](examples/github/deadpush.yml)
+    plus a reusable composite action (`.github/actions/scan`). Make it a required
+    status check via branch protection to keep violating commits off a protected branch.
+  - A `pre-receive` hook for self-hosted git (bare / Gitea / GitLab):
+    `deadpush hooks run-prereceive` with
+    [`examples/server-side/pre-receive`](examples/server-side/pre-receive) and
+    [`docs/server-side/pre-receive.md`](docs/server-side/pre-receive.md). Rejects the
+    whole push server-side.
+  Covered by `tests/test_scan_command.py` and `tests/test_prereceive.py`.
+
+### Security
+
+- **Daemon-kill visibility (soft mode).** Soft mode cannot stop a same-UID agent from
+  killing the daemon, but it no longer does so silently: a clean stop removes the PID
+  file, so a stale PID file with no live process is treated as a kill/crash. The
+  guardian logs a possible-tamper restart, and `deadpush status` / `deadpush doctor`
+  now distinguish "killed/crashed" and "installed but not running" from a clean stop,
+  pointing you to restart (or to hardened mode / the server-side check). Covered by
+  `tests/test_tamper_visibility.py`.
+- **Guardian now catches out-of-band commits (git plumbing / `--no-verify`)**: git
+  hooks only fire for *porcelain*, so `git commit-tree` + `git update-ref` (and
+  `git commit --no-verify`) advance HEAD with no hook — an adversarial agent used
+  exactly this to slip a payload past the pre-commit guardrails. The daemon now
+  polls HEAD each loop and independently re-enforces every new commit with the same
+  kernel the hooks use. Because a hook-approved commit never carries block-level
+  violations, any commit that reaches HEAD *with* them must have bypassed the hooks:
+  it is quarantined, drops the safety score, and — for a clean single-parent commit —
+  is undone with `git reset --soft` back to the parent (non-destructive; the changes
+  stay staged, then the payload is quarantined out of the tree/index). Merge/rebase/
+  pull/reset moves are quarantined + alerted but never auto-rewound. Covered by
+  `tests/test_out_of_band_commit.py`. (Soft mode still can't survive an agent that
+  kills the daemon first — that remains hardened mode's job.)
+
+### Fixed
+
+- **deadpush no longer scans (or lets you commit) its own state dir**: `.deadpush/`
+  was not in the guardian ignore set, so `git add -A` swept in deadpush's own
+  feedback records (which quote the very secrets it caught) and the hooks then
+  flagged deadpush's *own logs* instead of the real payload. `.deadpush/` (and git
+  internals) are now excluded from content scanning via `is_enforceable_path`, and
+  `.deadpush/` + `.deadpush-config-backups/` are added to the generated ignore
+  files. Covered by `tests/test_file_coverage.py`.
+
 ## [0.2.3] - 2026-07-04
 
 ### Fixed
