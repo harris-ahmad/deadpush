@@ -7,9 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.2.1] - 2026-07-04
+## [0.2.2] - 2026-07-04
 
-First public release on PyPI. The project stays on a 0.2.x beta line until the
+First public release on PyPI (`0.2.1` was burned by PyPI's deleted-filename
+reuse rule and skipped). The project stays on a 0.2.x beta line until the
 production-readiness gates (blocking lint, lockfiled reproducible builds, and
 green macOS + Linux CI including the lifecycle integration test) are met.
 
