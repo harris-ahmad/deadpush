@@ -171,7 +171,7 @@ def _enforce_git_paths(
     """Run unified enforcement on files at a git ref."""
     import subprocess
     from .config import load_config
-    from .intercept import enforce_content, violations_from_result, _ENFORCEABLE_EXTENSIONS
+    from .intercept import enforce_content, violations_from_result, is_enforceable_path
     from .rules import RuntimeConfig
 
     config = load_config(explicit_root=repo_root)
@@ -179,8 +179,7 @@ def _enforce_git_paths(
     violations: list[dict[str, Any]] = []
 
     for rel_path in paths:
-        ext = Path(rel_path).suffix.lower()
-        if ext not in _ENFORCEABLE_EXTENSIONS:
+        if not is_enforceable_path(rel_path):
             continue
         try:
             show_ref = f":{rel_path}" if git_ref == ":" else f"{git_ref}:{rel_path}"
@@ -548,67 +547,26 @@ def _git_name_only(repo_root: Path, *args: str) -> list[str]:
         return []
 
 
-def _prepush_new_ref_base(repo_root: Path, local_sha: str) -> str | None:
-    """Boundary commit for a brand-new ref push (remote side all-zeros).
-
-    Returns the commit already present on the remote that the newly-introduced
-    commits branch off from (suitable for a ``base..local_sha`` diff), or ``None``
-    when the pushed ref shares no history with any remote-tracking branch (first
-    push / disjoint history) — the caller then scans the entire pushed tree.
-    """
-    try:
-        # Commits reachable from local_sha but not from any remote-tracking ref:
-        # exactly the commits this push would introduce to the remote.
-        rv = subprocess.run(
-            ["git", "rev-list", "--reverse", "--topo-order", local_sha, "--not", "--remotes"],
-            capture_output=True, text=True, check=False, timeout=15,
-            cwd=repo_root,
-        )
-        if rv.returncode != 0:
-            return None
-        new_commits = [c for c in rv.stdout.split() if c]
-    except Exception:
-        return None
-
-    if not new_commits:
-        # No commits are new relative to remotes (or there are no remotes at all).
-        # Fall back to a whole-tree scan so a new ref is never let through unscanned.
-        return None
-
-    oldest = new_commits[0]
-    try:
-        # The parent of the oldest introduced commit is the boundary already on
-        # the remote. A root commit has no parent -> signal whole-tree scan.
-        parent = subprocess.run(
-            ["git", "rev-parse", "--verify", "--quiet", f"{oldest}^"],
-            capture_output=True, text=True, check=False, timeout=5,
-            cwd=repo_root,
-        )
-        base = parent.stdout.strip()
-        return base or None
-    except Exception:
-        return None
-
-
 def _prepush_changed_paths(repo_root: Path, local_sha: str, remote_sha: str) -> list[str]:
     """Resolve the files a single pre-push ref update introduces.
 
-    - Update to an existing branch: diff ``remote_sha..local_sha``.
-    - New branch/ref (remote all-zeros): diff from the boundary commit already on
-      the remote up to ``local_sha``; if the ref shares no history with any remote,
-      scan the entire pushed tree.
+    - Update to an existing branch: diff ``remote_sha..local_sha``. ``remote_sha``
+      comes from git's own push negotiation with the real remote (delivered on the
+      hook's stdin), so it is a trustworthy boundary.
+    - New branch/ref (remote all-zeros): scan the ENTIRE pushed tree
+      (``empty-tree..local_sha``).
 
-    The new-ref path closes a real gap: previously a new branch used ``local_sha``
-    as the whole diff spec, which made ``git diff`` compare the *working tree*
-    against ``local_sha`` and (on a clean tree) scan nothing — so pushing a brand
-    new branch bypassed content enforcement entirely.
+    Why the whole tree for a new ref: git offers no trustworthy boundary
+    (``remote_sha`` is all-zeros), and we must NOT derive one from local
+    remote-tracking refs (``refs/remotes/*``). Those are writable by a same-UID
+    agent, so a forged ``refs/remotes/x/y`` pointing at the payload commit would
+    make git treat the dangerous content as "already on the remote" and shrink the
+    scanned diff to exclude it — while ``git push`` still ships those commits. A
+    whole-tree scan cannot be poisoned this way. (Costs a full-tree scan on the
+    first push of a branch; subsequent updates use the cheap ``remote_sha`` range.)
     """
     if remote_sha != _ZERO_SHA:
         return _git_name_only(repo_root, f"{remote_sha}..{local_sha}")
-
-    base = _prepush_new_ref_base(repo_root, local_sha)
-    if base:
-        return _git_name_only(repo_root, base, local_sha)
     return _git_name_only(repo_root, _EMPTY_TREE_SHA, local_sha)
 
 

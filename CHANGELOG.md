@@ -54,6 +54,17 @@ end-to-end by `scripts/hardened_qa.sh`.
   not listable and secret files (the control token) remain `0600`.
 
 ### Added
+- **Real-time move/delete handling**: the watchdog guardian only handled
+  `on_created`/`on_modified`, so an agent could evade the real-time layer by
+  moving un-scanned content into place (stage a payload in a skipped dir like
+  `node_modules/` then `mv` it in, or rename a benign file onto a dangerous
+  path/name). `on_moved` now evaluates the destination exactly like a fresh
+  write (dangerous content is quarantined). `on_deleted` records forensic
+  telemetry (log + session incident) but is deliberately non-punitive — it does
+  not auto-restore or dock the safety score, since the score never recovers and
+  a legitimate multi-file `git rm`/refactor would otherwise false-trigger
+  lockdown; tracked files remain recoverable from git history. Covered by
+  `tests/test_move_delete_events.py`.
 - **Fail-closed git hooks**: once a repo is protected (a `.deadpush/installed`
   marker is written), the installed hooks refuse to run when the deadpush
   interpreter goes missing, instead of silently allowing the push/commit.
@@ -90,6 +101,17 @@ end-to-end by `scripts/hardened_qa.sh`.
   `tests/test_root_immutable.py`.
 
 ### Fixed
+- **Pre-push new-branch range can no longer be poisoned (D4)**: for a brand-new
+  branch (remote side all-zeros) the hook derived the scan boundary from
+  `git rev-list … --not --remotes`, trusting local `refs/remotes/*`. Those refs are
+  writable by a same-UID agent, so forging `refs/remotes/x/y` at the payload commit
+  made git treat the dangerous content as "already on the remote" and shrank the
+  scanned diff to exclude it — while `git push` still shipped those commits. New
+  refs now always scan the entire pushed tree (`empty-tree..local_sha`), which
+  cannot be poisoned by local refs; existing-branch updates keep using the
+  trustworthy `remote_sha` git supplies from the real push negotiation. Covered by
+  `tests/test_prepush_newbranch.py`
+  (`test_new_branch_push_cannot_be_poisoned_by_fake_remote_ref`).
 - **Uninstall leaves the repo pristine**: cleanup only removed an empty
   `.guardian`, leaving behind empty `.deadpush` (e.g. `.deadpush/feedback/`) and
   `.deadpush-quarantine` directories. It now prunes deadpush's own now-empty
@@ -114,6 +136,16 @@ end-to-end by `scripts/hardened_qa.sh`.
   `tests/test_hardened.py::TestTeardownHardenedEnvironment`.
 
 ### Changed
+- **Wider git-hook file coverage**: the pre-commit/pre-push/post-commit hooks
+  gated content scanning on a small extension allowlist (~18 types), so an agent
+  could commit dangerous content in files the hooks never read — extensionless
+  and config files such as `Dockerfile`, `Makefile`, `.env`, `.npmrc`, shell
+  rc-files, and LLM-context files like `.cursorrules` / `.claude_instructions`
+  (the watchdog daemon already scanned these; the hooks did not). A shared
+  `is_enforceable_path()` now mirrors the daemon's coverage: a much wider set of
+  code/config/infra/text extensions plus sensitive-by-name and `.env*` /
+  `Dockerfile*` files, while binary formats (images, archives, compiled objects,
+  keystores) are always skipped. Covered by `tests/test_file_coverage.py`.
 - **Robust hook/daemon entrypoint**: generated hooks, the launchd/systemd units,
   and the shadow respawn command now launch via `deadpush_bootstrap` instead of
   `-m deadpush.cli`, so they work in editable installs where macOS hides the

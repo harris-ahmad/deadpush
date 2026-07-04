@@ -1237,6 +1237,30 @@ class GuardianHandler(FileSystemEventHandler or object):
             return
         self._evaluate(Path(event.src_path), event_type="modified")
 
+    def on_moved(self, event):
+        # A rename/move can drop UN-SCANNED content into the repo: e.g. stage a
+        # payload in a skipped dir (node_modules/.git) then `mv` it into place, or
+        # rename a benign file onto a dangerous path/name. on_created/on_modified
+        # never fire for the destination, so evaluate it exactly like a fresh write.
+        if event.is_directory:
+            return
+        dest = getattr(event, "dest_path", None)
+        if not dest:
+            return
+        self._evaluate(Path(dest), event_type="moved")
+
+    def on_deleted(self, event):
+        # A deleted file's bytes are already gone (nothing to quarantine), and
+        # auto-restoring would fight legitimate refactors/`git rm`. Because the
+        # safety score never recovers and has a burst multiplier, penalizing every
+        # delete would false-trigger lockdown during normal multi-file deletes.
+        # So treat rm as forensic telemetry only: log it + record a session
+        # incident, without touching the safety score. Tracked files remain
+        # recoverable from git history.
+        if event.is_directory:
+            return
+        self._handle_deletion(Path(event.src_path))
+
     # ------------------------------------------------------------------
     # Shadow process lifecycle
     # ------------------------------------------------------------------
@@ -1455,6 +1479,44 @@ class GuardianHandler(FileSystemEventHandler or object):
                 except Exception as e:
                     self.logger.debug(f"Pending event error on {p}: {e}")
                 time.sleep(0.01)  # Brief yield between batch items
+
+    @staticmethod
+    def _looks_transient(name: str) -> bool:
+        """True for editor/tool scratch files whose deletion is normal churn."""
+        n = name.lower()
+        if n == ".ds_store":
+            return True
+        if n.startswith(".#") or n.startswith("~$"):
+            return True
+        if n.isdigit():  # vim's numbered write-test files (e.g. 4913)
+            return True
+        return n.endswith((".tmp", ".temp", ".swp", ".swx", ".swo", "~", ".bak", ".orig"))
+
+    def _handle_deletion(self, path: Path):
+        """Record a deletion as forensic telemetry (see on_deleted for rationale).
+
+        Deliberately non-punitive: no quarantine (nothing to quarantine) and no
+        safety-score change (would false-trigger lockdown on legitimate refactors).
+        """
+        try:
+            skip_names = {"__pycache__", ".git", "node_modules", ".deadpush",
+                          ".deadpush-quarantine", ".deadpush-archive",
+                          ".deadpush-config-backups"}
+            if any(part in skip_names for part in path.parts):
+                return
+            if self._looks_transient(path.name):
+                return
+            try:
+                rel = path.relative_to(self.config.repo_root).as_posix()
+            except (ValueError, Exception):
+                return
+            self.logger.info(f"DELETE {rel} (recorded; not restored)")
+            try:
+                self.session_mgr.record_incident({"type": "file_deleted", "file": rel})
+            except Exception:
+                pass
+        except Exception as e:
+            self.logger.debug(f"Deletion handling error on {path}: {e}")
 
     def _process_event(self, path: Path, event_type: str):
         """Core single-event evaluation pipeline."""

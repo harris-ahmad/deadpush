@@ -390,9 +390,79 @@ def _apply_guardrail_level(result: GuardrailResult, violations: list[Violation],
 
 
 _ENFORCEABLE_EXTENSIONS = frozenset({
-    ".py", ".js", ".ts", ".jsx", ".tsx", ".rs", ".go", ".java", ".rb", ".php",
-    ".sh", ".bash", ".yaml", ".yml", ".json", ".toml", ".md",
+    # Scripting / application code
+    ".py", ".pyw", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".vue", ".svelte",
+    ".rb", ".php", ".pl", ".pm", ".lua", ".r", ".dart", ".go", ".rs", ".java",
+    ".kt", ".kts", ".scala", ".groovy", ".clj", ".cljs", ".ex", ".exs", ".erl",
+    ".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".hh", ".m", ".mm", ".cs", ".swift",
+    # Shells / automation
+    ".sh", ".bash", ".zsh", ".fish", ".ps1", ".psm1", ".bat", ".cmd",
+    ".mk", ".cmake", ".gradle", ".sql", ".graphql", ".proto",
+    # Config / infra as code (prime spots for injected commands & secrets)
+    ".yaml", ".yml", ".json", ".json5", ".toml", ".ini", ".cfg", ".conf", ".config",
+    ".properties", ".xml", ".plist", ".tf", ".tfvars", ".hcl", ".nix", ".dockerfile",
+    ".service", ".env",
+    # Docs / text (prompt injection, exfil instructions, pasted secrets)
+    ".md", ".markdown", ".mdx", ".rst", ".txt",
+    # Credential-bearing text formats (detect a committed key/cert)
+    ".pem", ".crt", ".cer", ".key", ".pub", ".asc",
 })
+
+# Binary / non-text formats: never worth reading for content checks, and can be
+# large. Excluded even if some odd extension collision would otherwise match.
+_BINARY_EXTENSIONS = frozenset({
+    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".webp", ".tiff",
+    ".pdf", ".zip", ".gz", ".tar", ".tgz", ".bz2", ".xz", ".7z", ".rar",
+    ".mp3", ".mp4", ".mov", ".avi", ".mkv", ".wav", ".flac", ".ogg", ".webm",
+    ".woff", ".woff2", ".ttf", ".otf", ".eot",
+    ".so", ".dylib", ".dll", ".exe", ".bin", ".o", ".a", ".class", ".jar",
+    ".pyc", ".pyo", ".wasm", ".node",
+    ".p12", ".pfx", ".jks", ".keystore",  # binary keystores
+    ".db", ".sqlite", ".sqlite3", ".mo", ".dat",
+})
+
+# Sensitive files that carry no extension (or a misleading one). Matched on the
+# lowercased basename so hooks scan them the same way the daemon already does.
+_ENFORCEABLE_NAMES = frozenset({
+    "dockerfile", "containerfile", "makefile", "gnumakefile", "jenkinsfile",
+    "vagrantfile", "gemfile", "rakefile", "procfile", "brewfile", "justfile",
+    "taskfile", "cmakelists.txt", "berksfile", "guardfile", "capfile",
+    ".gitignore", ".gitattributes", ".gitmodules", ".dockerignore",
+    ".npmrc", ".yarnrc", ".nvmrc", ".ruby-version", ".python-version",
+    ".bashrc", ".zshrc", ".bash_profile", ".bash_aliases", ".profile",
+    ".netrc", ".pypirc", ".condarc", ".curlrc", ".wgetrc",
+    ".gitconfig", ".terraformrc", ".htaccess", ".editorconfig",
+})
+
+
+def is_enforceable_path(rel_path: str) -> bool:
+    """Whether a path should be content-scanned by the git hooks.
+
+    The watchdog daemon already scans every write; this mirrors that coverage on
+    the git-hook side, which previously gated purely on a small extension set and
+    so silently skipped extensionless/config files an agent can abuse (Dockerfile,
+    Makefile, .env, .npmrc, CI shell configs, and LLM-context files like
+    .cursorrules / .claude_instructions). Binary formats are always excluded.
+    """
+    name = Path(rel_path).name
+    lower = name.lower()
+    suffix = Path(rel_path).suffix.lower()
+
+    if suffix in _BINARY_EXTENSIONS:
+        return False
+    if suffix in _ENFORCEABLE_EXTENSIONS:
+        return True
+    if lower in _ENFORCEABLE_NAMES:
+        return True
+    # `.env`, `.env.local`, `.env.production`, ... and Dockerfile variants
+    # (`Dockerfile.prod`, `app.dockerfile`).
+    if lower.startswith(".env") or lower.startswith("dockerfile") or lower.endswith(".dockerfile"):
+        return True
+    # Known LLM/AI-assistant context files (many are extensionless).
+    from .debris import LLM_CONTEXT_FILES
+    if lower in LLM_CONTEXT_FILES:
+        return True
+    return False
 
 
 def enforce_content(
