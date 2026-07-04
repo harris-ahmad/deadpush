@@ -56,6 +56,9 @@ end-to-end by `scripts/hardened_qa.sh`.
   not listable and secret files (the control token) remain `0600`.
 
 ### Added
+- **`SECURITY.md` threat model**: documents the adversary (a same-UID AI agent),
+  the soft-vs-hardened guarantees, the inherent limits of heuristic detection, and
+  private vulnerability reporting.
 - **Real-time move/delete handling**: the watchdog guardian only handled
   `on_created`/`on_modified`, so an agent could evade the real-time layer by
   moving un-scanned content into place (stage a payload in a skipped dir like
