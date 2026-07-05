@@ -52,12 +52,18 @@ def main():
 @click.option("--strict", is_flag=True, help="Enable strict intervention mode")
 @click.option("--soft", is_flag=True, help="Run as your own UID (this is the default)")
 @click.option("--hardened", is_flag=True, help="Opt into hardened mode: run under a root-owned _deadpush user (requires sudo)")
-def cmd_guard(repo, no_intervention, daemon, strict, soft, hardened):
+@click.option(
+    "--allow-self-protect",
+    is_flag=True,
+    help="Allow a persistent guardian on the deadpush source repo (not recommended)",
+)
+def cmd_guard(repo, no_intervention, daemon, strict, soft, hardened, allow_self_protect):
     """
     Start the AI Agent Guardian.
 
     This is the core always-on protection while using AI coding agents.
     """
+    from .config import dev_repo_guard_refusal
     from .guard import run_guardian
     import os
     intervention = not no_intervention
@@ -68,7 +74,24 @@ def cmd_guard(repo, no_intervention, daemon, strict, soft, hardened):
     use_hardened = bool(hardened)
     if repo:
         os.chdir(Path(repo).resolve())
-    run_guardian(intervention=intervention, daemon=daemon, strict=strict, hardened=use_hardened)
+    config = load_config()
+    refusal = dev_repo_guard_refusal(
+        config.repo_root,
+        allow_self_protect=allow_self_protect,
+        persistent=bool(daemon or use_hardened),
+    )
+    if refusal:
+        print_error(refusal.split("\n")[0])
+        for line in refusal.split("\n")[1:]:
+            print(line)
+        raise SystemExit(2)
+    run_guardian(
+        intervention=intervention,
+        daemon=daemon,
+        strict=strict,
+        hardened=use_hardened,
+        allow_self_protect=allow_self_protect,
+    )
 
 
 @main.command("protect")
@@ -94,19 +117,19 @@ def cmd_protect(enable, daemon, soft, hardened, allow_self_protect):
     Run this once per repo (or after major changes) then walk away.
     The guardian will monitor, score, quarantine dangerous files autonomously.
     """
-    from .config import is_guardian_dev_repo
+    from .config import dev_repo_guard_refusal
     config = load_config()
 
-    if is_guardian_dev_repo(config.repo_root) and not allow_self_protect:
-        print_error("Refusing to protect the deadpush development repository.")
-        print_error(
-            "Running protect here installs git hooks and a filesystem guardian that "
-            "will block your own commits and quarantine source files."
-        )
-        print("Test in a throwaway clone instead:")
-        print("  git clone . /tmp/deadpush-e2e && cd /tmp/deadpush-e2e && deadpush protect")
-        print("Or pass --allow-self-protect to override (not recommended).")
-        return
+    refusal = dev_repo_guard_refusal(
+        config.repo_root,
+        allow_self_protect=allow_self_protect,
+        full_setup=True,
+    )
+    if refusal:
+        print_error(refusal.split("\n")[0])
+        for line in refusal.split("\n")[1:]:
+            print(line)
+        raise SystemExit(2)
 
     start_background = bool(enable or daemon)
     if soft and hardened:
@@ -270,7 +293,13 @@ def cmd_protect(enable, daemon, soft, hardened, allow_self_protect):
             if not _bootstrapped:
                 print("  (launchd unavailable — starting guardian directly)")
                 try:
-                    run_guardian(intervention=True, daemon=True, strict=False, hardened=False)
+                    run_guardian(
+                        intervention=True,
+                        daemon=True,
+                        strict=False,
+                        hardened=False,
+                        allow_self_protect=allow_self_protect,
+                    )
                 except SystemExit:
                     # Expected: the double-fork parent exits; the daemon child lives on.
                     pass
@@ -812,15 +841,38 @@ def cmd_scan(base, head, scan_all, ref, repo, fmt):
 
 @main.command("intercept")
 @click.option("--daemon", is_flag=True, help="Run as persistent background daemon")
-def cmd_intercept(daemon):
+@click.option(
+    "--allow-self-protect",
+    is_flag=True,
+    help="Allow a persistent guardian on the deadpush source repo (not recommended)",
+)
+def cmd_intercept(daemon, allow_self_protect):
     """Start the file interception daemon (alias for `deadpush guard`).
 
     Uses the watchdog-based guardian to monitor all file writes and
     enforce guardrails. The staging-based intercept has been removed;
     the guardian daemon covers every write through the filesystem.
     """
+    from .config import dev_repo_guard_refusal
     from .guard import run_guardian
-    run_guardian(intervention=True, daemon=daemon, strict=False)
+
+    config = load_config()
+    refusal = dev_repo_guard_refusal(
+        config.repo_root,
+        allow_self_protect=allow_self_protect,
+        persistent=daemon,
+    )
+    if refusal:
+        print_error(refusal.split("\n")[0])
+        for line in refusal.split("\n")[1:]:
+            print(line)
+        raise SystemExit(2)
+    run_guardian(
+        intervention=True,
+        daemon=daemon,
+        strict=False,
+        allow_self_protect=allow_self_protect,
+    )
 
 
 @main.command("mcp-proxy")
@@ -1828,7 +1880,12 @@ def cmd_doctor(repo, hardened):
 @click.option("--mode", type=click.Choice(["default", "hardened"]), default="default", help="Protection mode: default (user-level) or hardened (privilege separation)")
 @click.option("--daemon/--no-daemon", default=True, help="Start guardian daemon after setup")
 @click.option("--force", is_flag=True, help="Skip confirmations")
-def cmd_init(mode, daemon, force):
+@click.option(
+    "--allow-self-protect",
+    is_flag=True,
+    help="Allow init on the deadpush source repo (not recommended)",
+)
+def cmd_init(mode, daemon, force, allow_self_protect):
     """Guided first-time setup for deadpush.
 
     Walks through:
@@ -1843,7 +1900,7 @@ def cmd_init(mode, daemon, force):
 
     Run this once per repo, then walk away.
     """
-    from .config import load_config
+    from .config import dev_repo_guard_refusal, load_config
     from .guard import setup_autostart, setup_hardened_environment, run_guardian
     from .hooks import (
         install_hook, install_precommit_hook, install_postcommit_hook,
@@ -1852,6 +1909,17 @@ def cmd_init(mode, daemon, force):
 
     config = load_config()
     repo_root = config.repo_root
+
+    refusal = dev_repo_guard_refusal(
+        repo_root,
+        allow_self_protect=allow_self_protect,
+        full_setup=True,
+    )
+    if refusal:
+        print_error(refusal.split("\n")[0])
+        for line in refusal.split("\n")[1:]:
+            print(line)
+        raise SystemExit(2)
 
     print_header("deadpush Init", f"Guided setup for {repo_root.name}")
     print(f"Mode: {mode}")
@@ -1951,7 +2019,12 @@ def cmd_init(mode, daemon, force):
             print_success("Hardened guardian already loaded via launchd")
         else:
             try:
-                run_guardian(intervention=True, daemon=True, strict=False)
+                run_guardian(
+                    intervention=True,
+                    daemon=True,
+                    strict=False,
+                    allow_self_protect=allow_self_protect,
+                )
             except SystemExit:
                 pass
             except Exception as e:

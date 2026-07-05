@@ -2542,12 +2542,29 @@ def count_running_guardians() -> int:
 # =============================================================================
 # Main Runner with Improved Daemon Support
 # =============================================================================
-def run_guardian(intervention: bool = True, daemon: bool = False, strict: bool = False, hardened: bool = False):
+def run_guardian(
+    intervention: bool = True,
+    daemon: bool = False,
+    strict: bool = False,
+    hardened: bool = False,
+    *,
+    allow_self_protect: bool = False,
+):
     if not WATCHDOG_AVAILABLE:
         print("Error: watchdog package required. pip install deadpush[watch]")
         return
 
     config = load_config()
+    from .config import dev_repo_guard_refusal
+
+    refusal = dev_repo_guard_refusal(
+        config.repo_root,
+        allow_self_protect=allow_self_protect,
+        persistent=bool(daemon or hardened),
+    )
+    if refusal:
+        print(f"Error: {refusal}", file=sys.stderr)
+        raise SystemExit(2)
 
     logger = setup_logging(
         daemon=daemon, hardened=hardened, repo_root=config.repo_root,
