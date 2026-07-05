@@ -1204,6 +1204,7 @@ class GuardianHandler(FileSystemEventHandler or object):
         self.safety_score = SessionSafetyScore(config.repo_root, hardened=hardened)
         self.safety_score.load_score()
         self.session_mgr = SessionManager()
+        self.gpc = None  # GpcServer, started by run_guardian
 
         # Dynamic rate limiting (based on safety score)
         self.last_intervention_ts = 0.0
@@ -1847,6 +1848,15 @@ class GuardianHandler(FileSystemEventHandler or object):
             try:
                 quarantined = self.quarantine.quarantine(path, reason)
                 self.logger.info(f"Quarantined: {quarantined}")
+                if self.gpc is not None:
+                    try:
+                        self.gpc.emit_incident(
+                            category=result.violations[0].category if result.violations else "guardrail",
+                            description=reason,
+                            file=rel,
+                        )
+                    except Exception:
+                        pass
             except Exception as e:
                 self.logger.error(f"Failed to quarantine {path}: {e}")
                 try:
@@ -2217,6 +2227,18 @@ def run_guardian(intervention: bool = True, daemon: bool = False, strict: bool =
 def _start_control_server(control_server, logger, repo_root, hardened):
     """Start the local HTTP control interface and log its status.
     Safe to call after daemon fork (no threading before fork)."""
+    from .gpc import GpcServer
+
+    gpc = GpcServer(repo_root, hardened=hardened)
+    try:
+        gpc.start()
+        if control_server.guardian_handler:
+            control_server.guardian_handler.gpc = gpc
+        logger.info(f"Guardian Push Channel (GPC) on {gpc.socket_path}")
+        atexit.register(gpc.stop)
+    except Exception as e:
+        logger.warning(f"GPC server could not start: {e}")
+
     control_server.start()
     if control_server.port:
         logger.info(f"Local control interface on http://127.0.0.1:{control_server.port} (port file: {control_server.port_file})")

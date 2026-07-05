@@ -818,6 +818,99 @@ def cmd_intercept(daemon):
     run_guardian(intervention=True, daemon=daemon, strict=False)
 
 
+@main.command("mcp-proxy")
+@click.option("--config", "config_path", type=click.Path(exists=True, dir_okay=False), default=None,
+              help="MCP config JSON (use with --server)")
+@click.option("--server", "server_name", default=None, help="MCP server name from --config")
+@click.option("--repo", type=click.Path(exists=True, file_okay=False), default=None,
+              help="Repo root for guardrail checks")
+@click.argument("downstream", nargs=-1, type=click.UNPROCESSED)
+def cmd_mcp_proxy(config_path, server_name, repo, downstream):
+    """Transparent MCP proxy — scan tools/call before downstream servers execute.
+
+    Wrap a single MCP server:
+
+        deadpush mcp-proxy -- npx -y @modelcontextprotocol/server-filesystem .
+
+    Or load from config:
+
+        deadpush mcp-proxy --config .cursor/mcp.json --server filesystem
+    """
+    from .mcp_proxy import run_mcp_proxy
+
+    repo_root = Path(repo).resolve() if repo else None
+    downstream_cmd = list(downstream) if downstream else None
+    raise SystemExit(run_mcp_proxy(
+        downstream_cmd,
+        config_path=Path(config_path) if config_path else None,
+        server_name=server_name,
+        repo_root=repo_root,
+    ))
+
+
+@main.command("run")
+@click.option("--sandbox", is_flag=True, help="T2: run command in sandbox (Seatbelt on macOS, fanotify on Linux)")
+@click.option("--hardened", is_flag=True, help="Use hardened state paths")
+@click.option("--backend", default=None, type=click.Choice(["seatbelt", "linux", "noop"]),
+              help="Force a specific enforcement backend")
+@click.option("--repo", type=click.Path(exists=True, file_okay=False), default=None,
+              help="Repo root (default: auto-detect)")
+@click.argument("cmd", nargs=-1, required=True)
+def cmd_run(sandbox, hardened, backend, repo, cmd):
+    """Run a command inside a deadpush sandbox session (T2).
+
+    Example:
+
+        deadpush run --sandbox -- python my_agent_script.py
+    """
+    from .run_session import describe_session, run_sandbox
+
+    repo_root = Path(repo).resolve() if repo else None
+    if not sandbox:
+        print_warning("Running without --sandbox (T0). Use --sandbox for T2 confined I/O.")
+        import subprocess
+        raise SystemExit(subprocess.run(list(cmd)).returncode)
+
+    info = describe_session(repo_root, backend_prefer=backend)
+    print(f"Tier T2 sandbox — backend: {info['backend']['name']}")
+    raise SystemExit(run_sandbox(
+        list(cmd),
+        repo_root=repo_root,
+        hardened=hardened,
+        backend_prefer=backend,
+    ))
+
+
+@main.command("git-wrapper", context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
+@click.argument("args", nargs=-1, type=click.UNPROCESSED)
+def cmd_git_wrapper(args):
+    """Internal: git shim used by deadpush run --sandbox."""
+    from .git_wrapper import main as git_main
+    raise SystemExit(git_main(list(args)))
+
+
+@main.command("gpc-listen")
+@click.option("--repo", type=click.Path(exists=True, file_okay=False), default=None)
+@click.option("--hardened", is_flag=True)
+def cmd_gpc_listen(repo, hardened):
+    """Subscribe to Guardian Push Channel events (debug/integration)."""
+    import json
+
+    from .config import load_config
+    from .gpc import GpcClient, GpcMessage
+
+    config = load_config(explicit_root=Path(repo).resolve() if repo else None)
+
+    def on_msg(msg: GpcMessage) -> None:
+        print(f"[GPC {msg.type}] {json.dumps(msg.payload, default=str)}")
+    client = GpcClient(config.repo_root, hardened=hardened, on_message=on_msg)
+    print(f"Listening on {client.socket_path} (Ctrl+C to stop)")
+    try:
+        client.connect_and_listen(blocking=True)
+    except KeyboardInterrupt:
+        client.stop()
+
+
 @main.command("mcp")
 @click.option("--danger", is_flag=True, help="⚠️  Allow guardrail weakening (enable set_guardrail_level, add_allowed_pattern, reset_runtime_config, ignore_path). Only use this if you understand the risks.")
 @click.option("--hardened", is_flag=True, help="Connect to a hardened guardian")
@@ -1661,6 +1754,9 @@ def cmd_init(mode, daemon, force):
     else:
         print("  Start guardian with: deadpush protect --daemon")
     print("  Configure your AI agent to use: deadpush mcp")
+    print("  T2 sandbox sessions: deadpush run --sandbox -- <agent-cmd>")
+    print("  MCP proxy: deadpush mcp-proxy -- <mcp-server-cmd>")
+    print("  Guarantee tiers: docs/guarantees.md")
     print("  View dashboard at: http://127.0.0.1:<port>/dashboard")
 
     return 0

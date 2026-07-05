@@ -532,6 +532,17 @@ def enforce_content(
     _apply_guardrail_level(result, _check_layer_violations(source, rel, config, runtime), runtime, "layer")
     _apply_guardrail_level(result, _check_dependency_integrity(source, rel, config.repo_root, runtime), runtime, "dependency")
 
+    # Third-party guardrail plugins (entry point: deadpush.guardrails)
+    from .plugins import run_plugins
+    plugin_violations = run_plugins(rel, source, config, runtime)
+    for v in plugin_violations:
+        cat = v.category or "plugin"
+        level = runtime.get_guardrail_level(cat) if runtime else "block"
+        if level == "block":
+            result.reject(v)
+        elif level == "warn":
+            result.violations.append(v)
+
     return result
 
 

@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "deadpush"
 dynamic = ["version"]
-description = "Guardrails for the vibe coding era — real-time AI agent guardian with MCP write interception, git hooks, and quarantine"
+description = "Guardrails for the vibe coding era — repo integrity guardian with MCP proxy, sandbox sessions, git hooks, and provable guarantee tiers"
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.11"
@@ -34,6 +34,10 @@ dev = ["pytest>=8.0", "ruff>=0.4", "rich>=13.7.0", "watchdog>=4.0.0"]
 
 [project.scripts]
 deadpush = "deadpush_bootstrap:main"
+
+[project.entry-points."deadpush.guardrails"]
+# Register third-party guardrail plugins:
+# my_rules = "my_package.guardrails:MyPlugin"
 
 [project.urls]
 Homepage = "https://github.com/harris-ahmad/deadpush"
