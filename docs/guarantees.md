@@ -152,6 +152,16 @@ Tier:       T0 (receive-only); T2 (mandatory session integration)
 Bypass:     client not subscribed to GPC socket
 ```
 
+### G-13: Tamper-evident audit trail
+
+```
+Property:   enforcement events append to a hash-chained log; tampering breaks verify-audit
+Mechanism:  deadpush/audit.py content-hashed chain at .deadpush/audit.chain.jsonl (or hardened policy dir)
+Proof:      tests/test_audit.py; deadpush verify-audit
+Tier:       T0 (soft repo-local); T1 (hardened policy dir)
+Bypass:     delete audit file (detectable via missing history); root can replace entire chain in soft mode
+```
+
 ---
 
 ## Heuristic (not guaranteed)
@@ -188,6 +198,7 @@ a guarantee.
 | Harness | Validates | Run |
 |---------|-----------|-----|
 | `pytest tests/` | Unit + integration proofs | `uv run pytest` |
+| `deadpush verify-audit` | Audit hash chain integrity | `deadpush verify-audit` |
 | `scripts/hardened_qa.sh` | T1 live system guarantees | `./scripts/hardened_qa.sh` (macOS/Linux, needs sudo) |
 | `scripts/full_e2e_test.py` | Guardian + MCP + hooks demo | `python scripts/full_e2e_test.py --simulate-agent` |
 

@@ -1,0 +1,11 @@
+{
+  "name": "@deadpush/gpc-client",
+  "version": "0.1.0",
+  "description": "Minimal TypeScript client for deadpush Guardian Push Channel (GPC)",
+  "type": "module",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "files": ["index.js", "index.d.ts", "README.md"],
+  "license": "MIT",
+  "engines": { "node": ">=18" }
+}

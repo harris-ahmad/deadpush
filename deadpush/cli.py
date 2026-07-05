@@ -899,7 +899,7 @@ def cmd_git_wrapper(args):
 
 
 @main.command("configure")
-@click.argument("target", type=click.Choice(["cursor", "claude"]))
+@click.argument("target", type=click.Choice(["cursor", "claude", "vscode", "all"]))
 @click.option("--repo", type=click.Path(exists=True, file_okay=False), default=None,
               help="Repo root (default: auto-detect)")
 @click.option("--unwrap", is_flag=True, help="Restore original MCP server commands")
@@ -908,17 +908,33 @@ def cmd_configure(target, repo, unwrap):
 
     Example:
 
-        deadpush configure cursor
+        deadpush configure all
         deadpush configure cursor --unwrap
     """
     from .config import load_config
-    from .configure import configure_claude_mcp, configure_cursor_mcp
+    from .configure import (
+        configure_all_ides,
+        configure_claude_mcp,
+        configure_cursor_mcp,
+        configure_vscode_mcp,
+    )
 
     config = load_config(explicit_root=Path(repo).resolve() if repo else None)
-    if target == "cursor":
-        result = configure_cursor_mcp(config.repo_root, unwrap=unwrap)
-    else:
-        result = configure_claude_mcp(config.repo_root, unwrap=unwrap)
+    if target == "all":
+        result = configure_all_ides(config.repo_root, unwrap=unwrap)
+        action = "unwrapped" if unwrap else "proxied"
+        print_success(f"IDE MCP configuration {action}")
+        for item in result.get("configured", []):
+            for name, detail in item.items():
+                print(f"  {name}: {detail.get('path')} ({', '.join(detail.get('servers', []))})")
+        if result.get("skipped"):
+            print(f"  Skipped (not found): {', '.join(result['skipped'])}")
+        if result.get("gpc_snippet"):
+            print(f"  GPC agent snippet: {result['gpc_snippet']}")
+        return
+
+    fn = {"cursor": configure_cursor_mcp, "claude": configure_claude_mcp, "vscode": configure_vscode_mcp}[target]
+    result = fn(config.repo_root, unwrap=unwrap)
 
     action = "unwrapped" if unwrap else "proxied"
     print_success(f"MCP servers {action} via deadpush mcp-proxy")
@@ -926,6 +942,61 @@ def cmd_configure(target, repo, unwrap):
     if result.get("backup"):
         print(f"  Backup: {result['backup']}")
     print(f"  Servers: {', '.join(result.get('servers', [])) or '(none)'}")
+
+
+@main.command("verify-audit")
+@click.option("--repo", type=click.Path(exists=True, file_okay=False), default=None,
+              help="Repo root (default: auto-detect)")
+@click.option("--json", "as_json", is_flag=True, help="Emit machine-readable summary")
+def cmd_verify_audit(repo, as_json):
+    """Verify the tamper-evident audit hash chain for this repo."""
+    import json as json_mod
+
+    from .audit import audit_log_path, audit_summary, verify_audit_chain
+    from .config import load_config
+
+    config = load_config(explicit_root=Path(repo).resolve() if repo else None)
+    path = audit_log_path(config.repo_root)
+    ok, errors = verify_audit_chain(path)
+    summary = audit_summary(config.repo_root)
+
+    if as_json:
+        print(json_mod.dumps({"valid": ok, "errors": errors, **summary}, indent=2))
+        raise SystemExit(0 if ok else 1)
+
+    print_header("Audit chain verification", str(path))
+    print(f"  Entries: {summary['entries']}")
+    if summary.get("by_event"):
+        print(f"  Events: {summary['by_event']}")
+    if ok:
+        print_success("Audit chain is valid — no tampering detected.")
+    else:
+        print_error("Audit chain verification FAILED:")
+        for err in errors[:10]:
+            print(f"  - {err}")
+    raise SystemExit(0 if ok else 1)
+
+
+@main.command("export-sarif")
+@click.option("--repo", type=click.Path(exists=True, file_okay=False), default=None)
+@click.option("-o", "--output", type=click.Path(dir_okay=False), default=None,
+              help="Write SARIF file (default: stdout)")
+@click.option("--max-entries", default=500, show_default=True, type=int)
+def cmd_export_sarif(repo, output, max_entries):
+    """Export audit trail guardrail events as SARIF 2.1.0 for GitHub Security tab."""
+    import json as json_mod
+
+    from .audit import export_sarif
+    from .config import load_config
+
+    config = load_config(explicit_root=Path(repo).resolve() if repo else None)
+    sarif = export_sarif(config.repo_root, max_entries=max_entries)
+    text = json_mod.dumps(sarif, indent=2)
+    if output:
+        Path(output).write_text(text + "\n", encoding="utf-8")
+        print_success(f"SARIF written to {output}")
+    else:
+        print(text)
 
 
 @main.command("gpc-listen")
@@ -1667,6 +1738,22 @@ def cmd_doctor(repo, hardened):
             print("      → Fix or uninstall broken entry-point plugins in pyproject.toml.")
     except Exception as e:
         check("Sandbox backends", False, str(e))
+
+    # 10. Audit trail
+    try:
+        from .audit import audit_summary
+
+        audit = audit_summary(repo_root)
+        check(
+            "Audit chain",
+            audit.get("valid", True),
+            f"{audit.get('entries', 0)} entries at {audit.get('path')}",
+        )
+        if audit.get("errors"):
+            for err in audit["errors"][:3]:
+                print(f"      → {err}")
+    except Exception as e:
+        check("Audit chain", False, str(e))
 
     # Summary
     print()

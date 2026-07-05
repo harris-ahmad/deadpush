@@ -132,6 +132,114 @@ def configure_cursor_mcp(repo_root: Path, *, unwrap: bool = False) -> dict[str, 
     }
 
 
+def configure_vscode_mcp(repo_root: Path, *, unwrap: bool = False) -> dict[str, Any]:
+    """Wrap or unwrap `.vscode/mcp.json` servers with deadpush mcp-proxy."""
+    repo = repo_root.resolve()
+    vscode_path = repo / ".vscode" / "mcp.json"
+    backup_path = repo / ".vscode" / "mcp.json.deadpush.bak"
+
+    if not vscode_path.exists() and not unwrap:
+        from .hooks import setup_mcp_discovery
+        setup_mcp_discovery(repo)
+
+    config = _load_json(vscode_path)
+    servers = _servers_dict(config)
+    if not servers and not unwrap:
+        raise FileNotFoundError(f"No MCP servers in {vscode_path}")
+
+    if not unwrap and not backup_path.exists() and vscode_path.exists():
+        shutil.copy2(vscode_path, backup_path)
+
+    dp = _deadpush_cmd()
+    updated: dict[str, Any] = {}
+    for name, entry in servers.items():
+        if not isinstance(entry, dict):
+            continue
+        if unwrap:
+            updated[name] = unwrap_server_entry(entry)
+        else:
+            try:
+                updated[name] = wrap_server_entry(entry, deadpush_cmd=dp)
+            except ValueError:
+                updated[name] = entry
+
+    if "servers" in config and "mcpServers" not in config:
+        config["servers"] = updated
+    else:
+        config["mcpServers"] = updated
+
+    _save_json(vscode_path, config)
+    return {
+        "path": str(vscode_path),
+        "backup": str(backup_path) if backup_path.exists() else None,
+        "servers": list(updated.keys()),
+        "proxied": not unwrap,
+    }
+
+
+def write_gpc_agent_snippet(repo_root: Path) -> Path:
+    """Write a Cursor rule snippet describing GPC subscription for agents."""
+    repo = repo_root.resolve()
+    rules_dir = repo / ".cursor" / "rules"
+    rules_dir.mkdir(parents=True, exist_ok=True)
+    path = rules_dir / "deadpush-gpc.mdc"
+    content = f"""---
+description: Subscribe to deadpush Guardian Push Channel (GPC) for real-time incidents
+globs:
+alwaysApply: true
+---
+
+# deadpush GPC integration
+
+When working in this repo, subscribe to guardian push events:
+
+```bash
+deadpush gpc-listen
+```
+
+Or integrate in agent code (Python):
+
+```python
+from pathlib import Path
+from deadpush.gpc import GpcClient, GpcMessage
+
+def on_gpc(msg: GpcMessage) -> None:
+    if msg.type == "INCIDENT":
+        # Stop and surface to user — do not retry the blocked write
+        print("GUARDIAN:", msg.payload)
+    elif msg.type == "SESSION_PAUSE":
+        print("MCP paused:", msg.payload.get("reason"))
+
+client = GpcClient(Path("{repo}"))
+client.connect_and_listen()  # background thread
+```
+
+See docs/agent-gpc-integration.md in the deadpush repo for TypeScript and full protocol.
+"""
+    path.write_text(content, encoding="utf-8")
+    return path
+
+
+def configure_all_ides(repo_root: Path, *, unwrap: bool = False) -> dict[str, Any]:
+    """Configure Cursor, VS Code, and Claude MCP configs where present."""
+    results: dict[str, Any] = {"configured": [], "skipped": [], "gpc_snippet": None}
+    for name, fn in (
+        ("cursor", configure_cursor_mcp),
+        ("vscode", configure_vscode_mcp),
+        ("claude", configure_claude_mcp),
+    ):
+        try:
+            results["configured"].append({name: fn(repo_root, unwrap=unwrap)})
+        except FileNotFoundError:
+            results["skipped"].append(name)
+    if not unwrap:
+        try:
+            results["gpc_snippet"] = str(write_gpc_agent_snippet(repo_root))
+        except OSError:
+            pass
+    return results
+
+
 def configure_claude_mcp(repo_root: Path, *, unwrap: bool = False) -> dict[str, Any]:
     """Wrap Claude Desktop project MCP config if present."""
     repo = repo_root.resolve()

@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import load_config
+from .audit import append_audit_event, EVENT_MCP_PROXY_BLOCK
 from .intercept import enforce_content, violations_from_result
 from .rules import RuntimeConfig
 
@@ -101,6 +102,17 @@ def notify_proxy_block(repo_root: Path, tool_name: str, rel_path: str, summary: 
             f.write(json.dumps(record) + "\n")
     except OSError as e:
         logger.debug("Could not write mcp_proxy_blocks log: %s", e)
+
+    append_audit_event(
+        repo_root,
+        EVENT_MCP_PROXY_BLOCK,
+        {
+            "tool": tool_name,
+            "file": rel_path,
+            "description": summary,
+            "category": "mcp_proxy",
+        },
+    )
 
     try:
         from .config import is_hardened_install

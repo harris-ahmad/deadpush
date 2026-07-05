@@ -1513,7 +1513,15 @@ class GuardianHandler(FileSystemEventHandler or object):
     # ------------------------------------------------------------------
     # MCP suspension (disables agent's MCP access when score is critical)
     # ------------------------------------------------------------------
+    def _record_audit(self, event: str, payload: dict) -> None:
+        try:
+            from .audit import append_audit_event
+            append_audit_event(self.config.repo_root, event, payload)
+        except Exception:
+            pass
+
     def _gpc_policy_update(self, summary: str, **extra) -> None:
+        self._record_audit("policy.update", {"summary": summary, **extra})
         if self.gpc is None:
             return
         try:
@@ -1545,6 +1553,7 @@ class GuardianHandler(FileSystemEventHandler or object):
             suspend_file.parent.mkdir(parents=True, exist_ok=True)
             suspend_file.write_text(reason, encoding="utf-8")
             self.logger.warning(f"MCP suspended: {reason}")
+            self._record_audit("session.pause", {"reason": reason, "score": self.safety_score.score})
             if self.gpc is not None:
                 try:
                     self.gpc.emit_session_pause(reason, score=self.safety_score.score)
@@ -1772,6 +1781,11 @@ class GuardianHandler(FileSystemEventHandler or object):
                     )
                 except Exception:
                     pass
+            self._record_audit("guardrail.lockdown", {
+                "file": rel,
+                "description": "Guardian lockdown active (safety score 0)",
+                "score": self.safety_score.score,
+            })
             return
 
         # === STEP 1: Check blocked files (deadpush.toml blocked_files/blocked_patterns) ===
@@ -1914,6 +1928,12 @@ class GuardianHandler(FileSystemEventHandler or object):
                         )
                     except Exception:
                         pass
+                self._record_audit("guardrail.quarantine", {
+                    "file": rel,
+                    "description": reason,
+                    "category": result.violations[0].category if result.violations else "guardrail",
+                    "violations": [v.to_dict() for v in result.violations[:5]],
+                })
             except Exception as e:
                 self.logger.error(f"Failed to quarantine {path}: {e}")
                 try:
