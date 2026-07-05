@@ -536,6 +536,8 @@ def cmd_status(repo, hardened):
         print_warning("No guardian.log found yet (start the guardian to begin logging).")
 
     print("\nOther checks:")
+    print("  - All repos:     deadpush repos list")
+    print("  - Global hub:    deadpush hub open --start")
     print("  - Per-repo quarantines: cd your-repo ; deadpush quarantine list")
     print("  - Health check: deadpush doctor")
 
@@ -1257,6 +1259,76 @@ def cmd_dashboard(repo, open_browser):
     print(url)
     if open_browser:
         webbrowser.open(url)
+
+
+@main.group("hub")
+def cmd_hub():
+    """Global multi-repo dashboard (all guardians in one view)."""
+    pass
+
+
+@cmd_hub.command("start")
+@click.option("--port", default=8742, type=int, help="Hub listen port (default 8742)")
+@click.option("--daemon", is_flag=True, help="Run hub in background")
+def hub_start(port, daemon):
+    """Start the global deadpush hub on localhost."""
+    from .hub import hub_is_running, hub_url, start_hub
+
+    if hub_is_running():
+        print_success(f"Hub already running at {hub_url()}")
+        return
+    pid = start_hub(port=port, daemon=daemon)
+    if daemon:
+        print_success(f"Hub started (PID {pid}): {hub_url()}/hub")
+        print("  Open: deadpush hub open")
+    else:
+        print_info("Hub stopped.")
+
+
+@cmd_hub.command("stop")
+def hub_stop():
+    """Stop the global deadpush hub."""
+    from .hub import hub_is_running, stop_hub
+
+    if not hub_is_running():
+        print_info("Hub is not running.")
+        return
+    stop_hub()
+    print_success("Hub stopped.")
+
+
+@cmd_hub.command("status")
+def hub_status():
+    """Show whether the global hub is running."""
+    from .hub import hub_is_running, hub_url
+    from .state import hub_pidfile
+
+    print_header("deadpush Hub")
+    if hub_is_running():
+        pid = hub_pidfile().read_text().strip()
+        print_success(f"Hub RUNNING (PID {pid}) — {hub_url()}/hub")
+    else:
+        print_warning("Hub is not running. Start with: deadpush hub start --daemon")
+
+
+@cmd_hub.command("open")
+@click.option("--start", is_flag=True, help="Start hub in background if not running")
+def hub_open(start):
+    """Open the global hub in your browser."""
+    import webbrowser
+
+    from .hub import hub_is_running, hub_url, start_hub
+
+    if not hub_is_running():
+        if start:
+            start_hub(daemon=True)
+        else:
+            print_error("Hub is not running. Start with: deadpush hub start --daemon")
+            print("  Or: deadpush hub open --start")
+            return
+    url = f"{hub_url()}/hub"
+    print(url)
+    webbrowser.open(url)
 
 
 @main.command("uninstall")

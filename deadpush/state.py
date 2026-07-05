@@ -407,8 +407,13 @@ def discover_repos(hardened: bool = False) -> list[dict[str, Any]]:
             }
 
     for rid in _discover_ids_from_processes():
-        if rid not in by_id:
-            by_id[rid] = {"id": rid, "path": "", "label": rid, "hardened": hardened}
+        if rid in by_id:
+            continue
+        rdir = repos_root / rid
+        legacy_pid = root / f"guardian.{rid}.pid"
+        if not rdir.exists() and not legacy_pid.exists():
+            continue
+        by_id[rid] = {"id": rid, "path": "", "label": rid, "hardened": hardened}
 
     out: list[dict[str, Any]] = []
     for rid, entry in sorted(by_id.items(), key=lambda x: x[1].get("label", x[0])):
@@ -418,10 +423,37 @@ def discover_repos(hardened: bool = False) -> list[dict[str, Any]]:
         if path_str:
             pid = _read_pid(scoped_pidfile(path_str, hardened))
             running = _process_alive(pid)
+        else:
+            pid = _read_pid(repos_root / rid / "guardian.pid") if repos_root.exists() else None
+            running = _process_alive(pid)
         entry["pid"] = pid
         entry["running"] = running
         out.append(entry)
     return out
+
+
+def discover_all_repos() -> list[dict[str, Any]]:
+    """Merge soft + hardened repo entries, dedupe by id (prefer entry with path)."""
+    by_id: dict[str, dict[str, Any]] = {}
+    for hardened in (False, True):
+        for entry in discover_repos(hardened=hardened):
+            rid = entry["id"]
+            existing = by_id.get(rid)
+            if existing is None:
+                by_id[rid] = entry
+            elif not existing.get("path") and entry.get("path"):
+                by_id[rid] = {**existing, **entry}
+            elif entry.get("running") and not existing.get("running"):
+                by_id[rid] = {**existing, **entry}
+    return sorted(by_id.values(), key=lambda e: (e.get("label") or e["id"]).lower())
+
+
+def hub_pidfile() -> Path:
+    return state_dir(False) / "hub.pid"
+
+
+def hub_portfile() -> Path:
+    return state_dir(False) / "hub.port"
 
 
 def reset_migration_flags() -> None:
