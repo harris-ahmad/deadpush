@@ -77,31 +77,28 @@ def _find_bootstrap_python() -> str:
     return sys.executable
 
 
+from .config import repo_id as _repo_id
+from . import state as _state
+
+
 def _state_dir(hardened: bool = False) -> Path:
-    if hardened:
-        return _HARDENED_STATE_DIR
-    return Path.home() / ".deadpush"
-
-
-@functools.lru_cache(maxsize=16)
-def _repo_id(repo_root: str) -> str:
-    return hashlib.sha256(repo_root.encode()).hexdigest()[:12]
+    return _state.state_dir(hardened)
 
 
 def _scoped_pidfile(repo_root: Path, hardened: bool = False) -> Path:
-    return _state_dir(hardened) / f"guardian.{_repo_id(str(repo_root))}.pid"
+    return _state.scoped_pidfile(repo_root, hardened)
 
 
 def _scoped_lockfile(repo_root: Path, hardened: bool = False) -> Path:
-    return _state_dir(hardened) / f"guardian.{_repo_id(str(repo_root))}.lock"
+    return _state.scoped_lockfile(repo_root, hardened)
 
 
 def _scoped_portfile(repo_root: Path, hardened: bool = False) -> Path:
-    return _state_dir(hardened) / f"guardian.control.port.{_repo_id(str(repo_root))}"
+    return _state.scoped_portfile(repo_root, hardened)
 
 
 def _scoped_token_file(repo_root: Path, hardened: bool = False) -> Path:
-    return _state_dir(hardened) / f"guardian.control.token.{_repo_id(str(repo_root))}"
+    return _state.scoped_token_file(repo_root, hardened)
 
 
 def _load_or_create_control_token(repo_root: Path, hardened: bool = False) -> str:
@@ -136,32 +133,27 @@ def _load_or_create_control_token(repo_root: Path, hardened: bool = False) -> st
 
 
 def _scoped_suspend_file(repo_root: Path, hardened: bool = False) -> Path:
-    return _state_dir(hardened) / f"mcp_suspended.{_repo_id(str(repo_root))}"
+    return _state.scoped_suspend_file(repo_root, hardened)
 
 
 def _scoped_safety_score_file(repo_root: Path, hardened: bool = False) -> Path:
-    return _state_dir(hardened) / f"safety_score.{_repo_id(str(repo_root))}.json"
+    return _state.scoped_safety_score_file(repo_root, hardened)
 
 
 def _scoped_log_file(repo_root: Path, hardened: bool = False) -> Path:
-    return _state_dir(hardened) / f"guardian.{_repo_id(str(repo_root))}.log"
+    return _state.scoped_log_file(repo_root, hardened)
 
 
 def _scoped_plist_label(repo_root: Path) -> str:
-    return f"com.deadpush.guardian.{_repo_id(str(repo_root))}"
+    return _state.scoped_plist_label(repo_root)
 
 
 def _scoped_plist_path(repo_root: Path, hardened: bool = False) -> Path:
-    if hardened:
-        return Path("/Library/LaunchDaemons") / f"com.deadpush.guardian.{_repo_id(str(repo_root))}.plist"
-    return Path.home() / "Library" / "LaunchAgents" / f"com.deadpush.guardian.{_repo_id(str(repo_root))}.plist"
+    return _state.scoped_plist_path(repo_root, hardened)
 
 
 def _scoped_systemd_unit_path(repo_root: Path, hardened: bool = False) -> Path:
-    rid = _repo_id(str(repo_root))
-    if hardened:
-        return Path("/etc/systemd/system") / f"deadpush-guardian.{rid}.service"
-    return Path.home() / ".config" / "systemd" / "user" / f"deadpush-guardian.{rid}.service"
+    return _state.scoped_systemd_unit_path(repo_root, hardened)
 
 
 def _is_hardened(hardened: bool = False) -> bool:
@@ -244,7 +236,13 @@ class DaemonManager:
         with self.startfile.open("w") as f:
             f.write(str(start_time))
         if repo_root is not None:
-            self.holderfile.write_text(str(repo_root.resolve()), encoding="utf-8")
+            resolved = repo_root.resolve()
+            self.holderfile.write_text(str(resolved), encoding="utf-8")
+            try:
+                from .config import is_hardened_install
+                _state.touch_registry(resolved, hardened=is_hardened_install(resolved), running=True)
+            except Exception:
+                pass
         self.logger.info(f"Daemon started with PID {pid}")
 
     def _state_files(self) -> tuple[Path, ...]:
@@ -696,6 +694,12 @@ DASHBOARD_HTML = """\
   .nav {{ display: flex; gap: 12px; margin: 16px 0; }}
   .nav a {{ color: #58a6ff; text-decoration: none; font-size: 14px; }}
   .nav a:hover {{ text-decoration: underline; }}
+  .live {{ color: #3fb950; font-size: 12px; }}
+  #live-log {{ max-height: 320px; overflow-y: auto; font-size: 11px; line-height: 1.4;
+               background: #0d1117; border: 1px solid #30363d; border-radius: 6px;
+               padding: 10px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }}
+  #live-log .line {{ white-space: pre-wrap; word-break: break-all; }}
+  #live-score {{ margin: 12px 0; }}
   .empty {{ color: #484f58; font-style: italic; padding: 12px; }}
   .actions button {{ background: #21262d; border: 1px solid #30363d; color: #c9d1d9;
                      padding: 6px 14px; border-radius: 6px; cursor: pointer; font-size: 12px; }}
@@ -717,8 +721,32 @@ DASHBOARD_HTML = """\
   <a href="/dashboard/blocks">Blocks</a>
   <a href="/dashboard/quarantine">Quarantine</a>
   <a href="/dashboard/allowlist">Allowlist</a>
-  <a href="/dashboard">&#x21bb; Refresh</a>
+  <span class="live" id="live-status">● live</span>
 </div>
+<div id="live-score"></div>
+<h2>Live Log</h2>
+<div id="live-log"></div>
+<script>
+(function() {{
+  const logEl = document.getElementById('live-log');
+  const scoreEl = document.getElementById('live-score');
+  const statusEl = document.getElementById('live-status');
+  const es = new EventSource('/dashboard/events');
+  es.addEventListener('log', (e) => {{
+    const div = document.createElement('div');
+    div.className = 'line';
+    div.textContent = e.data;
+    logEl.appendChild(div);
+    logEl.scrollTop = logEl.scrollHeight;
+    while (logEl.childNodes.length > 200) logEl.removeChild(logEl.firstChild);
+  }});
+  es.addEventListener('score', (e) => {{
+    scoreEl.innerHTML = '<div class="card"><h3>Safety Score (live)</h3><div class="value">' + e.data + '</div></div>';
+  }});
+  es.onerror = () => {{ statusEl.textContent = '○ reconnecting…'; statusEl.style.color = '#d29922'; }};
+  es.onopen = () => {{ statusEl.textContent = '● live'; statusEl.style.color = '#3fb950'; }};
+}})();
+</script>
 {content}
 </body>
 </html>"""
@@ -946,6 +974,68 @@ class GuardianControlHandler(BaseHTTPRequestHandler):
         else:
             self._send_json({"error": "unknown dashboard page"}, 404)
 
+    def _handle_sse_events(self):
+        """Server-Sent Events: live log tail + safety score updates."""
+        handler = self._get_handler()
+        if not handler:
+            return self._send_json({"error": "guardian not ready"}, 503)
+
+        from .config import is_hardened_install
+
+        repo_root = handler.config.repo_root
+        hardened = is_hardened_install(repo_root)
+        log_path = _scoped_log_file(repo_root, hardened)
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.end_headers()
+
+        def _emit(event: str, data: str) -> bool:
+            try:
+                safe = data.replace("\n", " ").replace("\r", "")
+                self.wfile.write(f"event: {event}\ndata: {safe}\n\n".encode("utf-8"))
+                self.wfile.flush()
+                return True
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                return False
+
+        # Bootstrap: last 40 log lines
+        if log_path.exists():
+            try:
+                text = log_path.read_text(errors="ignore")
+                for line in text.strip().splitlines()[-40:]:
+                    if not _emit("log", line):
+                        return
+            except OSError:
+                pass
+
+        pos = log_path.stat().st_size if log_path.exists() else 0
+        last_score = ""
+        while True:
+            score = handler.safety_score.get_summary()
+            if score != last_score:
+                last_score = score
+                if not _emit("score", score):
+                    return
+
+            if log_path.exists():
+                try:
+                    size = log_path.stat().st_size
+                    if size > pos:
+                        with log_path.open("r", encoding="utf-8", errors="ignore") as f:
+                            f.seek(pos)
+                            chunk = f.read()
+                        pos = size
+                        for line in chunk.splitlines():
+                            if line.strip() and not _emit("log", line):
+                                return
+                except OSError:
+                    pass
+
+            time.sleep(1.0)
+
     def do_GET(self):
         # Reads (status/dashboard/quarantine-list) stay open on localhost; only
         # state-changing POSTs require the token. This keeps the human dashboard
@@ -987,7 +1077,12 @@ class GuardianControlHandler(BaseHTTPRequestHandler):
                 self._send_json({"status": "ok", "guardian": "alive"})
             elif path.startswith("/dashboard"):
                 subpath = path[len("/dashboard"):]
-                self._handle_dashboard(subpath)
+                if subpath in ("", "/") or subpath.startswith("/blocks") or subpath.startswith("/quarantine") or subpath.startswith("/allowlist"):
+                    self._handle_dashboard(subpath)
+                elif subpath == "/events":
+                    self._handle_sse_events()
+                else:
+                    self._handle_dashboard(subpath)
             else:
                 self._send_json({"error": "unknown endpoint", "available": ["/status", "/safety-score", "/recent-incidents", "/quarantine-list", "/health", "/dashboard"]}, 404)
         except Exception as e:
@@ -1221,6 +1316,8 @@ class GuardianHandler(FileSystemEventHandler or object):
         # Dynamic rate limiting (based on safety score)
         self.last_intervention_ts = 0.0
         self._pending_events: deque[tuple[Path, str]] = deque()
+        self._last_hook_repair_ts = 0.0
+        self._last_hook_problems_key = ""
 
         # Shadow process (watching for crashes)
         self.shadow_process: subprocess.Popen | None = None
@@ -1337,11 +1434,31 @@ class GuardianHandler(FileSystemEventHandler or object):
 
             problems = verify_hooks_installed(self.config.repo_root)
             if not problems:
+                self._last_hook_problems_key = ""
                 return
+
+            key = "|".join(sorted(problems))
+            now = time.time()
+            # Avoid hot-looping when re-lock/reinstall cannot fix the issue (e.g. uchg
+            # unsupported, or hooks cleared repeatedly by an external tool).
+            if (
+                key == self._last_hook_problems_key
+                and (now - self._last_hook_repair_ts) < 30.0
+            ):
+                return
+
             self.logger.warning(f"Hook integrity issue(s): {', '.join(problems)} — repairing")
             repaired = repair_deadpush_hooks(self.config.repo_root)
+            self._last_hook_repair_ts = now
+            self._last_hook_problems_key = key
             if repaired:
                 self.logger.info(f"Reinstalled hooks: {', '.join(repaired)}")
+            remaining = verify_hooks_installed(self.config.repo_root)
+            if remaining and remaining == problems:
+                self.logger.warning(
+                    "Hook repair did not resolve: %s (will retry after cooldown)",
+                    ", ".join(remaining),
+                )
         except Exception as e:
             self.logger.debug(f"Hook integrity check skipped: {e}")
 
@@ -2147,6 +2264,279 @@ def start_shadow_process(guardian_pid: int, pidfile: Path, respawn_cmd: list[str
         return proc
     except Exception:
         return None
+
+
+def stop_guardian_for_repo(
+    repo_root: Path | str,
+    *,
+    hardened: bool = False,
+    force: bool = False,
+) -> bool:
+    """Stop the guardian for one repo. Returns True if a process was stopped."""
+    import signal
+    import subprocess
+    import time
+
+    from .hooks import _make_mutable
+
+    repo_root = Path(repo_root).resolve()
+    pidfile = _scoped_pidfile(repo_root, hardened)
+    lockfile = _scoped_lockfile(repo_root, hardened)
+    portfile = _scoped_portfile(repo_root, hardened)
+    plist_label = _scoped_plist_label(repo_root)
+    plist_path = _scoped_plist_path(repo_root, hardened)
+    shadow_pidfile = pidfile.with_suffix(".shadow")
+
+    if force:
+        dm = DaemonManager(pidfile, lockfile)
+        dm.force_cleanup()
+        if not hardened and plist_path.exists():
+            plist_path.unlink(missing_ok=True)
+        for f in (portfile, shadow_pidfile):
+            f.unlink(missing_ok=True)
+        _state.touch_registry(repo_root, hardened=hardened, running=False)
+        return True
+
+    stopped = False
+
+    if not hardened:
+        if stop_shadow_for_repo(repo_root, hardened):
+            stopped = True
+            time.sleep(0.2)
+
+    guardian_pid = None
+    if hardened:
+        try:
+            r = subprocess.run(
+                ["sudo", "cat", str(pidfile)],
+                capture_output=True, text=True, timeout=5,
+            )
+            if r.returncode == 0 and r.stdout.strip():
+                guardian_pid = int(r.stdout.strip())
+        except Exception:
+            pass
+    elif pidfile.exists():
+        try:
+            guardian_pid = int(pidfile.read_text().strip())
+        except (ValueError, OSError):
+            pass
+
+    if guardian_pid:
+        try:
+            if hardened:
+                r = subprocess.run(
+                    ["sudo", "kill", "-0", str(guardian_pid)],
+                    capture_output=True, timeout=5,
+                )
+                if r.returncode != 0:
+                    raise OSError("not running")
+                subprocess.run(["sudo", "kill", str(guardian_pid)], capture_output=True, timeout=5)
+            else:
+                os.kill(guardian_pid, 0)
+                os.kill(guardian_pid, signal.SIGTERM)
+            for _ in range(10):
+                try:
+                    if hardened:
+                        r = subprocess.run(
+                            ["sudo", "kill", "-0", str(guardian_pid)],
+                            capture_output=True, timeout=5,
+                        )
+                        if r.returncode != 0:
+                            break
+                    else:
+                        os.kill(guardian_pid, 0)
+                    time.sleep(0.2)
+                except OSError:
+                    break
+            else:
+                try:
+                    if hardened:
+                        subprocess.run(["sudo", "kill", "-9", str(guardian_pid)], capture_output=True, timeout=5)
+                    else:
+                        os.kill(guardian_pid, signal.SIGKILL)
+                except OSError:
+                    pass
+            stopped = True
+        except OSError:
+            pass
+
+    try:
+        if sys.platform == "darwin":
+            if hardened:
+                subprocess.run(["sudo", "launchctl", "bootout", "system", plist_label], capture_output=True, timeout=10)
+            else:
+                uid = os.getuid()
+                subprocess.run(["launchctl", "bootout", f"gui/{uid}/{plist_label}"], capture_output=True, timeout=10)
+    except Exception:
+        pass
+
+    try:
+        if hardened:
+            subprocess.run(["sudo", "rm", "-f", str(plist_path)], capture_output=True, timeout=10)
+        elif plist_path.exists():
+            plist_path.unlink()
+    except OSError:
+        pass
+
+    for f in (pidfile, lockfile, portfile, shadow_pidfile):
+        try:
+            if hardened:
+                subprocess.run(["sudo", "rm", "-f", str(f)], capture_output=True, timeout=10)
+            elif f.exists():
+                f.unlink()
+        except OSError:
+            pass
+
+    if hardened:
+        shared_port = repo_root / ".guardian" / "guardian.control.port"
+        try:
+            subprocess.run(["sudo", "rm", "-f", str(shared_port)], capture_output=True, timeout=10)
+        except OSError:
+            pass
+
+    try:
+        hooks_dir = repo_root / ".git" / "hooks"
+        if hooks_dir.exists():
+            for hook in hooks_dir.iterdir():
+                if hook.is_file() and not hook.name.endswith(".sample"):
+                    _make_mutable(hook)
+    except Exception:
+        pass
+
+    _state.touch_registry(repo_root, hardened=hardened, running=False)
+    return stopped
+
+
+def stop_guardian_by_id(rid: str, *, hardened: bool = False) -> bool:
+    """Stop guardian when only repo id is known (orphan / missing holder)."""
+    import signal
+    import time
+
+    stopped = False
+    my_pid = os.getpid()
+    patterns = (
+        f"deadpush_shadow_watch.{rid}",
+        f"guardian.{rid}.pid",
+        f"repos/{rid}/",
+    )
+    pids: set[int] = set()
+    for pattern in patterns:
+        try:
+            r = subprocess.run(["pgrep", "-f", pattern], capture_output=True, text=True, timeout=5)
+            if r.returncode != 0:
+                continue
+            for line in r.stdout.splitlines():
+                try:
+                    pid = int(line.strip())
+                    if pid != my_pid:
+                        pids.add(pid)
+                except ValueError:
+                    pass
+        except Exception:
+            pass
+
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+            stopped = True
+        except OSError:
+            pass
+    time.sleep(0.5)
+    for pid in pids:
+        try:
+            os.kill(pid, 0)
+            os.kill(pid, signal.SIGKILL)
+            stopped = True
+        except OSError:
+            pass
+
+    root = _state.state_dir(hardened)
+    for pidfile in (root / "repos" / rid / "guardian.pid", root / f"guardian.{rid}.pid"):
+        if pidfile.exists():
+            try:
+                gpid = int(pidfile.read_text(encoding="utf-8").strip())
+                if gpid != my_pid:
+                    try:
+                        os.kill(gpid, signal.SIGTERM)
+                        stopped = True
+                    except OSError:
+                        pass
+                    time.sleep(0.3)
+                    try:
+                        os.kill(gpid, signal.SIGKILL)
+                    except OSError:
+                        pass
+            except (ValueError, OSError):
+                pass
+        pidfile.unlink(missing_ok=True)
+
+    repos_dir = root / "repos" / rid
+    for name in ("guardian.lock", "guardian.shadow", "control.port"):
+        (repos_dir / name).unlink(missing_ok=True)
+    (root / f"guardian.{rid}.shadow").unlink(missing_ok=True)
+    sock = repos_dir / "gpc.sock"
+    if sock.exists():
+        sock.unlink(missing_ok=True)
+    return stopped
+
+
+def kill_orphan_guardian_processes() -> int:
+    """SIGTERM stray guardian/shadow processes. Returns count killed."""
+    import signal
+
+    patterns = (
+        "deadpush_shadow_watch.",
+        "-m deadpush.cli guard --daemon",
+        "-m deadpush_bootstrap guard --daemon",
+        "-m deadpush guard --daemon",
+    )
+    my_pid = os.getpid()
+    killed = 0
+    seen: set[int] = set()
+    for pattern in patterns:
+        try:
+            r = subprocess.run(
+                ["pgrep", "-f", pattern],
+                capture_output=True, text=True, timeout=5,
+            )
+            if r.returncode != 0:
+                continue
+            for line in r.stdout.strip().splitlines():
+                if not line.strip():
+                    continue
+                pid = int(line.strip())
+                if pid == my_pid or pid in seen:
+                    continue
+                seen.add(pid)
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                    killed += 1
+                except OSError:
+                    pass
+        except Exception:
+            pass
+    time.sleep(0.5)
+    for pid in list(seen):
+        try:
+            os.kill(pid, 0)
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+    return killed
+
+
+def count_running_guardians() -> int:
+    """Return number of guardian processes still alive."""
+    try:
+        r = subprocess.run(
+            ["pgrep", "-f", "deadpush_shadow_watch.|guard --daemon"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if r.returncode != 0:
+            return 0
+        return len([ln for ln in r.stdout.strip().splitlines() if ln.strip()])
+    except Exception:
+        return 0
 
 
 # =============================================================================

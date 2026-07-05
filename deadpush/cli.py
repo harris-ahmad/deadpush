@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -527,7 +528,8 @@ def cmd_status(repo, hardened):
                 print("\nNo intervention actions in recent log tail.")
 
             print(f"\nLog file: {log}")
-            print("Live tail: tail -f " + str(log))
+            print("Live tail:  deadpush logs -f")
+            print("Dashboard:  deadpush dashboard --open")
         except Exception as e:
             print_warning(f"Could not parse recent log: {e}")
     else:
@@ -544,8 +546,9 @@ def cmd_status(repo, hardened):
     if port_file.exists():
         try:
             port = port_file.read_text().strip()
-            print(f"\nLocal Control Interface (for AI agents): http://127.0.0.1:{port}")
-            print("  Agents can GET /status, /quarantine-list, /safety-score, etc.")
+            print(f"\nLocal Control Interface: http://127.0.0.1:{port}")
+            print(f"  Dashboard (live):      http://127.0.0.1:{port}/dashboard")
+            print("  JSON API (agents):     /status, /safety-score, /quarantine-list")
         except Exception:
             pass
 
@@ -1066,210 +1069,194 @@ def cmd_unfreeze(hardened):
 @main.command("stop")
 @click.option("--repo", type=click.Path(exists=True, file_okay=False), default=None,
               help="Repo root to stop (default: auto-detect from cwd)")
+@click.option("--all", "stop_all", is_flag=True,
+              help="Stop guardians for every known repo (see: deadpush repos list)")
 @click.option("--hardened", is_flag=True, help="Stop a hardened guardian")
 @click.option("--force", is_flag=True, help="Force cleanup of stale lock/PID files (use if guardian crashed)")
-def cmd_stop(repo, hardened, force):
+def cmd_stop(repo, stop_all, hardened, force):
     """Stop the deadpush guardian and clean up.
 
     Sends SIGTERM to the guardian (which saves safety score with a clean-shutdown
     marker so restart doesn't trigger the "killed by agent" penalty), unloads the
     launchd plist, kills shadow processes, removes immutable flags from hooks,
     and cleans up PID / lock files.
+
+    Use ``--all`` to stop every known repo in one shot, then verify with
+    ``pgrep -fl deadpush`` (should print nothing).
     """
-    import os
-    import signal
-    import subprocess
-    import time
+    from .guard import (
+        stop_guardian_for_repo,
+        stop_guardian_by_id,
+        kill_orphan_guardian_processes,
+        count_running_guardians,
+    )
+    from .state import discover_repos
+
+    if stop_all:
+        print_header("deadpush stop --all", "Stopping every known guardian")
+        seen_paths: set[str] = set()
+        seen_ids: set[str] = set()
+        stopped = 0
+        for h in (False, True):
+            for entry in discover_repos(hardened=h):
+                rid = entry["id"]
+                path = entry.get("path") or ""
+                if path and path not in seen_paths:
+                    seen_paths.add(path)
+                    label = entry.get("label") or path
+                    if stop_guardian_for_repo(path, hardened=entry.get("hardened", h), force=force):
+                        print_success(f"Stopped {label} ({path})")
+                        stopped += 1
+                    elif force:
+                        print_info(f"Cleaned state for {label}")
+                        stopped += 1
+                elif rid not in seen_ids:
+                    seen_ids.add(rid)
+                    if stop_guardian_by_id(rid, hardened=h):
+                        print_success(f"Stopped guardian id={rid}")
+                        stopped += 1
+        orphans = kill_orphan_guardian_processes()
+        if orphans:
+            print_warning(f"Sent SIGTERM to {orphans} orphan process(es)")
+        remaining = count_running_guardians()
+        if remaining:
+            print_error(f"{remaining} guardian/shadow process(es) still running — try: pgrep -fl deadpush")
+        else:
+            print_success("No guardian processes running.")
+        return
 
     from .config import load_config
-    from .guard import (
-        _scoped_pidfile,
-        _scoped_lockfile,
-        _scoped_portfile,
-        _scoped_plist_label,
-        _scoped_plist_path,
-        stop_shadow_for_repo,
-    )
-    from .hooks import _make_mutable
 
     config = load_config(explicit_root=Path(repo).resolve() if repo else None)
     repo_root = config.repo_root
-    pidfile = _scoped_pidfile(repo_root, hardened)
-    lockfile = _scoped_lockfile(repo_root, hardened)
-    plist_label = _scoped_plist_label(repo_root)
-    plist_path = _scoped_plist_path(repo_root, hardened)
-    portfile = _scoped_portfile(repo_root, hardened)
-    shadow_pidfile = pidfile.with_suffix(".shadow")
+    if stop_guardian_for_repo(repo_root, hardened=hardened, force=force):
+        print_success(f"Guardian stopped for {repo_root.name}. Restart with: deadpush protect")
+    elif force:
+        print_success("Forced cleanup complete.")
+    else:
+        print_info("No guardian was running.")
 
-    # Force cleanup mode: just remove all state files and exit
-    if force:
-        from .guard import DaemonManager
-        dm = DaemonManager(pidfile, lockfile)
-        dm.force_cleanup()
-        # Also clean up plist and shared port
-        if hardened:
-            try:
-                subprocess.run(["sudo", "rm", "-f", str(plist_path)], capture_output=True, timeout=10)
-                subprocess.run(["sudo", "rm", "-f", str(repo_root / ".guardian" / "guardian.control.port")], capture_output=True, timeout=10)
-            except Exception:
-                pass
-        else:
-            if plist_path.exists():
-                plist_path.unlink()
-            shared_port = repo_root / ".guardian" / "guardian.control.port"
-            if shared_port.exists():
-                shared_port.unlink()
-        print("Forced cleanup complete. All guardian state removed.")
+
+
+@main.group("repos")
+def cmd_repos():
+    """List and manage per-repo guardian state under ~/.deadpush/repos/."""
+    pass
+
+
+@cmd_repos.command("list")
+@click.option("--hardened", is_flag=True, help="List hardened (/var/db/deadpush) repos only")
+def cmd_repos_list(hardened):
+    """Show all known repos with id, path, and running status."""
+    from .state import discover_repos, state_dir
+
+    entries = discover_repos(hardened=hardened)
+    if not entries:
+        print_info(f"No repos registered under {state_dir(hardened)}")
         return
 
-    guardian_killed = False
-    shadow_killed = False
+    print_header("deadpush repos", str(state_dir(hardened)))
+    print(f"{'ID':<14} {'STATUS':<10} {'LABEL':<22} PATH")
+    print("-" * 72)
+    for e in entries:
+        status = "RUNNING" if e.get("running") else "stopped"
+        pid = f" pid={e['pid']}" if e.get("pid") and e.get("running") else ""
+        label = (e.get("label") or e["id"])[:22]
+        path = e.get("path") or "(unknown path)"
+        print(f"{e['id']:<14} {status + pid:<10} {label:<22} {path}")
 
-    # 1. Kill shadow processes first (they re-spawn the guardian) — repo-scoped only
-    if not hardened:
-        count = stop_shadow_for_repo(repo_root, hardened)
-        if count:
-            shadow_killed = True
-            print(f"  Killed {count} shadow process(es)")
-            time.sleep(0.2)
 
-    # 2. Kill guardian via PID file for this repo only
-    guardian_pid = None
-    if hardened:
-        try:
-            r = subprocess.run(
-                ["sudo", "cat", str(pidfile)],
-                capture_output=True, text=True, timeout=5,
-            )
-            if r.returncode == 0 and r.stdout.strip():
-                guardian_pid = int(r.stdout.strip())
-        except Exception:
-            pass
-    elif pidfile.exists():
-        try:
-            guardian_pid = int(pidfile.read_text().strip())
-        except (ValueError, OSError):
-            pass
+@cmd_repos.command("clean")
+@click.option("--older-than", default=30, type=int, help="Remove stopped repos unseen for N days")
+@click.option("--dry-run", is_flag=True, help="Show what would be removed")
+def cmd_repos_clean(older_than, dry_run):
+    """Prune state dirs for repos that are stopped and stale."""
+    import shutil
+    from datetime import datetime, timedelta, timezone
 
-    if guardian_pid:
-        try:
-            if hardened:
-                r = subprocess.run(
-                    ["sudo", "kill", "-0", str(guardian_pid)],
-                    capture_output=True, timeout=5,
-                )
-                if r.returncode != 0:
-                    raise OSError("not running")
-                subprocess.run(
-                    ["sudo", "kill", str(guardian_pid)],
-                    capture_output=True, timeout=5,
-                )
-            else:
-                os.kill(guardian_pid, 0)  # check alive
-                os.kill(guardian_pid, signal.SIGTERM)
-            # Wait briefly so shutdown handler runs mark_clean_shutdown()
-            for _ in range(10):
-                try:
-                    if hardened:
-                        r = subprocess.run(
-                            ["sudo", "kill", "-0", str(guardian_pid)],
-                            capture_output=True, timeout=5,
-                        )
-                        if r.returncode != 0:
-                            break
-                    else:
-                        os.kill(guardian_pid, 0)
-                    time.sleep(0.2)
-                except OSError:
-                    break
-            else:
-                # Force kill if still alive
-                try:
-                    if hardened:
-                        subprocess.run(
-                            ["sudo", "kill", "-9", str(guardian_pid)],
-                            capture_output=True, timeout=5,
-                        )
-                    else:
-                        os.kill(guardian_pid, signal.SIGKILL)
-                except OSError:
-                    pass
-            guardian_killed = True
-            print(f"  Guardian PID {guardian_pid} stopped")
-        except OSError:
-            print(f"  Guardian PID {guardian_pid} not running (stale PID file)")
+    from .state import discover_repos, repo_state_dir, state_dir
 
-    # 3. Launchctl bootout (unload plist, prevents re-spawn)
-    try:
-        if hardened:
-            r = subprocess.run(
-                ["sudo", "launchctl", "bootout", "system", plist_label],
-                capture_output=True, text=True, timeout=10,
-            )
+    cutoff = datetime.now(timezone.utc) - timedelta(days=older_than)
+    removed = 0
+    for entry in discover_repos(hardened=False):
+        if entry.get("running"):
+            continue
+        path = entry.get("path")
+        if not path:
+            continue
+        d = repo_state_dir(path, hardened=False)
+        manifest = d / "manifest.json"
+        if manifest.exists():
+            try:
+                m = json.loads(manifest.read_text(encoding="utf-8"))
+                last = datetime.fromisoformat(m.get("last_seen", "1970-01-01T00:00:00+00:00"))
+                if last.tzinfo is None:
+                    last = last.replace(tzinfo=timezone.utc)
+                if last > cutoff:
+                    continue
+            except Exception:
+                pass
+        if dry_run:
+            print(f"would remove {d}")
         else:
-            uid = os.getuid()
-            r = subprocess.run(
-                ["launchctl", "bootout", f"gui/{uid}/{plist_label}"],
-                capture_output=True, text=True, timeout=10,
-            )
-        if r.returncode == 0:
-            print("  launchd plist unloaded")
-        elif "not found" in r.stderr.lower() or "does not exist" in r.stderr.lower():
-            pass  # not loaded — fine
-        else:
-            print(f"  launchctl bootout: {r.stderr.strip()}")
-    except Exception:
-        pass
-
-    # 5. Remove the plist from LaunchAgents / LaunchDaemons
-    try:
-        if hardened:
-            r = subprocess.run(["sudo", "test", "-e", str(plist_path)], capture_output=True, timeout=5)
-            if r.returncode == 0:
-                subprocess.run(["sudo", "rm", str(plist_path)], capture_output=True, text=True, timeout=10)
-                print(f"  Removed {plist_path.name}")
-        elif plist_path.exists():
-            plist_path.unlink()
-            print(f"  Removed {plist_path.name}")
-    except OSError as e:
-        print(f"  Could not remove plist: {e}")
-
-    # 6. Clean up PID / lock / port / shadow files for this repo only
-    for f in [pidfile, lockfile, portfile, shadow_pidfile]:
-        try:
-            if hardened:
-                subprocess.run(["sudo", "rm", "-f", str(f)], capture_output=True, text=True, timeout=10)
-            elif f.exists():
-                f.unlink()
-        except OSError:
-            pass
-
-    # 6b. Clean up shared port file (hardened mode)
-    if hardened:
-        shared_port = repo_root / ".guardian" / "guardian.control.port"
-        try:
-            subprocess.run(["sudo", "rm", "-f", str(shared_port)], capture_output=True, text=True, timeout=10)
-        except OSError:
-            pass
-
-    # 7. Remove immutable flag from git hooks
-    try:
-        hooks_dir = config.repo_root / ".git" / "hooks"
-        if hooks_dir.exists():
-            for hook in hooks_dir.iterdir():
-                if hook.is_file() and not hook.name.endswith(".sample"):
-                    _make_mutable(hook)
-            print("  Removed immutable flag from hooks")
-    except Exception:
-        pass
-
-    # 8. Print summary
-    if guardian_killed or shadow_killed:
-        print("\nGuardian stopped. You can restart it later with:")
-        print("  deadpush protect")
+            shutil.rmtree(d, ignore_errors=True)
+            removed += 1
+    if dry_run:
+        print_info("Dry run only — no files deleted.")
     else:
-        print("No guardian was running.")
+        print_success(f"Removed {removed} stale repo state dir(s) under {state_dir(False) / 'repos'}")
 
+
+@main.command("logs")
+@click.option("--repo", type=click.Path(exists=True, file_okay=False), default=None,
+              help="Repo root (default: auto-detect from cwd)")
+@click.option("-f", "--follow", is_flag=True, help="Tail log live (like tail -f)")
+@click.option("--lines", "-n", default=40, type=int, help="Number of lines to show (default 40)")
+def cmd_logs(repo, follow, lines):
+    """Show guardian log for the current (or given) repo."""
+    import subprocess
+
+    from .guard import _scoped_log_file
+
+    config = load_config(explicit_root=Path(repo).resolve() if repo else None)
+    log = _scoped_log_file(config.repo_root, hardened=False)
+    if not log.exists():
+        print_warning(f"No log yet: {log}")
+        return
+    if follow:
+        subprocess.run(["tail", "-f", str(log)])
+        return
+    text = log.read_text(errors="ignore")
+    chunk = text.strip().splitlines()[-lines:] if text.strip() else []
+    for line in chunk:
+        click.echo(line)
+    print(f"\n({log})")
+
+
+@main.command("dashboard")
+@click.option("--repo", type=click.Path(exists=True, file_okay=False), default=None,
+              help="Repo root (default: auto-detect from cwd)")
+@click.option("--open", "open_browser", is_flag=True, help="Open in default browser")
+def cmd_dashboard(repo, open_browser):
+    """Open the live guardian dashboard (http://127.0.0.1:PORT/dashboard)."""
+    import webbrowser
+
+    from .guard import _scoped_portfile, guardian_is_running
+
+    config = load_config(explicit_root=Path(repo).resolve() if repo else None)
+    repo_root = config.repo_root
+    if not guardian_is_running(repo_root, hardened=False):
+        print_error("Guardian is not running. Start with: deadpush protect --daemon")
+        return
+    port_file = _scoped_portfile(repo_root, hardened=False)
+    if not port_file.exists():
+        print_error("Control port file missing — is the guardian fully started?")
+        return
+    port = port_file.read_text().strip()
+    url = f"http://127.0.0.1:{port}/dashboard"
+    print(url)
+    if open_browser:
+        webbrowser.open(url)
 
 
 @main.command("uninstall")

@@ -37,10 +37,7 @@ GUARDIAN_TO_CLIENT = frozenset({
 CLIENT_TO_GUARDIAN = frozenset({"ACK", "HEARTBEAT", "REQUEST_OVERRIDE", "PROXY_BLOCK"})
 
 
-def _state_dir(hardened: bool = False) -> Path:
-    if hardened:
-        return Path("/var/db/deadpush")
-    return Path.home() / ".deadpush"
+from . import state as _state
 
 
 def gpc_socket_path(repo_root: Path, *, hardened: bool | None = None) -> Path:
@@ -48,8 +45,7 @@ def gpc_socket_path(repo_root: Path, *, hardened: bool | None = None) -> Path:
     resolved = Path(repo_root).resolve()
     if hardened is None:
         hardened = is_hardened_install(resolved)
-    rid = repo_id(resolved)
-    return _state_dir(hardened) / f"gpc.{rid}.sock"
+    return _state.scoped_gpc_socket(resolved, hardened)
 
 
 def _now_iso() -> str:

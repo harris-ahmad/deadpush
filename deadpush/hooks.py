@@ -767,13 +767,29 @@ def restore_hookspath(repo_root: Path) -> bool:
     return changed and detect_hookspath_hijack(repo_root) is None
 
 
+def _hook_checksum_matches(repo_root: Path, hook_name: str, hook_path: Path) -> bool:
+    """Return True when on-disk hook content matches the saved checksum."""
+    checksum_file = repo_root / ".deadpush" / "hooks" / f"{hook_name}.sha256"
+    if not checksum_file.exists() or not hook_path.is_file():
+        return False
+    try:
+        expected = checksum_file.read_text(encoding="utf-8").strip()
+        actual = hashlib.sha256(hook_path.read_text(encoding="utf-8").encode()).hexdigest()
+        return actual == expected
+    except Exception:
+        return False
+
+
 def verify_hooks_installed(repo_root: Path) -> list[str]:
     """Return hook names that are missing, checksum-mismatched, or not immutable."""
+    from .config import is_hardened_install
+
     problems: list[str] = []
     hijack = detect_hookspath_hijack(repo_root)
     if hijack:
         problems.append(f"core.hooksPath (hijacked -> {hijack})")
     hooks_dir = repo_root / ".git" / "hooks"
+    hardened = is_hardened_install(repo_root)
     for name in ("pre-push", "pre-commit", "post-commit"):
         hook_path = hooks_dir / name
         if not hook_path.exists():
@@ -789,10 +805,31 @@ def verify_hooks_installed(repo_root: Path) -> list[str]:
             except Exception:
                 problems.append(f"{name} (checksum unreadable)")
         if not _is_immutable(hook_path):
-            # Only flag on macOS where we expect this to work; Linux might lack chattr access
-            if sys.platform == "darwin":
+            # macOS only: immutability is required in hardened mode. In soft mode a
+            # checksum-valid hook is acceptable — re-installing in a loop when
+            # chflags uchg fails (or was cleared by `deadpush stop`) wastes CPU and
+            # spams logs without improving security.
+            if sys.platform == "darwin" and hardened:
+                problems.append(f"{name} (not immutable)")
+            elif sys.platform == "darwin" and not _hook_checksum_matches(repo_root, name, hook_path):
                 problems.append(f"{name} (not immutable)")
     return problems
+
+
+def relock_deadpush_hooks(repo_root: Path, *, system: bool | None = None) -> list[str]:
+    """Re-apply immutable flags without rewriting hook scripts."""
+    from .config import is_hardened_install
+
+    if system is None:
+        system = is_hardened_install(repo_root)
+    hooks_dir = repo_root / ".git" / "hooks"
+    relocked: list[str] = []
+    for name in ("pre-push", "pre-commit", "post-commit"):
+        hook_path = hooks_dir / name
+        if hook_path.exists() and not _is_immutable(hook_path):
+            if _make_immutable(hook_path, system=system):
+                relocked.append(name)
+    return relocked
 
 
 def uninstall_deadpush_hooks(repo_root: Path, *, system: bool = False) -> list[str]:
@@ -863,15 +900,24 @@ def repair_deadpush_hooks(repo_root: Path, *, system: bool | None = None) -> lis
     if any(p.startswith("core.hooksPath") for p in problems) and restore_hookspath(repo_root):
         repaired.append("core.hooksPath")
     for name in ("pre-push", "pre-commit", "post-commit"):
-        if not any(p.startswith(name) for p in problems):
+        hook_problems = [p for p in problems if p.startswith(name)]
+        if not hook_problems:
             continue
-        if name == "pre-push":
-            install_hook(repo_root, system=system)
-        elif name == "pre-commit":
-            install_precommit_hook(repo_root, system=system)
-        elif name == "post-commit":
-            install_postcommit_hook(repo_root, system=system)
-        repaired.append(name)
+        needs_reinstall = any(
+            "(not immutable)" not in p for p in hook_problems
+        )
+        if needs_reinstall:
+            if name == "pre-push":
+                install_hook(repo_root, system=system)
+            elif name == "pre-commit":
+                install_precommit_hook(repo_root, system=system)
+            elif name == "post-commit":
+                install_postcommit_hook(repo_root, system=system)
+            repaired.append(name)
+        elif any("(not immutable)" in p for p in hook_problems):
+            hook_path = repo_root / ".git" / "hooks" / name
+            if hook_path.exists() and _make_immutable(hook_path, system=system):
+                repaired.append(name)
     return repaired
 
 
