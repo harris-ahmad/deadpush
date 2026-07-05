@@ -48,3 +48,23 @@ def test_scan_tool_call_allows_clean(temp_repo: Path):
 def test_scan_tool_call_allows_read(temp_repo: Path):
     block = scan_tool_call("read_file", {"path": "hello.py"}, temp_repo)
     assert block is None
+
+
+def test_scan_tool_call_blocks_destructive_shell(temp_repo: Path):
+    block = scan_tool_call(
+        "run_terminal_cmd",
+        {"command": "rm -rf /"},
+        temp_repo,
+    )
+    assert block is not None
+    assert block.get("isError") is True
+
+
+def test_scan_tool_call_blocks_git_hookspath_shell(temp_repo: Path):
+    block = scan_tool_call(
+        "Bash",
+        {"command": "git -c core.hooksPath=/tmp/evil commit -m x"},
+        temp_repo,
+    )
+    assert block is not None
+

@@ -100,8 +100,11 @@ def test_gpc_override_request_logged(temp_repo: Path):
         time.sleep(0.1)
         client = GpcClient(temp_repo)
         assert client.send_request_override("need to push hotfix", related_message_id="inc-1")
-        time.sleep(0.5)
         log = temp_repo / ".deadpush" / "gpc_overrides.jsonl"
+        for _ in range(20):
+            if log.exists():
+                break
+            time.sleep(0.1)
         assert log.exists()
         line = json.loads(log.read_text(encoding="utf-8").strip())
         assert line["payload"]["reason"] == "need to push hotfix"
@@ -111,3 +114,26 @@ def test_gpc_override_request_logged(temp_repo: Path):
 
 def test_gpc_protocol_version():
     assert GPC_PROTOCOL_VERSION == "1.0"
+
+
+def test_gpc_proxy_block_rebroadcasts_incident(temp_repo: Path):
+    received: list[str] = []
+
+    def on_msg(msg):
+        received.append(msg.type)
+
+    server = GpcServer(temp_repo, hardened=False)
+    server.start()
+    try:
+        import time
+        time.sleep(0.1)
+        listener = GpcClient(temp_repo, on_message=on_msg)
+        listener.connect_and_listen()
+        time.sleep(0.2)
+        reporter = GpcClient(temp_repo)
+        assert reporter.send_proxy_block("run_terminal_cmd", "rm -rf /", file="_shell_")
+        time.sleep(0.3)
+        assert "INCIDENT" in received
+    finally:
+        server.stop()
+

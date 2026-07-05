@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -13,6 +14,7 @@ from deadpush.backends.seatbelt import (
     profile_content_hash,
     seatbelt_available,
     validate_seatbelt_profile,
+    verify_write_blocked_outside_repo,
     write_seatbelt_profile,
 )
 
@@ -22,6 +24,8 @@ def test_generate_seatbelt_profile(temp_repo: Path):
     assert str(temp_repo.resolve()) in profile
     assert "(deny default)" in profile
     assert "(allow file-write*" in profile
+    assert "(allow network-outbound)" in profile
+    assert "(allow network*)" not in profile
     assert ".ssh" in profile
 
 
@@ -72,3 +76,19 @@ def test_seatbelt_backend_wrap(temp_repo: Path):
 def test_seatbelt_available_on_macos(temp_repo: Path):
     backend = SeatbeltEnforcementBackend(temp_repo)
     assert backend.available() == seatbelt_available()
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="Seatbelt is macOS-only")
+def test_write_blocked_outside_repo(temp_repo: Path):
+    if not seatbelt_available():
+        pytest.skip("sandbox-exec not available")
+    # Must be outside repo AND outside Seatbelt temp allowlist (/private/tmp, /var/folders).
+    outside = Path("/Users/Shared") / f".deadpush_sandbox_probe_{os.getpid()}"
+    outside.mkdir(parents=True, exist_ok=True)
+    try:
+        assert verify_write_blocked_outside_repo(temp_repo, outside)
+    finally:
+        probe = outside / ".deadpush_sandbox_probe"
+        probe.unlink(missing_ok=True)
+        outside.rmdir()
+

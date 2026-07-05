@@ -97,8 +97,11 @@ def run_sandbox(
         logger.error("Backend start failed: %s", e)
         if backend_prefer == "seatbelt":
             raise
-        # Fall back to noop semantics for resilience
         from .backends.noop import NoopEnforcementBackend
+        logger.warning(
+            "Falling back to T2-partial (noop): OS sandbox unavailable — "
+            "git/MCP/guardian gates only, not syscall confinement"
+        )
         backend = NoopEnforcementBackend(repo)
         backend.start(repo)
 
@@ -120,6 +123,26 @@ def run_sandbox(
             gpc.stop()
         if bindir:
             shutil.rmtree(bindir, ignore_errors=True)
+
+
+def describe_backends(repo_root: Path | None = None) -> dict[str, Any]:
+    """Report available enforcement backends and the selected default."""
+    from .backends.linux import LinuxEnforcementBackend
+    from .backends.noop import NoopEnforcementBackend
+    from .backends.seatbelt import SeatbeltEnforcementBackend
+
+    config = load_config(explicit_root=repo_root)
+    repo = config.repo_root.resolve()
+    candidates = [
+        SeatbeltEnforcementBackend(repo),
+        LinuxEnforcementBackend(repo),
+        NoopEnforcementBackend(repo),
+    ]
+    selected = get_backend(repo)
+    return {
+        "selected": selected.describe(),
+        "available": [b.describe() for b in candidates],
+    }
 
 
 def describe_session(repo_root: Path | None = None, *, backend_prefer: str | None = None) -> dict[str, Any]:

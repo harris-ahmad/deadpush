@@ -872,7 +872,16 @@ def cmd_run(sandbox, hardened, backend, repo, cmd):
         raise SystemExit(subprocess.run(list(cmd)).returncode)
 
     info = describe_session(repo_root, backend_prefer=backend)
-    print(f"Tier T2 sandbox — backend: {info['backend']['name']}")
+    backend_name = info["backend"]["name"]
+    print(f"Tier T2 sandbox — backend: {backend_name}")
+    if backend_name == "noop":
+        print_warning(
+            "OS sandbox unavailable — using T2-partial (noop). "
+            "Subprocess has normal filesystem access; enforcement is via git-wrapper, "
+            "MCP proxy, and guardian quarantine only."
+        )
+    elif info["backend"].get("last_error"):
+        print_warning(info["backend"]["last_error"])
     raise SystemExit(run_sandbox(
         list(cmd),
         repo_root=repo_root,
@@ -1621,6 +1630,43 @@ def cmd_doctor(repo, hardened):
             check("State dir permissions", mode_ok and owner_ok, f"mode={oct(mode)}, uid={st.st_uid}")
         except Exception:
             check("State dir permissions", False, "could not check")
+
+    # 9. Sandbox backends + guardrail plugins
+    print()
+    print("  Sandbox backends:")
+    try:
+        from .run_session import describe_backends
+        from .plugins import load_plugins, plugin_load_errors
+
+        backends = describe_backends(repo_root)
+        selected = backends["selected"]
+        os_sandbox = selected.get("os_sandbox", False)
+        check(
+            "Selected sandbox backend",
+            True,
+            f"{selected.get('name')} ({selected.get('tier')})"
+            + (" — OS syscall confinement" if os_sandbox else " — T2-partial, no OS sandbox"),
+        )
+        if selected.get("name") == "noop":
+            print("      → Run on macOS (Seatbelt) or Linux 5.13+ (fanotify) for full T2.")
+        for b in backends["available"]:
+            mark = "← selected" if b.get("name") == selected.get("name") else (
+                "available" if b.get("available") else "unavailable"
+            )
+            print(f"      · {b.get('name')}: {mark}")
+
+        load_plugins(reload=True)
+        plugin_errs = plugin_load_errors()
+        loaded = load_plugins()
+        check(
+            "Guardrail plugins",
+            not plugin_errs,
+            f"{len(loaded)} loaded" if not plugin_errs else "; ".join(plugin_errs[:2]),
+        )
+        if plugin_errs:
+            print("      → Fix or uninstall broken entry-point plugins in pyproject.toml.")
+    except Exception as e:
+        check("Sandbox backends", False, str(e))
 
     # Summary
     print()

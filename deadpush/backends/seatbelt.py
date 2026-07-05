@@ -77,7 +77,7 @@ def generate_seatbelt_profile(repo_root: Path, *, hardened: bool = False) -> str
 (allow file-ioctl)
 (allow mach-lookup)
 (allow ipc-posix*)
-(allow network*)
+(allow network-outbound)
 (allow file-write*
 {write_block}
     (require-all

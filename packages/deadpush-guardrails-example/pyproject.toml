@@ -1,0 +1,20 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "deadpush-guardrails-example"
+version = "0.1.0"
+description = "Reference guardrail plugin for deadpush — blocks TODO(FIXME) markers in production paths"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+dependencies = [
+    "deadpush>=0.3.0",
+]
+
+[project.entry-points."deadpush.guardrails"]
+no_todo_in_src = "deadpush_guardrails_example.plugin:NoTodoInSrcPlugin"
+
+[tool.hatch.build.targets.wheel]
+packages = ["deadpush_guardrails_example"]

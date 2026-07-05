@@ -4,7 +4,7 @@ Guardian Push Channel (GPC) — bidirectional push protocol outside MCP.
 Transport: Unix domain socket, newline-delimited JSON.
 
 Guardian → client: INCIDENT, LOCKDOWN, INSTRUCTION, POLICY_UPDATE, SESSION_PAUSE, WELCOME
-Client → guardian: ACK, HEARTBEAT, REQUEST_OVERRIDE
+Client → guardian: ACK, HEARTBEAT, REQUEST_OVERRIDE, PROXY_BLOCK
 """
 
 from __future__ import annotations
@@ -34,7 +34,7 @@ RECONNECT_MAX_DELAY = 30.0
 GUARDIAN_TO_CLIENT = frozenset({
     "INCIDENT", "LOCKDOWN", "INSTRUCTION", "POLICY_UPDATE", "SESSION_PAUSE", "WELCOME",
 })
-CLIENT_TO_GUARDIAN = frozenset({"ACK", "HEARTBEAT", "REQUEST_OVERRIDE"})
+CLIENT_TO_GUARDIAN = frozenset({"ACK", "HEARTBEAT", "REQUEST_OVERRIDE", "PROXY_BLOCK"})
 
 
 def _state_dir(hardened: bool = False) -> Path:
@@ -345,6 +345,15 @@ class GpcServer:
             pass
         elif msg.type == "REQUEST_OVERRIDE":
             self._log_override_request(msg)
+        elif msg.type == "PROXY_BLOCK":
+            payload = msg.payload or {}
+            self.emit_incident(
+                category=str(payload.get("category", "mcp_proxy")),
+                description=str(payload.get("description", "MCP proxy blocked tools/call")),
+                file=str(payload.get("file", "")),
+                tool=str(payload.get("tool", "")),
+                source="mcp-proxy",
+            )
 
         if self.on_client_message:
             try:
@@ -428,6 +437,20 @@ class GpcClient:
             repo_id=self.rid,
             payload={"reason": reason, "related_message_id": related_message_id},
         ))
+
+    def send_proxy_block(self, tool: str, description: str, *, file: str = "") -> bool:
+        """Report an MCP proxy block to the guardian (re-broadcast as INCIDENT)."""
+        return self._send(GpcMessage(
+            type="PROXY_BLOCK",
+            message_id=_new_message_id("pxy"),
+            repo_id=self.rid,
+            payload={
+                "tool": tool,
+                "description": description,
+                "file": file,
+                "category": "mcp_proxy",
+            },
+        ), keep_open=False)
 
     def _send(self, msg: GpcMessage, *, keep_open: bool | None = None) -> bool:
         if keep_open is None:

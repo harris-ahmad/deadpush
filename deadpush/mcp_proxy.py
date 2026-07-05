@@ -9,15 +9,19 @@ Usage:
 from __future__ import annotations
 
 import json
+import logging
 import subprocess
 import sys
 import threading
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from .config import load_config
 from .intercept import enforce_content, violations_from_result
 from .rules import RuntimeConfig
+
+logger = logging.getLogger("deadpush.mcp_proxy")
 
 MCP_PROTOCOL_VERSION = "2024-11-05"
 
@@ -28,11 +32,84 @@ WRITE_TOOL_NAMES = frozenset({
     "create_or_update_file", "file_write",
 })
 
+# Shell/terminal tools — always scanned for destructive commands.
+SHELL_TOOL_NAMES = frozenset({
+    "bash", "shell", "run_terminal_cmd", "terminal", "execute_command",
+    "run_command", "exec", "subprocess", "command", "run_shell_command",
+})
+
 GIT_TOOL_PATTERNS = ("git commit", "git push", "git add")
+
+DESTRUCTIVE_CMD_PATTERNS = (
+    "rm -rf", "rm -r /", "chmod 777", "mkfs.", ":(){ :|:& };:",
+    "curl | sh", "wget | sh", "curl|sh", "wget|sh",
+    "> /etc/", "dd if=", "git -c core.hookspath", "core.hookspath=",
+)
 
 # Argument keys that may hold file path or content.
 PATH_KEYS = ("path", "file_path", "filepath", "filename", "target", "file")
 CONTENT_KEYS = ("content", "contents", "text", "data", "new_string", "new_str", "replacement")
+
+
+def _shell_command(arguments: dict[str, Any]) -> str:
+    cmd = arguments.get("command") or arguments.get("cmd") or arguments.get("script") or ""
+    return cmd if isinstance(cmd, str) else ""
+
+
+def _destructive_shell_reason(cmd: str) -> str | None:
+    if not cmd:
+        return None
+    cmd_lower = cmd.lower()
+    for pat in DESTRUCTIVE_CMD_PATTERNS:
+        if pat in cmd_lower:
+            return f"Destructive shell command blocked: {pat!r} in {cmd[:120]!r}"
+    from .git_escape import detect_git_config_escape
+    parts = cmd.split()
+    escape = detect_git_config_escape(parts)
+    if escape:
+        return escape
+    return None
+
+
+def _block_result(tool_name: str, rel_path: str, summary: str, *, violations: list | None = None) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "success": False,
+        "blocked_by": "deadpush-mcp-proxy",
+        "tool": tool_name,
+        "summary": summary,
+    }
+    if violations is not None:
+        payload["violations"] = violations
+    return {
+        "content": [{"type": "text", "text": json.dumps(payload, indent=2)}],
+        "isError": True,
+    }
+
+
+def notify_proxy_block(repo_root: Path, tool_name: str, rel_path: str, summary: str) -> None:
+    """Best-effort: log block and notify guardian GPC (if running)."""
+    record = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "tool": tool_name,
+        "file": rel_path,
+        "summary": summary,
+    }
+    log_path = repo_root / ".deadpush" / "mcp_proxy_blocks.jsonl"
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record) + "\n")
+    except OSError as e:
+        logger.debug("Could not write mcp_proxy_blocks log: %s", e)
+
+    try:
+        from .config import is_hardened_install
+        from .gpc import GpcClient
+
+        client = GpcClient(repo_root, hardened=is_hardened_install(repo_root))
+        client.send_proxy_block(tool_name, summary, file=rel_path)
+    except Exception:
+        pass
 
 
 def _extract_path_and_content(arguments: dict[str, Any]) -> tuple[str | None, str | None]:
@@ -63,13 +140,20 @@ def _tool_needs_scan(tool_name: str, arguments: dict[str, Any]) -> bool:
     for part in WRITE_TOOL_NAMES:
         if part in name_lower:
             return True
+    if name_lower in SHELL_TOOL_NAMES:
+        return True
+    for part in SHELL_TOOL_NAMES:
+        if part in name_lower:
+            return True
     # Shell/bash tools with write-like commands
-    cmd = arguments.get("command") or arguments.get("cmd") or ""
-    if isinstance(cmd, str):
+    cmd = _shell_command(arguments)
+    if isinstance(cmd, str) and cmd:
         cmd_lower = cmd.lower()
         if any(p in cmd_lower for p in GIT_TOOL_PATTERNS):
             return True
         if any(w in cmd_lower for w in ("write_file", " echo ", " > ", " >> ", "tee ")):
+            return True
+        if _destructive_shell_reason(cmd):
             return True
     return False
 
@@ -78,6 +162,13 @@ def scan_tool_call(tool_name: str, arguments: dict[str, Any], repo_root: Path) -
     """Return MCP error result if blocked, else None (allow)."""
     if not _tool_needs_scan(tool_name, arguments):
         return None
+
+    shell_cmd = _shell_command(arguments)
+    destructive = _destructive_shell_reason(shell_cmd)
+    if destructive:
+        rel_path = "_shell_"
+        notify_proxy_block(repo_root, tool_name, rel_path, destructive)
+        return _block_result(tool_name, rel_path, f"Blocked by deadpush guardrails: {destructive}")
 
     config = load_config(explicit_root=repo_root)
     runtime = RuntimeConfig(repo_root)
@@ -103,19 +194,9 @@ def scan_tool_call(tool_name: str, arguments: dict[str, Any], repo_root: Path) -
 
     violations = violations_from_result(rel_path, result)
     summary = "; ".join(v["description"] for v in violations[:3])
-    return {
-        "content": [{
-            "type": "text",
-            "text": json.dumps({
-                "success": False,
-                "blocked_by": "deadpush-mcp-proxy",
-                "tool": tool_name,
-                "violations": violations,
-                "summary": f"Blocked by deadpush guardrails: {summary}",
-            }, indent=2),
-        }],
-        "isError": True,
-    }
+    full_summary = f"Blocked by deadpush guardrails: {summary}"
+    notify_proxy_block(repo_root, tool_name, rel_path, full_summary)
+    return _block_result(tool_name, rel_path, full_summary, violations=violations)
 
 
 class McpProxy:

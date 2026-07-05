@@ -7,6 +7,8 @@ import shutil
 import sys
 from pathlib import Path
 
+from .git_escape import detect_git_config_escape
+
 
 def find_real_git() -> str:
     """Locate the real git binary, skipping deadpush wrappers."""
@@ -30,6 +32,12 @@ def main(argv: list[str] | None = None) -> int:
     if not repo_root:
         repo_root = str(Path.cwd())
     repo = Path(repo_root).resolve()
+    in_sandbox = os.environ.get("DEADPUSH_SANDBOX") == "1"
+
+    escape = detect_git_config_escape(args)
+    if escape and in_sandbox:
+        print(f"deadpush: git blocked in sandbox session: {escape}", file=sys.stderr)
+        return 1
 
     subcmd = args[0] if args else ""
     no_verify = "--no-verify" in args or "-n" in args
