@@ -1,4 +1,4 @@
-# Guardian Push Channel (GPC) v0
+# Guardian Push Channel (GPC)
 
 Bidirectional push protocol **outside** MCP stdio. Agents subscribe to receive guardian
 events without polling MCP tools.
@@ -7,7 +7,8 @@ events without polling MCP tools.
 
 - Unix domain socket: `~/.deadpush/gpc.<repo-id>.sock` (soft) or `/var/db/deadpush/gpc.<repo-id>.sock` (hardened)
 - Framing: newline-delimited JSON (one message per line)
-- Protocol version: `0.1`
+- Protocol version: `1.0`
+- Max message size: 65536 bytes
 
 ## Guardian → client messages
 

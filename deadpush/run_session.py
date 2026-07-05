@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import shutil
 import subprocess
@@ -10,25 +11,27 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from .backends.base import get_backend
+from .backends.base import EnforcementBackend, get_backend
 from .config import is_hardened_install, load_config
 from .gpc import GpcServer
+
+logger = logging.getLogger("deadpush.run_session")
 
 
 def _make_git_wrapper_bin(repo_root: Path) -> Path:
     """Create a temp bin dir with a `git` shim pointing to deadpush git-wrapper."""
     bindir = Path(tempfile.mkdtemp(prefix="deadpush-bin-"))
     git_shim = bindir / "git"
-    # Resolve deadpush executable
     deadpush = shutil.which("deadpush") or sys.executable
+    repo_s = str(repo_root.resolve())
     if deadpush.endswith("python") or deadpush.endswith("python3"):
         wrapper = f'''#!/bin/sh
-export DEADPUSH_REPO_ROOT="{repo_root}"
+export DEADPUSH_REPO_ROOT="{repo_s}"
 exec "{sys.executable}" -m deadpush.git_wrapper "$@"
 '''
     else:
         wrapper = f'''#!/bin/sh
-export DEADPUSH_REPO_ROOT="{repo_root}"
+export DEADPUSH_REPO_ROOT="{repo_s}"
 exec "{deadpush}" git-wrapper "$@"
 '''
     git_shim.write_text(wrapper, encoding="utf-8")
@@ -36,7 +39,12 @@ exec "{deadpush}" git-wrapper "$@"
     return bindir
 
 
-def prepare_sandbox_env(repo_root: Path, *, hardened: bool = False) -> dict[str, str]:
+def prepare_sandbox_env(
+    repo_root: Path,
+    *,
+    hardened: bool = False,
+    backend: EnforcementBackend | None = None,
+) -> dict[str, str]:
     """Build environment for a sandboxed agent session."""
     env = dict(os.environ)
     env["DEADPUSH_REPO_ROOT"] = str(repo_root.resolve())
@@ -51,6 +59,9 @@ def prepare_sandbox_env(repo_root: Path, *, hardened: bool = False) -> dict[str,
     real_git = shutil.which("git")
     if real_git and bindir / "git" != Path(real_git):
         env["DEADPUSH_REAL_GIT"] = real_git
+
+    if backend is not None:
+        backend.apply_env_markers(env)
 
     return env
 
@@ -70,17 +81,35 @@ def run_sandbox(
 
     backend = get_backend(repo, prefer=backend_prefer)
     gpc: GpcServer | None = None
+    bindir: str | None = None
 
     if start_gpc:
         gpc = GpcServer(repo, hardened=use_hardened)
         try:
             gpc.start()
-        except OSError:
+        except OSError as e:
+            logger.warning("GPC unavailable for sandbox session: %s", e)
             gpc = None
 
-    backend.start(repo)
-    env = prepare_sandbox_env(repo, hardened=use_hardened)
-    wrapped = backend.wrap_command(cmd, repo_root=repo, env=env)
+    try:
+        backend.start(repo)
+    except RuntimeError as e:
+        logger.error("Backend start failed: %s", e)
+        if backend_prefer == "seatbelt":
+            raise
+        # Fall back to noop semantics for resilience
+        from .backends.noop import NoopEnforcementBackend
+        backend = NoopEnforcementBackend(repo)
+        backend.start(repo)
+
+    env = prepare_sandbox_env(repo, hardened=use_hardened, backend=backend)
+    bindir = env.get("DEADPUSH_BIN_DIR")
+
+    try:
+        wrapped = backend.wrap_command(cmd, repo_root=repo, env=env)
+    except (ValueError, RuntimeError) as e:
+        logger.error("Cannot wrap command: %s", e)
+        return 2
 
     try:
         result = subprocess.run(wrapped, env=env, cwd=repo)
@@ -89,7 +118,6 @@ def run_sandbox(
         backend.stop()
         if gpc:
             gpc.stop()
-        bindir = env.get("DEADPUSH_BIN_DIR")
         if bindir:
             shutil.rmtree(bindir, ignore_errors=True)
 
@@ -102,6 +130,6 @@ def describe_session(repo_root: Path | None = None, *, backend_prefer: str | Non
     return {
         "repo_root": str(repo),
         "backend": backend.describe(),
-        "tier": "T2",
+        "tier": backend.tier,
         "features": ["git-wrapper", "gpc", "enforcement-backend"],
     }

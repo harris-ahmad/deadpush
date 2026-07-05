@@ -12,7 +12,7 @@ from deadpush.run_session import describe_session, prepare_sandbox_env, run_sand
 
 def test_describe_session(temp_repo: Path):
     info = describe_session(temp_repo)
-    assert info["tier"] == "T2"
+    assert info["tier"] in ("T2", "T2-partial", "T2-max")
     assert "backend" in info
     assert info["repo_root"] == str(temp_repo.resolve())
 

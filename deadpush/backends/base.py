@@ -2,16 +2,25 @@
 
 from __future__ import annotations
 
+import logging
 import sys
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger("deadpush.backends")
 
 
 class EnforcementBackend(ABC):
     """Platform-specific sandbox wrapper for agent subprocesses."""
 
     name: str = "base"
+    tier: str = "T2"
+
+    def __init__(self, repo_root: Path):
+        self.repo_root = repo_root.resolve()
+        self._started = False
+        self._last_error: str | None = None
 
     @abstractmethod
     def available(self) -> bool:
@@ -19,7 +28,7 @@ class EnforcementBackend(ABC):
 
     @abstractmethod
     def wrap_command(self, cmd: list[str], *, repo_root: Path, env: dict[str, str]) -> list[str]:
-        """Return argv prefix/wrapper to sandbox *cmd*."""
+        """Return argv to execute *cmd* under this backend's confinement."""
 
     @abstractmethod
     def start(self, repo_root: Path) -> None:
@@ -27,10 +36,33 @@ class EnforcementBackend(ABC):
 
     @abstractmethod
     def stop(self) -> None:
-        """Stop backend monitoring."""
+        """Stop backend monitoring and release resources."""
+
+    def preflight(self, cmd: list[str]) -> tuple[bool, str]:
+        """Validate that *cmd* can run under this backend. Returns (ok, reason)."""
+        if not cmd:
+            return False, "empty command"
+        if not cmd[0]:
+            return False, "missing executable"
+        return True, ""
+
+    def apply_env_markers(self, env: dict[str, str]) -> None:
+        """Stamp sandbox metadata into *env* for child processes."""
+        env["DEADPUSH_BACKEND"] = self.name
+        env["DEADPUSH_TIER"] = self.tier
+        env["DEADPUSH_REPO_ROOT"] = str(self.repo_root)
+        if self._last_error:
+            env["DEADPUSH_BACKEND_WARNING"] = self._last_error
 
     def describe(self) -> dict[str, Any]:
-        return {"name": self.name, "available": self.available()}
+        return {
+            "name": self.name,
+            "tier": self.tier,
+            "available": self.available(),
+            "started": self._started,
+            "repo_root": str(self.repo_root),
+            "last_error": self._last_error,
+        }
 
 
 def get_backend(repo_root: Path, *, prefer: str | None = None) -> EnforcementBackend:
@@ -56,5 +88,15 @@ def get_backend(repo_root: Path, *, prefer: str | None = None) -> EnforcementBac
 
     for backend in candidates:
         if backend.available():
+            if prefer and backend.name != prefer and prefer != "noop":
+                logger.warning(
+                    "Preferred backend %r unavailable; using %r",
+                    prefer,
+                    backend.name,
+                )
             return backend
-    return NoopEnforcementBackend(repo_root)
+
+    fallback = NoopEnforcementBackend(repo_root)
+    fallback._last_error = "no platform backend available; using git/MCP gates only"
+    logger.warning(fallback._last_error)
+    return fallback

@@ -1717,6 +1717,15 @@ class GuardianHandler(FileSystemEventHandler or object):
             except Exception:
                 pass
             self.logger.critical(f"LOCKDOWN [{event_type.upper()}] quarantined {rel}")
+            if self.gpc is not None:
+                try:
+                    self.gpc.emit_lockdown(
+                        "Guardian lockdown active (safety score 0): all writes quarantined",
+                        file=rel,
+                        score=self.safety_score.score,
+                    )
+                except Exception:
+                    pass
             return
 
         # === STEP 1: Check blocked files (deadpush.toml blocked_files/blocked_patterns) ===
