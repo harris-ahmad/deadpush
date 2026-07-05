@@ -127,7 +127,7 @@ Bypass:     not launched via deadpush run; Cursor GUI editor (outside wrapped su
 ```
 Property:   write syscalls to repo paths denied before completion when fanotify backend active
 Mechanism:  LinuxEnforcementBackend with fanotify FAN_DENY
-Proof:      tests/test_fanotify_deny.py (ubuntu CI only)
+Proof:      tests/test_fanotify_deny.py (decide_fanotify_write + ubuntu CI integration)
 Tier:       T2-max (Linux)
 Bypass:     writes outside watched mount; CAP_SYS_ADMIN adversary
 ```

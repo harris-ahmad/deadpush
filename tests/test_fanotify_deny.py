@@ -7,7 +7,11 @@ from pathlib import Path
 
 import pytest
 
-from deadpush.backends.linux import LinuxEnforcementBackend
+from deadpush.backends.linux import (
+    LinuxEnforcementBackend,
+    decide_fanotify_write,
+    evaluate_repo_write,
+)
 
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux only")
@@ -16,6 +20,7 @@ def test_linux_backend_describe(temp_repo: Path):
     info = backend.describe()
     assert info["name"] == "linux-fanotify"
     assert "repo_root" in info
+    assert "deny_count" in info
 
 
 @pytest.mark.skipif(sys.platform.startswith("linux"), reason="Non-Linux check")
@@ -30,3 +35,40 @@ def test_linux_backend_wrap_sets_env(temp_repo: Path):
     cmd = backend.wrap_command(["echo"], repo_root=temp_repo, env=env)
     assert cmd == ["echo"]
     assert env.get("DEADPUSH_LINUX_SANDBOX") == "1"
+
+
+def test_decide_fanotify_write_blocks_eval(temp_repo: Path):
+    evil = temp_repo / "evil.py"
+    allowed, reason = decide_fanotify_write(
+        temp_repo,
+        abs_path=str(evil),
+        content="eval('bad')\n",
+    )
+    assert not allowed
+    assert reason
+
+
+def test_decide_fanotify_write_allows_clean(temp_repo: Path):
+    good = temp_repo / "good.py"
+    allowed, _ = decide_fanotify_write(
+        temp_repo,
+        abs_path=str(good),
+        content="x = 1\n",
+    )
+    assert allowed
+
+
+def test_decide_fanotify_write_skips_outside_repo(temp_repo: Path):
+    allowed, _ = decide_fanotify_write(
+        temp_repo,
+        abs_path="/tmp/outside.py",
+        content="eval(1)\n",
+    )
+    assert allowed
+
+
+def test_evaluate_repo_write_uses_enforcement_kernel(temp_repo: Path):
+    allowed, _ = evaluate_repo_write(temp_repo, "bad.py", "eval(1)\n")
+    assert not allowed
+    allowed2, _ = evaluate_repo_write(temp_repo, "fine.py", "print('hi')\n")
+    assert allowed2

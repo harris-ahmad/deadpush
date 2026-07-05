@@ -889,6 +889,36 @@ def cmd_git_wrapper(args):
     raise SystemExit(git_main(list(args)))
 
 
+@main.command("configure")
+@click.argument("target", type=click.Choice(["cursor", "claude"]))
+@click.option("--repo", type=click.Path(exists=True, file_okay=False), default=None,
+              help="Repo root (default: auto-detect)")
+@click.option("--unwrap", is_flag=True, help="Restore original MCP server commands")
+def cmd_configure(target, repo, unwrap):
+    """Wrap IDE MCP servers to route tools/call through deadpush mcp-proxy (T1).
+
+    Example:
+
+        deadpush configure cursor
+        deadpush configure cursor --unwrap
+    """
+    from .config import load_config
+    from .configure import configure_claude_mcp, configure_cursor_mcp
+
+    config = load_config(explicit_root=Path(repo).resolve() if repo else None)
+    if target == "cursor":
+        result = configure_cursor_mcp(config.repo_root, unwrap=unwrap)
+    else:
+        result = configure_claude_mcp(config.repo_root, unwrap=unwrap)
+
+    action = "unwrapped" if unwrap else "proxied"
+    print_success(f"MCP servers {action} via deadpush mcp-proxy")
+    print(f"  Config: {result['path']}")
+    if result.get("backup"):
+        print(f"  Backup: {result['backup']}")
+    print(f"  Servers: {', '.join(result.get('servers', [])) or '(none)'}")
+
+
 @main.command("gpc-listen")
 @click.option("--repo", type=click.Path(exists=True, file_okay=False), default=None)
 @click.option("--hardened", is_flag=True)

@@ -1006,6 +1006,7 @@ class GuardianControlHandler(BaseHTTPRequestHandler):
                 name = params.get("name", "")
                 if name:
                     handler.quarantine.restore(name)
+                    handler._gpc_policy_update(f"Quarantine restore: {name}", file=name)
                 self._redirect("/dashboard/quarantine")
                 return
 
@@ -1014,6 +1015,11 @@ class GuardianControlHandler(BaseHTTPRequestHandler):
                 description = params.get("description", "")
                 if pattern:
                     rc.add_allowed_pattern(pattern, description)
+                    handler._gpc_policy_update(
+                        f"Allowlist pattern added: {pattern}",
+                        pattern=pattern,
+                        description=description,
+                    )
                 self._redirect("/dashboard/allowlist")
                 return
 
@@ -1021,11 +1027,16 @@ class GuardianControlHandler(BaseHTTPRequestHandler):
                 pattern = params.get("pattern", "")
                 if pattern:
                     rc.remove_allowed_pattern(pattern)
+                    handler._gpc_policy_update(
+                        f"Allowlist pattern removed: {pattern}",
+                        pattern=pattern,
+                    )
                 self._redirect("/dashboard/allowlist")
                 return
 
             elif path == "/allowlist/reset":
                 rc.reset()
+                handler._gpc_policy_update("Allowlist reset to defaults")
                 self._redirect("/dashboard/allowlist")
                 return
 
@@ -1084,6 +1095,7 @@ class GuardianControlHandler(BaseHTTPRequestHandler):
                     return self._send_json({"error": "missing 'path' in payload"}, 400)
                 restored = handler.quarantine.restore(qname)
                 if restored:
+                    handler._gpc_policy_update(f"Quarantine restore: {qname}", file=qname)
                     self._send_json({"success": True, "restored_to": str(restored)})
                 else:
                     self._send_json({"success": False, "error": "restore failed or original exists"}, 409)
@@ -1501,6 +1513,31 @@ class GuardianHandler(FileSystemEventHandler or object):
     # ------------------------------------------------------------------
     # MCP suspension (disables agent's MCP access when score is critical)
     # ------------------------------------------------------------------
+    def _gpc_policy_update(self, summary: str, **extra) -> None:
+        if self.gpc is None:
+            return
+        try:
+            self.gpc.emit_policy_update(summary, **extra)
+        except Exception:
+            pass
+
+    def _gpc_maybe_instruction(self) -> None:
+        """Emit INSTRUCTION when agents trigger repeated violations in a short window."""
+        if self.gpc is None:
+            return
+        recent = len(self.safety_score.incidents)
+        if recent < 3:
+            return
+        try:
+            self.gpc.emit_instruction(
+                "Repeated guardrail violations detected. Stop weakening protections; "
+                "review feedback and restore quarantined files before continuing.",
+                recent_incidents=recent,
+                score=self.safety_score.score,
+            )
+        except Exception:
+            pass
+
     def _suspend_mcp(self, reason: str):
         """Write a suspension flag that the MCP server checks at startup."""
         suspend_file = _scoped_suspend_file(self.config.repo_root, self.hardened)
@@ -1508,6 +1545,11 @@ class GuardianHandler(FileSystemEventHandler or object):
             suspend_file.parent.mkdir(parents=True, exist_ok=True)
             suspend_file.write_text(reason, encoding="utf-8")
             self.logger.warning(f"MCP suspended: {reason}")
+            if self.gpc is not None:
+                try:
+                    self.gpc.emit_session_pause(reason, score=self.safety_score.score)
+                except Exception:
+                    pass
         except Exception as e:
             self.logger.error(f"Failed to write MCP suspension file: {e}")
 
@@ -1518,6 +1560,10 @@ class GuardianHandler(FileSystemEventHandler or object):
             if suspend_file.exists():
                 suspend_file.unlink()
                 self.logger.info("MCP unsuspended")
+                self._gpc_policy_update(
+                    "MCP access restored",
+                    score=self.safety_score.score,
+                )
         except Exception as e:
             self.logger.error(f"Failed to remove MCP suspension file: {e}")
 
@@ -1849,6 +1895,8 @@ class GuardianHandler(FileSystemEventHandler or object):
             self.session_mgr.update_safety_score(score)
         except Exception:
             pass
+
+        self._gpc_maybe_instruction()
 
     def _quarantine_and_restore(self, path: Path, rel: str, result) -> None:
         """Quarantine the violating file, unstage if needed, restore safe git version."""
