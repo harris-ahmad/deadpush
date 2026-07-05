@@ -15,6 +15,8 @@ def test_describe_session(temp_repo: Path):
     assert info["tier"] in ("T2", "T2-partial", "T2-max")
     assert "backend" in info
     assert info["repo_root"] == str(temp_repo.resolve())
+    assert info["gpc"]["mandatory"] is True
+    assert "gpc-mandatory" in info["features"]
 
 
 def test_prepare_sandbox_env(temp_repo: Path):
@@ -31,7 +33,6 @@ def test_run_sandbox_echo(temp_repo: Path):
         [sys.executable, "-c", "print('ok')"],
         repo_root=temp_repo,
         backend_prefer="noop",
-        start_gpc=False,
     )
     assert code == 0
 

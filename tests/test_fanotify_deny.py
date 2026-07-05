@@ -67,6 +67,15 @@ def test_decide_fanotify_write_skips_outside_repo(temp_repo: Path):
     assert allowed
 
 
+def test_decide_fanotify_write_skips_bootstrap_paths(temp_repo: Path):
+    allowed, _ = decide_fanotify_write(
+        temp_repo,
+        abs_path=str(temp_repo / ".cursorignore"),
+        content="# ignore\n",
+    )
+    assert allowed
+
+
 def test_evaluate_repo_write_uses_enforcement_kernel(temp_repo: Path):
     allowed, _ = evaluate_repo_write(temp_repo, "bad.py", "eval(1)\n")
     assert not allowed

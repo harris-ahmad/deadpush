@@ -10,7 +10,7 @@ from .types import DebrisFile, FileInfo
 
 LLM_CONTEXT_FILES = {
     "claude.md", "claude_context.md", ".claude_instructions",
-    ".cursorrules", "cursor_rules.md", ".cursorignore",
+    ".cursorrules", "cursor_rules.md",
     ".copilot-instructions.md", "agents.md", "windsurf_rules.md",
     "llm_context.txt", "ai_prompt.md", "system_prompt.txt",
 }
@@ -46,8 +46,12 @@ class DebrisDetector:
         self.config = config
 
     def scan(self, files: list[FileInfo]) -> list[DebrisFile]:
+        from .bootstrap import is_bootstrap_path
+
         results: list[DebrisFile] = []
         for f in files:
+            if is_bootstrap_path(str(f.rel_path), self.config.repo_root):
+                continue
             flags = self._check_file(f)
             if flags:
                 results.append(self._build_debris_file(f, flags))

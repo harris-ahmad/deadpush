@@ -139,8 +139,12 @@ def configure_vscode_mcp(repo_root: Path, *, unwrap: bool = False) -> dict[str, 
     backup_path = repo / ".vscode" / "mcp.json.deadpush.bak"
 
     if not vscode_path.exists() and not unwrap:
-        from .hooks import setup_mcp_discovery
-        setup_mcp_discovery(repo)
+        vscode_dir = repo / ".vscode"
+        vscode_dir.mkdir(parents=True, exist_ok=True)
+        dp = _deadpush_cmd()
+        _save_json(vscode_path, {
+            "servers": {"deadpush": {"command": dp, "args": ["mcp"]}},
+        })
 
     config = _load_json(vscode_path)
     servers = _servers_dict(config)

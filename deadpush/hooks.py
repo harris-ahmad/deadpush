@@ -928,39 +928,41 @@ def setup_mcp_discovery(repo_root: Path) -> None:
     if not Path(deadpush_cmd).exists():
         deadpush_cmd = "deadpush"
 
-    mcp_config = {
-        "mcpServers": {
-            "deadpush": {
-                "command": deadpush_cmd,
-                "args": ["mcp"],
-            }
-        }
+    deadpush_entry = {
+        "command": deadpush_cmd,
+        "args": ["mcp"],
     }
 
     cursor_dir = repo_root / ".cursor"
     cursor_dir.mkdir(parents=True, exist_ok=True)
     cursor_path = cursor_dir / "mcp.json"
-    existing = {}
+    existing: dict = {}
     if cursor_path.exists():
         try:
             existing = json.loads(cursor_path.read_text(encoding="utf-8"))
         except Exception:
             pass
-    existing.update(mcp_config)
+    cursor_servers = dict(existing.get("mcpServers") or existing.get("servers") or {})
+    cursor_servers.setdefault("deadpush", deadpush_entry)
+    existing["mcpServers"] = cursor_servers
     cursor_path.write_text(json.dumps(existing, indent=2), encoding="utf-8")
     print(f"  Created {cursor_path}")
 
     vscode_dir = repo_root / ".vscode"
     vscode_dir.mkdir(parents=True, exist_ok=True)
     vscode_path = vscode_dir / "mcp.json"
-    vscode_config = {"servers": {"deadpush": {"command": deadpush_cmd, "args": ["mcp"]}}}
-    existing_vs = {}
+    existing_vs: dict = {}
     if vscode_path.exists():
         try:
             existing_vs = json.loads(vscode_path.read_text(encoding="utf-8"))
         except Exception:
             pass
-    existing_vs.update(vscode_config)
+    vscode_servers = dict(existing_vs.get("servers") or existing_vs.get("mcpServers") or {})
+    vscode_servers.setdefault("deadpush", deadpush_entry)
+    if "servers" in existing_vs or "mcpServers" not in existing_vs:
+        existing_vs["servers"] = vscode_servers
+    else:
+        existing_vs["mcpServers"] = vscode_servers
     vscode_path.write_text(json.dumps(existing_vs, indent=2), encoding="utf-8")
     print(f"  Created {vscode_path}")
 

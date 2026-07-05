@@ -13,11 +13,13 @@ from __future__ import annotations
 
 import atexit
 from collections import deque
+import errno
 import fcntl
 import functools
 import hashlib
 import logging
 import os
+import shutil
 import signal
 import sys
 import time
@@ -370,17 +372,60 @@ class QuarantineManager:
     def __init__(self, base_dir: Path):
         self.quarantine_dir = base_dir / ".deadpush-quarantine"
         self.quarantine_dir.mkdir(parents=True, exist_ok=True)
+        self.logger = logging.getLogger("deadpush.guardian")
+
+    def _unique_dest(self, basename: str, timestamp: str) -> Path:
+        dest = self.quarantine_dir / f"{timestamp}_{basename}"
+        if not dest.exists():
+            return dest
+        return self.quarantine_dir / f"{timestamp}_{os.getpid()}_{basename}"
+
+    def _write_reason(self, dest: Path, reason: str, original: Path) -> None:
+        reason_path = dest.with_suffix(dest.suffix + ".reason")
+        reason_path.write_text(
+            f"Quarantined at {datetime.now()}\nReason: {reason}\nOriginal path: {original}\n",
+            encoding="utf-8",
+        )
 
     def quarantine(self, path: Path, reason: str) -> Path:
+        if not path.exists():
+            return path
+
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        dest = self.quarantine_dir / f"{timestamp}_{path.name}"
+        dest = self._unique_dest(path.name, timestamp)
+        retry_errnos = {errno.EBUSY, errno.EACCES, errno.EPERM}
+
+        for attempt in range(4):
+            try:
+                shutil.copy2(path, dest)
+                self._write_reason(dest, reason, path)
+                try:
+                    path.unlink()
+                except OSError as unlink_err:
+                    if unlink_err.errno in retry_errnos:
+                        time.sleep(0.05 * (attempt + 1))
+                        if not path.exists():
+                            return dest
+                        continue
+                    try:
+                        path.write_text("", encoding="utf-8")
+                    except OSError:
+                        pass
+                return dest
+            except OSError as e:
+                if e.errno in retry_errnos and attempt < 3:
+                    time.sleep(0.05 * (attempt + 1))
+                    continue
+                break
+
         try:
             path.rename(dest)
-            with dest.with_suffix(dest.suffix + ".reason").open("w") as f:
-                f.write(f"Quarantined at {datetime.now()}\nReason: {reason}\nOriginal path: {path}\n")
+            self._write_reason(dest, reason, path)
             return dest
         except Exception as e:
-            logging.getLogger("deadpush.guardian").error(f"Failed to quarantine {path}: {e}")
+            self.logger.error(f"Failed to quarantine {path}: {e}")
+            if dest.exists() and not path.exists():
+                return dest
             return path
 
     def list_quarantined(self):
@@ -1061,6 +1106,7 @@ class GuardianControlHandler(BaseHTTPRequestHandler):
                     "quarantine_count": len(handler.quarantine.list_quarantined()),
                     "intervention_enabled": handler.intervention,
                     "strict_mode": handler.strict_mode,
+                    "fanotify": handler.fanotify_status(),
                 }
                 self._send_json(data)
             elif path == "/safety-score":
@@ -1299,12 +1345,13 @@ class GuardianHandler(FileSystemEventHandler or object):
     - Block-level violations → quarantine + git restore + structured feedback
     """
 
-    def __init__(self, config, intervention: bool = True, strict_mode: bool = False, daemon: bool = False, logger=None, hardened: bool = False):
+    def __init__(self, config, intervention: bool = True, strict_mode: bool = False, daemon: bool = False, logger=None, hardened: bool = False, *, enable_fanotify: bool = True):
         self.config = config
         self.intervention = intervention
         self.strict_mode = strict_mode
         self.daemon = daemon
         self.hardened = hardened
+        self.enable_fanotify = enable_fanotify
         self.logger = logger or logging.getLogger("deadpush.guardian")
         self.detector = DebrisDetector(config)
         self.quarantine = QuarantineManager(config.repo_root)
@@ -1312,6 +1359,7 @@ class GuardianHandler(FileSystemEventHandler or object):
         self.safety_score.load_score()
         self.session_mgr = SessionManager()
         self.gpc = None  # GpcServer, started by run_guardian
+        self._fanotify_backend = None
 
         # Dynamic rate limiting (based on safety score)
         self.last_intervention_ts = 0.0
@@ -1326,6 +1374,89 @@ class GuardianHandler(FileSystemEventHandler or object):
         # We poll HEAD each loop and independently re-scan any new commit.
         self._last_head: str | None = None
         self._scanned_commits: set[str] = set()
+
+    def fanotify_status(self) -> dict | None:
+        if self._fanotify_backend is None:
+            return None
+        return self._fanotify_backend.describe()
+
+    def _start_fanotify(self) -> None:
+        if not self.enable_fanotify or self._fanotify_backend is not None:
+            return
+        if not sys.platform.startswith("linux"):
+            return
+        try:
+            from .backends.linux import LinuxEnforcementBackend
+
+            backend = LinuxEnforcementBackend(
+                self.config.repo_root,
+                on_deny=self._handle_fanotify_deny,
+            )
+            if not backend.available():
+                self.logger.info(
+                    "fanotify pre-write deny unavailable (%s); watchdog-only on Linux",
+                    backend._last_error or "needs Linux 5.13+ and CAP_SYS_ADMIN",
+                )
+                return
+            backend.start(self.config.repo_root)
+            self._fanotify_backend = backend
+            self.logger.info(
+                "fanotify pre-write deny listener starting (T2-max); "
+                "watchdog remains as post-write fallback"
+            )
+        except Exception as e:
+            self.logger.warning("Could not start fanotify backend: %s", e)
+
+    def _stop_fanotify(self) -> None:
+        if self._fanotify_backend is None:
+            return
+        try:
+            self._fanotify_backend.stop()
+        except Exception:
+            pass
+        self._fanotify_backend = None
+
+    def _handle_fanotify_deny(self, rel: str, reason: str, source: str) -> None:
+        """Record a kernel-level write denial (write never landed on disk)."""
+        from .intercept import GuardrailResult, Violation, _write_feedback, FEEDBACK_DIR
+
+        self.last_intervention_ts = time.time()
+        score = self.safety_score.report_incident(
+            15, f"Fanotify deny: {reason}", rel,
+        )
+        result = GuardrailResult()
+        result.reject(Violation("fanotify", reason, 0, "critical"))
+
+        self.logger.warning(
+            f"FANOTIFY DENY [{source.upper()}] {rel} | {reason} | Safety: {score}/100"
+        )
+
+        try:
+            _write_feedback(self.config.repo_root / FEEDBACK_DIR, rel, result)
+        except Exception:
+            pass
+        try:
+            self.session_mgr.record_incident({
+                "type": "fanotify_deny",
+                "file": rel,
+                "reason": reason,
+                "source": source,
+                "score": score,
+            })
+            self.session_mgr.update_safety_score(score)
+        except Exception:
+            pass
+        if self.gpc is not None:
+            try:
+                self.gpc.emit_incident(category="fanotify", description=reason, file=rel)
+            except Exception:
+                pass
+        self._record_audit("fanotify.deny", {
+            "file": rel,
+            "reason": reason,
+            "source": source,
+            "score": score,
+        })
 
     def _get_cooldown(self) -> float:
         """Dynamic cooldown based on safety score.
@@ -1870,6 +2001,15 @@ class GuardianHandler(FileSystemEventHandler or object):
             return
 
         self.last_intervention_ts = now
+
+        from .bootstrap import is_bootstrap_path
+
+        if is_bootstrap_path(rel, self.config.repo_root):
+            try:
+                self.session_mgr.record_file_change(rel)
+            except Exception:
+                pass
+            return
 
         # Lockdown: at score 0, quarantine every write (no pass-through)
         if self.intervention and self.safety_score.score <= 0 and path.exists():
@@ -2549,6 +2689,7 @@ def run_guardian(
     hardened: bool = False,
     *,
     allow_self_protect: bool = False,
+    enable_fanotify: bool = True,
 ):
     if not WATCHDOG_AVAILABLE:
         print("Error: watchdog package required. pip install deadpush[watch]")
@@ -2667,7 +2808,10 @@ def run_guardian(
             daemon_mgr.write_pid(config.repo_root)
             atexit.register(daemon_mgr.cleanup)
 
-            handler = GuardianHandler(config, intervention=intervention, strict_mode=strict, daemon=daemon, logger=logger, hardened=hardened)
+            handler = GuardianHandler(
+                config, intervention=intervention, strict_mode=strict, daemon=daemon,
+                logger=logger, hardened=hardened, enable_fanotify=enable_fanotify,
+            )
             _note_unclean_restart(handler)
             _control_token = _load_or_create_control_token(config.repo_root, hardened)
             control_server = GuardianControlServer(handler, repo_root=config.repo_root, hardened=hardened, token=_control_token)
@@ -2678,6 +2822,7 @@ def run_guardian(
 
             # Start control server in the final daemon process (post-fork)
             _start_control_server(control_server, logger, config.repo_root, hardened)
+            handler._start_fanotify()
 
             _run_observer(handler, logger, daemon_mgr)
         except Exception as e:
@@ -2694,7 +2839,10 @@ def run_guardian(
         daemon_mgr.write_pid(config.repo_root)
         atexit.register(daemon_mgr.cleanup)
 
-        handler = GuardianHandler(config, intervention=intervention, strict_mode=strict, daemon=daemon, logger=logger, hardened=hardened)
+        handler = GuardianHandler(
+            config, intervention=intervention, strict_mode=strict, daemon=daemon,
+            logger=logger, hardened=hardened, enable_fanotify=enable_fanotify,
+        )
         _note_unclean_restart(handler)
         _control_token = _load_or_create_control_token(config.repo_root, hardened)
         control_server = GuardianControlServer(handler, repo_root=config.repo_root, hardened=hardened, token=_control_token)
@@ -2704,6 +2852,7 @@ def run_guardian(
             handler._start_shadow()
 
         _start_control_server(control_server, logger, config.repo_root, hardened)
+        handler._start_fanotify()
 
         _run_observer(handler, logger, daemon_mgr)
 
@@ -2760,6 +2909,10 @@ def _run_observer(handler: GuardianHandler, logger, daemon_mgr: DaemonManager | 
             return
         running = False
         logger.info("Guardian shutting down gracefully...")
+        try:
+            handler._stop_fanotify()
+        except Exception:
+            pass
         try:
             handler.safety_score.mark_clean_shutdown()
         except Exception:

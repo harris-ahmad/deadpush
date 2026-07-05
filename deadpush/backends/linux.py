@@ -129,8 +129,9 @@ def decide_fanotify_write(
     if rel is None:
         return True, ""
 
-    # Skip deadpush internal paths to avoid feedback loops
-    if rel.startswith(".deadpush/") or rel.startswith(".deadpush-quarantine/"):
+    from ..bootstrap import is_bootstrap_path
+
+    if is_bootstrap_path(rel, repo):
         return True, ""
 
     text = content
@@ -163,6 +164,10 @@ class LinuxEnforcementBackend(EnforcementBackend):
         self._on_deny = on_deny
         self._deny_count = 0
         self._allow_count = 0
+
+    @property
+    def is_active(self) -> bool:
+        return self._running and self._fd is not None
 
     def available(self) -> bool:
         if not sys.platform.startswith("linux"):

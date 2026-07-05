@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import subprocess
 import sys
 import threading
@@ -20,6 +21,7 @@ from typing import Any
 from .config import load_config
 from .audit import append_audit_event, EVENT_MCP_PROXY_BLOCK
 from .intercept import enforce_content, violations_from_result
+from .mcp_suspend import is_mcp_hardened, mcp_suspend_reason, suspend_file_path
 from .rules import RuntimeConfig
 
 logger = logging.getLogger("deadpush.mcp_proxy")
@@ -119,6 +121,9 @@ def notify_proxy_block(repo_root: Path, tool_name: str, rel_path: str, summary: 
         from .gpc import GpcClient
 
         client = GpcClient(repo_root, hardened=is_hardened_install(repo_root))
+        env_socket = os.environ.get("DEADPUSH_GPC_SOCKET")
+        if env_socket:
+            client.socket_path = Path(env_socket)
         client.send_proxy_block(tool_name, summary, file=rel_path)
     except Exception:
         pass
@@ -170,8 +175,27 @@ def _tool_needs_scan(tool_name: str, arguments: dict[str, Any]) -> bool:
     return False
 
 
-def scan_tool_call(tool_name: str, arguments: dict[str, Any], repo_root: Path) -> dict[str, Any] | None:
+def _suspend_block_result(tool_name: str, reason: str) -> dict[str, Any]:
+    summary = (
+        f"MCP suspended by deadpush guardian: {reason}\n"
+        "All tool calls are blocked until the guardian clears the pause "
+        "(safety score recovers) or you run: deadpush unfreeze"
+    )
+    return _block_result(tool_name, "_mcp_suspended_", summary)
+
+
+def scan_tool_call(
+    tool_name: str,
+    arguments: dict[str, Any],
+    repo_root: Path,
+    *,
+    hardened: bool | None = None,
+) -> dict[str, Any] | None:
     """Return MCP error result if blocked, else None (allow)."""
+    reason = mcp_suspend_reason(repo_root, hardened=hardened)
+    if reason:
+        return _suspend_block_result(tool_name, reason)
+
     if not _tool_needs_scan(tool_name, arguments):
         return None
 
@@ -216,10 +240,13 @@ class McpProxy:
 
     def __init__(self, downstream_cmd: list[str], repo_root: Path | None = None):
         self.repo_root = (repo_root or Path.cwd()).resolve()
+        self.hardened = is_mcp_hardened(self.repo_root)
         self.downstream_cmd = downstream_cmd
         self._proc: subprocess.Popen[str] | None = None
         self._initialized = False
         self._lock = threading.Lock()
+        self._suspended = False
+        self._start_suspension_watch()
 
     def start_downstream(self) -> None:
         self._proc = subprocess.Popen(
@@ -267,6 +294,24 @@ class McpProxy:
             pass
         return self._proc.wait()
 
+    def _start_suspension_watch(self) -> None:
+        """Detect guardian SESSION_PAUSE while the proxy stays alive for the IDE."""
+        suspend_path = suspend_file_path(self.repo_root, hardened=self.hardened)
+
+        def _watch() -> None:
+            while True:
+                try:
+                    if suspend_path.exists():
+                        self._suspended = True
+                        if mcp_suspend_reason(self.repo_root, hardened=self.hardened):
+                            logger.warning("MCP proxy: guardian suspension active — blocking tools/call")
+                        break
+                except Exception:
+                    pass
+                threading.Event().wait(2.0)
+
+        threading.Thread(target=_watch, daemon=True, name="mcp-proxy-suspension-watch").start()
+
     def _maybe_intercept(self, line: str) -> str | None:
         try:
             msg = json.loads(line)
@@ -289,7 +334,9 @@ class McpProxy:
         if not isinstance(arguments, dict):
             arguments = {}
 
-        block_result = scan_tool_call(tool_name, arguments, self.repo_root)
+        block_result = scan_tool_call(
+            tool_name, arguments, self.repo_root, hardened=self.hardened,
+        )
         if block_result is None:
             return None
 

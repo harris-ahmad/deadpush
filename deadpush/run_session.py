@@ -13,7 +13,7 @@ from typing import Any
 
 from .backends.base import EnforcementBackend, get_backend
 from .config import is_hardened_install, load_config
-from .gpc import GpcServer
+from .gpc_session import GpcMandatoryError, GpcSession, apply_gpc_env, start_gpc_session, stop_gpc_session
 
 logger = logging.getLogger("deadpush.run_session")
 
@@ -44,6 +44,7 @@ def prepare_sandbox_env(
     *,
     hardened: bool = False,
     backend: EnforcementBackend | None = None,
+    gpc_session: GpcSession | None = None,
 ) -> dict[str, str]:
     """Build environment for a sandboxed agent session."""
     env = dict(os.environ)
@@ -63,7 +64,26 @@ def prepare_sandbox_env(
     if backend is not None:
         backend.apply_env_markers(env)
 
+    if gpc_session is not None:
+        apply_gpc_env(env, gpc_session)
+
     return env
+
+
+def _backend_on_deny(gpc_session: GpcSession | None):
+    def _on_deny(rel: str, reason: str, source: str) -> None:
+        if gpc_session is None:
+            return
+        try:
+            gpc_session.emit_incident(
+                category=source,
+                description=reason,
+                file=rel,
+                source=source,
+            )
+        except Exception as e:
+            logger.debug("GPC incident emit failed: %s", e)
+    return _on_deny
 
 
 def run_sandbox(
@@ -72,24 +92,29 @@ def run_sandbox(
     repo_root: Path | None = None,
     hardened: bool = False,
     backend_prefer: str | None = None,
-    start_gpc: bool = True,
+    require_gpc: bool = True,
 ) -> int:
     """Run *cmd* inside a deadpush sandbox session."""
     config = load_config(explicit_root=repo_root)
     repo = config.repo_root.resolve()
     use_hardened = hardened or is_hardened_install(repo)
 
-    backend = get_backend(repo, prefer=backend_prefer)
-    gpc: GpcServer | None = None
+    gpc_session: GpcSession | None = None
     bindir: str | None = None
 
-    if start_gpc:
-        gpc = GpcServer(repo, hardened=use_hardened)
+    if require_gpc:
         try:
-            gpc.start()
-        except OSError as e:
-            logger.warning("GPC unavailable for sandbox session: %s", e)
-            gpc = None
+            gpc_session = start_gpc_session(repo, hardened=use_hardened, mandatory=True)
+        except GpcMandatoryError as e:
+            logger.error("Mandatory GPC unavailable for T2 sandbox: %s", e)
+            return 2
+
+    from .backends.linux import LinuxEnforcementBackend
+
+    on_deny = _backend_on_deny(gpc_session)
+    backend = get_backend(repo, prefer=backend_prefer)
+    if isinstance(backend, LinuxEnforcementBackend):
+        backend._on_deny = on_deny
 
     try:
         backend.start(repo)
@@ -105,7 +130,9 @@ def run_sandbox(
         backend = NoopEnforcementBackend(repo)
         backend.start(repo)
 
-    env = prepare_sandbox_env(repo, hardened=use_hardened, backend=backend)
+    env = prepare_sandbox_env(
+        repo, hardened=use_hardened, backend=backend, gpc_session=gpc_session,
+    )
     bindir = env.get("DEADPUSH_BIN_DIR")
 
     try:
@@ -119,8 +146,7 @@ def run_sandbox(
         return result.returncode
     finally:
         backend.stop()
-        if gpc:
-            gpc.stop()
+        stop_gpc_session(gpc_session)
         if bindir:
             shutil.rmtree(bindir, ignore_errors=True)
 
@@ -150,9 +176,15 @@ def describe_session(repo_root: Path | None = None, *, backend_prefer: str | Non
     config = load_config(explicit_root=repo_root)
     repo = config.repo_root.resolve()
     backend = get_backend(repo, prefer=backend_prefer)
+    from .gpc import gpc_socket_path
+
     return {
         "repo_root": str(repo),
         "backend": backend.describe(),
         "tier": backend.tier,
-        "features": ["git-wrapper", "gpc", "enforcement-backend"],
+        "gpc": {
+            "mandatory": True,
+            "socket": str(gpc_socket_path(repo, hardened=is_hardened_install(repo))),
+        },
+        "features": ["git-wrapper", "gpc-mandatory", "enforcement-backend"],
     }

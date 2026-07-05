@@ -57,7 +57,12 @@ def main():
     is_flag=True,
     help="Allow a persistent guardian on the deadpush source repo (not recommended)",
 )
-def cmd_guard(repo, no_intervention, daemon, strict, soft, hardened, allow_self_protect):
+@click.option(
+    "--no-fanotify",
+    is_flag=True,
+    help="Disable Linux fanotify pre-write deny in the guardian (watchdog-only)",
+)
+def cmd_guard(repo, no_intervention, daemon, strict, soft, hardened, allow_self_protect, no_fanotify):
     """
     Start the AI Agent Guardian.
 
@@ -91,10 +96,13 @@ def cmd_guard(repo, no_intervention, daemon, strict, soft, hardened, allow_self_
         strict=strict,
         hardened=use_hardened,
         allow_self_protect=allow_self_protect,
+        enable_fanotify=not no_fanotify,
     )
 
 
 @main.command("protect")
+@click.option("--repo", type=click.Path(exists=True, file_okay=False), default=None,
+              help="Repo root to protect (default: auto-detect from cwd)")
 @click.option("--enable", is_flag=True, help="Enable persistent background guardian (auto-starts daemon after setup)")
 @click.option("--daemon", is_flag=True, help="Start the guardian as a persistent background daemon after performing full setup")
 @click.option("--soft", is_flag=True, help="Same-UID guardian at your own privileges (this is the default)")
@@ -104,7 +112,17 @@ def cmd_guard(repo, no_intervention, daemon, strict, soft, hardened, allow_self_
     is_flag=True,
     help="Allow protecting the deadpush source repo itself (not recommended for development)",
 )
-def cmd_protect(enable, daemon, soft, hardened, allow_self_protect):
+@click.option(
+    "--no-configure",
+    is_flag=True,
+    help="Skip IDE MCP proxy wiring (default: wrap Cursor/VS Code/Claude MCP via mcp-proxy)",
+)
+@click.option(
+    "--no-fanotify",
+    is_flag=True,
+    help="Disable Linux fanotify pre-write deny in the guardian (watchdog-only)",
+)
+def cmd_protect(repo, enable, daemon, soft, hardened, allow_self_protect, no_configure, no_fanotify):
     """
     One-command setup to protect your vibe coding workflow.
 
@@ -118,7 +136,7 @@ def cmd_protect(enable, daemon, soft, hardened, allow_self_protect):
     The guardian will monitor, score, quarantine dangerous files autonomously.
     """
     from .config import dev_repo_guard_refusal
-    config = load_config()
+    config = load_config(explicit_root=Path(repo).resolve() if repo else None)
 
     refusal = dev_repo_guard_refusal(
         config.repo_root,
@@ -209,11 +227,30 @@ def cmd_protect(enable, daemon, soft, hardened, allow_self_protect):
         print_error(f"Could not write protection marker: {e}")
         critical_failures.append("protection marker not written")
     try:
-        from .hooks import setup_mcp_discovery
-        setup_mcp_discovery(config.repo_root)
-        print("  Agent auto-discovery configured (.cursor/mcp.json, .vscode/mcp.json).")
+        from .bootstrap import default_protect_bootstrap_paths, record_bootstrap_paths
+        record_bootstrap_paths(config.repo_root, default_protect_bootstrap_paths())
+    except Exception:
+        pass
+    try:
+        if no_configure:
+            from .hooks import setup_mcp_discovery
+            setup_mcp_discovery(config.repo_root)
+            print("  Agent auto-discovery configured (.cursor/mcp.json, .vscode/mcp.json).")
+        else:
+            from .configure import configure_all_ides
+            cfg_result = configure_all_ides(config.repo_root)
+            configured = [next(iter(d.keys())) for d in cfg_result.get("configured", [])]
+            skipped = cfg_result.get("skipped", [])
+            if configured:
+                print_success(
+                    f"  IDE MCP servers proxied through deadpush guardrails: {', '.join(configured)}"
+                )
+            if skipped:
+                print(f"  (No MCP config found for: {', '.join(skipped)})")
+            if cfg_result.get("gpc_snippet"):
+                print(f"  GPC agent snippet: {cfg_result['gpc_snippet']}")
     except Exception as e:
-        print_warning(f"MCP discovery setup issue: {e}")
+        print_warning(f"IDE MCP configure issue: {e}")
 
     # GitHub Actions server-side guard (must be committed to take effect)
     try:
@@ -299,6 +336,7 @@ def cmd_protect(enable, daemon, soft, hardened, allow_self_protect):
                         strict=False,
                         hardened=False,
                         allow_self_protect=allow_self_protect,
+                        enable_fanotify=not no_fanotify,
                     )
                 except SystemExit:
                     # Expected: the double-fork parent exits; the daemon child lives on.
@@ -846,7 +884,12 @@ def cmd_scan(base, head, scan_all, ref, repo, fmt):
     is_flag=True,
     help="Allow a persistent guardian on the deadpush source repo (not recommended)",
 )
-def cmd_intercept(daemon, allow_self_protect):
+@click.option(
+    "--no-fanotify",
+    is_flag=True,
+    help="Disable Linux fanotify pre-write deny in the guardian (watchdog-only)",
+)
+def cmd_intercept(daemon, allow_self_protect, no_fanotify):
     """Start the file interception daemon (alias for `deadpush guard`).
 
     Uses the watchdog-based guardian to monitor all file writes and
@@ -872,6 +915,7 @@ def cmd_intercept(daemon, allow_self_protect):
         daemon=daemon,
         strict=False,
         allow_self_protect=allow_self_protect,
+        enable_fanotify=not no_fanotify,
     )
 
 
@@ -912,8 +956,13 @@ def cmd_mcp_proxy(config_path, server_name, repo, downstream):
               help="Force a specific enforcement backend")
 @click.option("--repo", type=click.Path(exists=True, file_okay=False), default=None,
               help="Repo root (default: auto-detect)")
+@click.option(
+    "--no-gpc",
+    is_flag=True,
+    help="Disable mandatory GPC for this sandbox session (not T2-complete)",
+)
 @click.argument("cmd", nargs=-1, required=True)
-def cmd_run(sandbox, hardened, backend, repo, cmd):
+def cmd_run(sandbox, hardened, backend, repo, no_gpc, cmd):
     """Run a command inside a deadpush sandbox session (T2).
 
     Example:
@@ -931,6 +980,8 @@ def cmd_run(sandbox, hardened, backend, repo, cmd):
     info = describe_session(repo_root, backend_prefer=backend)
     backend_name = info["backend"]["name"]
     print(f"Tier T2 sandbox — backend: {backend_name}")
+    if info.get("gpc", {}).get("mandatory") and not no_gpc:
+        print(f"  GPC mandatory — socket: {info['gpc']['socket']}")
     if backend_name == "noop":
         print_warning(
             "OS sandbox unavailable — using T2-partial (noop). "
@@ -944,6 +995,7 @@ def cmd_run(sandbox, hardened, backend, repo, cmd):
         repo_root=repo_root,
         hardened=hardened,
         backend_prefer=backend,
+        require_gpc=not no_gpc,
     ))
 
 
@@ -1885,7 +1937,12 @@ def cmd_doctor(repo, hardened):
     is_flag=True,
     help="Allow init on the deadpush source repo (not recommended)",
 )
-def cmd_init(mode, daemon, force, allow_self_protect):
+@click.option(
+    "--no-fanotify",
+    is_flag=True,
+    help="Disable Linux fanotify pre-write deny in the guardian (watchdog-only)",
+)
+def cmd_init(mode, daemon, force, allow_self_protect, no_fanotify):
     """Guided first-time setup for deadpush.
 
     Walks through:
@@ -2024,6 +2081,7 @@ def cmd_init(mode, daemon, force, allow_self_protect):
                     daemon=True,
                     strict=False,
                     allow_self_protect=allow_self_protect,
+                    enable_fanotify=not no_fanotify,
                 )
             except SystemExit:
                 pass

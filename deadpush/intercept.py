@@ -490,14 +490,18 @@ def enforce_content(
     result = GuardrailResult()
     rel = rel_path.replace("\\", "/")
 
-    if config.is_blocked(rel):
+    from .bootstrap import is_bootstrap_path
+
+    bootstrap = is_bootstrap_path(rel, config.repo_root)
+
+    if not bootstrap and config.is_blocked(rel):
         result.reject(Violation("blocked_file", f"File {rel} is blocked by config", 0, "critical"))
         return result
 
     from .debris import LLM_CONTEXT_FILES
 
     name_lower = Path(rel).name.lower()
-    if name_lower in LLM_CONTEXT_FILES:
+    if not bootstrap and name_lower in LLM_CONTEXT_FILES:
         result.reject(Violation(
             "debris",
             f"Known LLM/AI coding assistant context file: {Path(rel).name}",
@@ -520,7 +524,8 @@ def enforce_content(
 
     result.violations = [v for v in result.violations if v.description not in suppressed_desc]
 
-    _apply_guardrail_level(result, _check_sensitive_write(source, rel, config, runtime), runtime, "sensitive")
+    if not bootstrap:
+        _apply_guardrail_level(result, _check_sensitive_write(source, rel, config, runtime), runtime, "sensitive")
     destructive_level = runtime.get_guardrail_level("destructive") if runtime else "warn"
     for v in _check_destructive_changes(source, rel, config.repo_root, runtime, _old_source=old_source):
         if destructive_level == "block":
