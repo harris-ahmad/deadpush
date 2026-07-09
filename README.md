@@ -60,24 +60,43 @@ For a full automated demo of guardian features (burst simulation, hooks, MCP):
 python scripts/full_e2e_test.py --simulate-agent --burst
 ```
 
+## Enforcement tiers
+
+deadpush uses explicit tiers so you know what is **proven** vs **heuristic**. Full catalog: [docs/guarantees.md](docs/guarantees.md).
+
+| Tier | Command | What it guarantees |
+|------|---------|-------------------|
+| **T0 Deter** | `deadpush protect --daemon` | Accident prevention, loud tamper logs |
+| **T1 Harden** | `deadpush protect --hardened` | Agent cannot kill guardian, edit policy, or tamper hooks |
+| **T2 Sandbox** | `deadpush run --sandbox -- …` | Confined agent I/O + git/MCP gates |
+| **T3 Ship** | GitHub Action + branch protection | Violations cannot merge (uncircumventable) |
+
+**Recommended default:** T0 locally + [T3 on GitHub](docs/github-setup.md) (5-minute setup).
+
 ## Key Features
 
 - **True background guardian** — Survives terminal close, supports systemd/launchd autostart
 - **Smart multi-agent Safety Score** — Penalizes bursts of dangerous activity from parallel agents
 - **Automatic quarantine** (never hard-delete) — Easy `deadpush quarantine list` / `restore`
-- **Local Control Interface for agents** — Your AI coding agents can query the guardian themselves (`GET /status`, `/quarantine-list`, etc. on localhost)
+- **MCP proxy + Guardian Push Channel** — Mandatory tool-path scanning and push incidents to agents
+- **Plugin SDK** — Extend `enforce_content()` via `deadpush.guardrails` entry points
 - **Cross-platform git hooks** — Pre-commit, post-commit, and pre-push guardrails
 - **Debris detection** — LLM context files, vibe scratchpads, hardcoded secrets
 
 ## Commands You'll Actually Use
 
 ```bash
-deadpush protect --daemon     # The one command you run per repo
-deadpush status               # Is the guardian alive? What's the Safety Score?
+deadpush protect --daemon     # T0: one command per repo
+deadpush protect --hardened   # T1: unkillable guardian (requires sudo)
+deadpush run --sandbox -- …   # T2: sandboxed agent session
+deadpush mcp-proxy -- …       # Wrap MCP servers with guardrails
+deadpush status               # Safety Score + guardian health
 deadpush quarantine list      # See what it caught
 deadpush doctor               # Health check (hooks, MCP, guardian)
 deadpush mcp                  # MCP server for AI agents (guardrailed writes)
 ```
+
+See also: [comparison vs other guardrails](docs/comparison.md) · [guarantee catalog](docs/guarantees.md)
 
 ## Why This Matters in the AI Era
 

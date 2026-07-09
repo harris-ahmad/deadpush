@@ -318,6 +318,45 @@ def is_guardian_dev_repo(repo_root: Path) -> bool:
         return True
 
 
+_DEV_REPO_HINT = (
+    "Test in a throwaway clone instead:\n"
+    "  git clone . /tmp/deadpush-e2e && cd /tmp/deadpush-e2e && deadpush protect\n"
+    "Or pass --allow-self-protect to override (not recommended)."
+)
+
+
+def dev_repo_guard_refusal(
+    repo_root: Path,
+    *,
+    allow_self_protect: bool = False,
+    persistent: bool = False,
+    full_setup: bool = False,
+) -> str | None:
+    """Return a user-facing refusal message, or None if the operation is allowed.
+
+    * ``full_setup`` — block ``protect`` / ``init`` (hooks + optional daemon).
+    * ``persistent`` — block ``guard --daemon``, ``guard --hardened``, etc.
+    Foreground ``deadpush guard`` (no daemon) is still allowed for local testing.
+    """
+    if allow_self_protect or not is_guardian_dev_repo(repo_root):
+        return None
+    if full_setup:
+        return (
+            "Refusing to protect the deadpush development repository.\n"
+            "Running protect/init here installs git hooks and a filesystem guardian that "
+            "will block your own commits and quarantine source files.\n"
+            + _DEV_REPO_HINT
+        )
+    if persistent:
+        return (
+            "Refusing to start a persistent guardian on the deadpush development repository.\n"
+            "A background daemon (or hardened guardian) here will fight your own edits, "
+            "survive terminal close, and pollute ~/.deadpush with dev-repo state.\n"
+            + _DEV_REPO_HINT
+        )
+    return None
+
+
 def _find_repo_root(start: Path | None = None) -> Path:
     """Walk up to find likely repo root."""
     if start is None:

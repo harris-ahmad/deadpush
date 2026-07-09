@@ -956,17 +956,18 @@ def run_mcp(danger_mode: bool = False, hardened: bool = False):
     if hardened or (config.repo_root / ".guardian" / "guardian.control.port").exists():
         hardened = True
 
-    # Check for suspension flag (set by guardian when score ≤ 5).
-    # In normal mode, refuse to start. Danger mode overrides.
-    suspend_file = _scoped_suspend_file(config.repo_root, hardened)
-    if suspend_file.exists() and not danger_mode:
-        reason = suspend_file.read_text(encoding="utf-8").strip()
+    from .mcp_suspend import mcp_suspend_reason
+
+    reason = mcp_suspend_reason(config.repo_root, hardened=hardened)
+    if reason and not danger_mode:
         print(f"❌ deadpush MCP is suspended.\n\n{reason}\n\n"
               f"Your AI agent was blocked from weakening guardrails repeatedly.\n"
-              f"To re-enable MCP access, run:\n\n    deadpush mcp --danger\n\n"
-              f"This allows the agent to use MCP tools again.\n",
+              f"To re-enable MCP access, run:\n\n    deadpush unfreeze\n\n"
+              f"Or override with: deadpush mcp --danger\n",
               file=sys.stderr)
         return
+    from .guard import _scoped_suspend_file
+    suspend_file = _scoped_suspend_file(config.repo_root, hardened)
     server = McpServer(config.repo_root, danger_mode=danger_mode)
     server.suspend_file = suspend_file
     server._start_suspension_watch()

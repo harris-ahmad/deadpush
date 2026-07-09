@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://deadpush.dev/schemas/rules.v2.schema.json",
+  "title": "deadpush runtime rules (v2)",
+  "description": "Agent-configurable guardrail overrides stored in .deadpush/rules.json",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "allowed_patterns": {
+      "type": "array",
+      "description": "Regex patterns whose matches are suppressed from guardrail hits",
+      "items": {
+        "type": "object",
+        "required": ["pattern"],
+        "additionalProperties": false,
+        "properties": {
+          "pattern": { "type": "string", "minLength": 1 },
+          "description": { "type": "string" }
+        }
+      }
+    },
+    "ignored_paths": {
+      "type": "array",
+      "description": "Repo-relative paths skipped by enforcement",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "guardrail_levels": {
+      "type": "object",
+      "description": "Per-category enforcement level",
+      "additionalProperties": {
+        "type": "string",
+        "enum": ["off", "warn", "block"]
+      },
+      "properties": {
+        "prompt_injection": { "type": "string", "enum": ["off", "warn", "block"] },
+        "secret": { "type": "string", "enum": ["off", "warn", "block"] },
+        "security": { "type": "string", "enum": ["off", "warn", "block"] },
+        "layer": { "type": "string", "enum": ["off", "warn", "block"] },
+        "sensitive": { "type": "string", "enum": ["off", "warn", "block"] },
+        "destructive": { "type": "string", "enum": ["off", "warn", "block"] },
+        "debris": { "type": "string", "enum": ["off", "warn", "block"] },
+        "dependency": { "type": "string", "enum": ["off", "warn", "block"] }
+      }
+    }
+  }
+}

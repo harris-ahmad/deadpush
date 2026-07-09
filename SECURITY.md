@@ -10,6 +10,8 @@ boundary rather than a convenience.
 Please report suspected vulnerabilities **privately** — do not open a public issue
 for a security bug.
 
+For the list of provable guarantees and enforcement tiers, see [docs/guarantees.md](docs/guarantees.md).
+
 - Preferred: open a [GitHub Security Advisory](https://github.com/harris-ahmad/deadpush/security/advisories/new)
   (Security → Report a vulnerability).
 - Or email **harris@deadpush.dev** with a description, affected version, and a

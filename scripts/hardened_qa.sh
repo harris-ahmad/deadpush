@@ -339,6 +339,42 @@ check "'deadpush status --hardened' reports RUNNING" \
   bash -c "cd '$REPO' && $DP_CMD status --hardened 2>&1 | grep -qi running"
 
 # ══════════════════════════════════════════════════════════════════════════════
+# PHASE 2b — T2 sandbox (Seatbelt / git-wrapper / GPC; platform-dependent)
+# ══════════════════════════════════════════════════════════════════════════════
+info "T2 sandbox checks"
+
+check "deadpush run --sandbox reports Tier T2" \
+  bash -c "cd '$REPO' && $DP_CMD run --sandbox -- echo sandbox_ok 2>&1 | grep -qi 'Tier T2'"
+
+printf 'eval("qa_evil")\n' > "$REPO/qa_gitwrap_evil.py"
+( cd "$REPO" && git add qa_gitwrap_evil.py ) >/dev/null 2>&1 || true
+check_fails "git-wrapper blocks commit with guardrail violation" \
+  bash -c "cd '$REPO' && DEADPUSH_REPO_ROOT='$REPO' $DP_CMD git-wrapper commit -m 'evil' 2>&1 | grep -qi block"
+
+GPC_SOCK="$REPO/.deadpush/gpc.sock"
+if [[ "$OS" == "Darwin" ]]; then
+  HARD_GPC="/var/db/deadpush/gpc.${POL_ID}.sock"
+  if [[ -S "$HARD_GPC" ]]; then
+    check "GPC socket present (hardened path)" test -S "$HARD_GPC"
+  elif [[ -S "$GPC_SOCK" ]]; then
+    check "GPC socket present (repo path)" test -S "$GPC_SOCK"
+  else
+    warn "GPC socket not found (optional if guardian still starting)"
+  fi
+else
+  if [[ -S "$GPC_SOCK" ]]; then
+    check "GPC socket present" test -S "$GPC_SOCK"
+  else
+    warn "GPC socket not found (optional)"
+  fi
+fi
+
+if [[ -f "$REPO/.cursor/mcp.json" ]]; then
+  check "configure cursor wraps MCP servers with mcp-proxy" \
+    bash -c "cd '$REPO' && $DP_CMD configure cursor 2>&1 && grep -q mcp-proxy '$REPO/.cursor/mcp.json'"
+fi
+
+# ══════════════════════════════════════════════════════════════════════════════
 # PHASE 3 — Teardown & verify a clean uninstall
 # ══════════════════════════════════════════════════════════════════════════════
 if [[ "$KEEP" == "1" ]]; then

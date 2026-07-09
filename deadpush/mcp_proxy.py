@@ -1,0 +1,378 @@
+"""
+MCP transparent proxy — intercept tools/call before downstream MCP servers execute.
+
+Usage:
+    deadpush mcp-proxy -- npx -y @modelcontextprotocol/server-filesystem /path
+    deadpush mcp-proxy --config .cursor/mcp.json --server filesystem
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import subprocess
+import sys
+import threading
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+from .config import load_config
+from .audit import append_audit_event, EVENT_MCP_PROXY_BLOCK
+from .intercept import enforce_content, violations_from_result
+from .mcp_suspend import is_mcp_hardened, mcp_suspend_reason, suspend_file_path
+from .rules import RuntimeConfig
+
+logger = logging.getLogger("deadpush.mcp_proxy")
+
+MCP_PROTOCOL_VERSION = "2024-11-05"
+
+# Tool names (and substrings) that perform repo writes and must be scanned.
+WRITE_TOOL_NAMES = frozenset({
+    "write_file", "create_file", "edit_file", "write", "save_file",
+    "str_replace", "search_replace", "apply_patch", "patch_file",
+    "create_or_update_file", "file_write",
+})
+
+# Shell/terminal tools — always scanned for destructive commands.
+SHELL_TOOL_NAMES = frozenset({
+    "bash", "shell", "run_terminal_cmd", "terminal", "execute_command",
+    "run_command", "exec", "subprocess", "command", "run_shell_command",
+})
+
+GIT_TOOL_PATTERNS = ("git commit", "git push", "git add")
+
+DESTRUCTIVE_CMD_PATTERNS = (
+    "rm -rf", "rm -r /", "chmod 777", "mkfs.", ":(){ :|:& };:",
+    "curl | sh", "wget | sh", "curl|sh", "wget|sh",
+    "> /etc/", "dd if=", "git -c core.hookspath", "core.hookspath=",
+)
+
+# Argument keys that may hold file path or content.
+PATH_KEYS = ("path", "file_path", "filepath", "filename", "target", "file")
+CONTENT_KEYS = ("content", "contents", "text", "data", "new_string", "new_str", "replacement")
+
+
+def _shell_command(arguments: dict[str, Any]) -> str:
+    cmd = arguments.get("command") or arguments.get("cmd") or arguments.get("script") or ""
+    return cmd if isinstance(cmd, str) else ""
+
+
+def _destructive_shell_reason(cmd: str) -> str | None:
+    if not cmd:
+        return None
+    cmd_lower = cmd.lower()
+    for pat in DESTRUCTIVE_CMD_PATTERNS:
+        if pat in cmd_lower:
+            return f"Destructive shell command blocked: {pat!r} in {cmd[:120]!r}"
+    from .git_escape import detect_git_config_escape
+    parts = cmd.split()
+    escape = detect_git_config_escape(parts)
+    if escape:
+        return escape
+    return None
+
+
+def _block_result(tool_name: str, rel_path: str, summary: str, *, violations: list | None = None) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "success": False,
+        "blocked_by": "deadpush-mcp-proxy",
+        "tool": tool_name,
+        "summary": summary,
+    }
+    if violations is not None:
+        payload["violations"] = violations
+    return {
+        "content": [{"type": "text", "text": json.dumps(payload, indent=2)}],
+        "isError": True,
+    }
+
+
+def notify_proxy_block(repo_root: Path, tool_name: str, rel_path: str, summary: str) -> None:
+    """Best-effort: log block and notify guardian GPC (if running)."""
+    record = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "tool": tool_name,
+        "file": rel_path,
+        "summary": summary,
+    }
+    log_path = repo_root / ".deadpush" / "mcp_proxy_blocks.jsonl"
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record) + "\n")
+    except OSError as e:
+        logger.debug("Could not write mcp_proxy_blocks log: %s", e)
+
+    append_audit_event(
+        repo_root,
+        EVENT_MCP_PROXY_BLOCK,
+        {
+            "tool": tool_name,
+            "file": rel_path,
+            "description": summary,
+            "category": "mcp_proxy",
+        },
+    )
+
+    try:
+        from .config import is_hardened_install
+        from .gpc import GpcClient
+
+        client = GpcClient(repo_root, hardened=is_hardened_install(repo_root))
+        env_socket = os.environ.get("DEADPUSH_GPC_SOCKET")
+        if env_socket:
+            client.socket_path = Path(env_socket)
+        client.send_proxy_block(tool_name, summary, file=rel_path)
+    except Exception:
+        pass
+
+
+def _extract_path_and_content(arguments: dict[str, Any]) -> tuple[str | None, str | None]:
+    rel_path: str | None = None
+    content: str | None = None
+    for k, v in arguments.items():
+        kl = k.lower()
+        if rel_path is None and kl in PATH_KEYS and isinstance(v, str):
+            rel_path = v
+        if content is None and kl in CONTENT_KEYS and isinstance(v, str):
+            content = v
+    # Nested edits (some MCP tools use edits=[{path, content}])
+    edits = arguments.get("edits") or arguments.get("changes")
+    if isinstance(edits, list) and edits:
+        first = edits[0]
+        if isinstance(first, dict):
+            if rel_path is None:
+                rel_path = first.get("path") or first.get("file_path")
+            if content is None:
+                content = first.get("content") or first.get("new_string")
+    return rel_path, content
+
+
+def _tool_needs_scan(tool_name: str, arguments: dict[str, Any]) -> bool:
+    name_lower = tool_name.lower()
+    if name_lower in WRITE_TOOL_NAMES:
+        return True
+    for part in WRITE_TOOL_NAMES:
+        if part in name_lower:
+            return True
+    if name_lower in SHELL_TOOL_NAMES:
+        return True
+    for part in SHELL_TOOL_NAMES:
+        if part in name_lower:
+            return True
+    # Shell/bash tools with write-like commands
+    cmd = _shell_command(arguments)
+    if isinstance(cmd, str) and cmd:
+        cmd_lower = cmd.lower()
+        if any(p in cmd_lower for p in GIT_TOOL_PATTERNS):
+            return True
+        if any(w in cmd_lower for w in ("write_file", " echo ", " > ", " >> ", "tee ")):
+            return True
+        if _destructive_shell_reason(cmd):
+            return True
+    return False
+
+
+def _suspend_block_result(tool_name: str, reason: str) -> dict[str, Any]:
+    summary = (
+        f"MCP suspended by deadpush guardian: {reason}\n"
+        "All tool calls are blocked until the guardian clears the pause "
+        "(safety score recovers) or you run: deadpush unfreeze"
+    )
+    return _block_result(tool_name, "_mcp_suspended_", summary)
+
+
+def scan_tool_call(
+    tool_name: str,
+    arguments: dict[str, Any],
+    repo_root: Path,
+    *,
+    hardened: bool | None = None,
+) -> dict[str, Any] | None:
+    """Return MCP error result if blocked, else None (allow)."""
+    reason = mcp_suspend_reason(repo_root, hardened=hardened)
+    if reason:
+        return _suspend_block_result(tool_name, reason)
+
+    if not _tool_needs_scan(tool_name, arguments):
+        return None
+
+    shell_cmd = _shell_command(arguments)
+    destructive = _destructive_shell_reason(shell_cmd)
+    if destructive:
+        rel_path = "_shell_"
+        notify_proxy_block(repo_root, tool_name, rel_path, destructive)
+        return _block_result(tool_name, rel_path, f"Blocked by deadpush guardrails: {destructive}")
+
+    config = load_config(explicit_root=repo_root)
+    runtime = RuntimeConfig(repo_root)
+    rel_path, content = _extract_path_and_content(arguments)
+
+    if content is None and rel_path:
+        # Path-only call — check if file exists and scan content
+        full = repo_root / rel_path
+        if full.is_file():
+            try:
+                content = full.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                content = ""
+
+    if rel_path is None:
+        rel_path = "_unknown_"
+    if content is None:
+        content = json.dumps(arguments, default=str)
+
+    result = enforce_content(rel_path, content, config, runtime)
+    if result.allowed:
+        return None
+
+    violations = violations_from_result(rel_path, result)
+    summary = "; ".join(v["description"] for v in violations[:3])
+    full_summary = f"Blocked by deadpush guardrails: {summary}"
+    notify_proxy_block(repo_root, tool_name, rel_path, full_summary)
+    return _block_result(tool_name, rel_path, full_summary, violations=violations)
+
+
+class McpProxy:
+    """Transparent stdio proxy between MCP client and downstream MCP server."""
+
+    def __init__(self, downstream_cmd: list[str], repo_root: Path | None = None):
+        self.repo_root = (repo_root or Path.cwd()).resolve()
+        self.hardened = is_mcp_hardened(self.repo_root)
+        self.downstream_cmd = downstream_cmd
+        self._proc: subprocess.Popen[str] | None = None
+        self._initialized = False
+        self._lock = threading.Lock()
+        self._suspended = False
+        self._start_suspension_watch()
+
+    def start_downstream(self) -> None:
+        self._proc = subprocess.Popen(
+            self.downstream_cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=sys.stderr,
+            text=True,
+            bufsize=1,
+        )
+
+    def run(self) -> int:
+        self.start_downstream()
+        assert self._proc and self._proc.stdin and self._proc.stdout
+
+        def forward_client():
+            for line in sys.stdin:
+                line = line.rstrip("\n")
+                if not line:
+                    continue
+                handled = self._maybe_intercept(line)
+                if handled is not None:
+                    sys.stdout.write(handled + "\n")
+                    sys.stdout.flush()
+                    continue
+                try:
+                    self._proc.stdin.write(line + "\n")  # type: ignore[union-attr]
+                    self._proc.stdin.flush()
+                except (BrokenPipeError, OSError):
+                    break
+
+        def forward_server():
+            for line in self._proc.stdout:  # type: ignore[union-attr]
+                sys.stdout.write(line)
+                sys.stdout.flush()
+
+        t1 = threading.Thread(target=forward_client, daemon=True)
+        t2 = threading.Thread(target=forward_server, daemon=True)
+        t1.start()
+        t2.start()
+        t1.join()
+        try:
+            self._proc.terminate()
+        except OSError:
+            pass
+        return self._proc.wait()
+
+    def _start_suspension_watch(self) -> None:
+        """Detect guardian SESSION_PAUSE while the proxy stays alive for the IDE."""
+        suspend_path = suspend_file_path(self.repo_root, hardened=self.hardened)
+
+        def _watch() -> None:
+            while True:
+                try:
+                    if suspend_path.exists():
+                        self._suspended = True
+                        if mcp_suspend_reason(self.repo_root, hardened=self.hardened):
+                            logger.warning("MCP proxy: guardian suspension active — blocking tools/call")
+                        break
+                except Exception:
+                    pass
+                threading.Event().wait(2.0)
+
+        threading.Thread(target=_watch, daemon=True, name="mcp-proxy-suspension-watch").start()
+
+    def _maybe_intercept(self, line: str) -> str | None:
+        try:
+            msg = json.loads(line)
+        except json.JSONDecodeError:
+            return None
+
+        method = msg.get("method")
+        msg_id = msg.get("id")
+
+        if method == "initialize":
+            self._initialized = True
+            return None  # forward
+
+        if method != "tools/call" or msg_id is None:
+            return None
+
+        params = msg.get("params") or {}
+        tool_name = params.get("name", "")
+        arguments = params.get("arguments") or {}
+        if not isinstance(arguments, dict):
+            arguments = {}
+
+        block_result = scan_tool_call(
+            tool_name, arguments, self.repo_root, hardened=self.hardened,
+        )
+        if block_result is None:
+            return None
+
+        response = {"jsonrpc": "2.0", "id": msg_id, "result": block_result}
+        return json.dumps(response)
+
+
+def load_mcp_server_command(config_path: Path, server_name: str) -> list[str]:
+    """Extract command+args for an MCP server from a JSON config file."""
+    data = json.loads(config_path.read_text(encoding="utf-8"))
+    servers = data.get("mcpServers") or data.get("servers") or {}
+    if server_name not in servers:
+        raise ValueError(f"Server {server_name!r} not found in {config_path}")
+    entry = servers[server_name]
+    if isinstance(entry, dict):
+        cmd = entry.get("command") or entry.get("cmd")
+        args = entry.get("args") or []
+    else:
+        raise ValueError(f"Invalid server entry for {server_name!r}")
+    if not cmd:
+        raise ValueError(f"No command for server {server_name!r}")
+    return [cmd, *[str(a) for a in args]]
+
+
+def run_mcp_proxy(
+    downstream_cmd: list[str] | None = None,
+    *,
+    config_path: Path | None = None,
+    server_name: str | None = None,
+    repo_root: Path | None = None,
+) -> int:
+    if downstream_cmd is None:
+        if config_path is None or server_name is None:
+            print("Provide downstream command after -- or --config + --server", file=sys.stderr)
+            return 2
+        downstream_cmd = load_mcp_server_command(config_path, server_name)
+
+    proxy = McpProxy(downstream_cmd, repo_root=repo_root)
+    return proxy.run()

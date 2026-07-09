@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -51,12 +52,23 @@ def main():
 @click.option("--strict", is_flag=True, help="Enable strict intervention mode")
 @click.option("--soft", is_flag=True, help="Run as your own UID (this is the default)")
 @click.option("--hardened", is_flag=True, help="Opt into hardened mode: run under a root-owned _deadpush user (requires sudo)")
-def cmd_guard(repo, no_intervention, daemon, strict, soft, hardened):
+@click.option(
+    "--allow-self-protect",
+    is_flag=True,
+    help="Allow a persistent guardian on the deadpush source repo (not recommended)",
+)
+@click.option(
+    "--no-fanotify",
+    is_flag=True,
+    help="Disable Linux fanotify pre-write deny in the guardian (watchdog-only)",
+)
+def cmd_guard(repo, no_intervention, daemon, strict, soft, hardened, allow_self_protect, no_fanotify):
     """
     Start the AI Agent Guardian.
 
     This is the core always-on protection while using AI coding agents.
     """
+    from .config import dev_repo_guard_refusal
     from .guard import run_guardian
     import os
     intervention = not no_intervention
@@ -67,10 +79,30 @@ def cmd_guard(repo, no_intervention, daemon, strict, soft, hardened):
     use_hardened = bool(hardened)
     if repo:
         os.chdir(Path(repo).resolve())
-    run_guardian(intervention=intervention, daemon=daemon, strict=strict, hardened=use_hardened)
+    config = load_config()
+    refusal = dev_repo_guard_refusal(
+        config.repo_root,
+        allow_self_protect=allow_self_protect,
+        persistent=bool(daemon or use_hardened),
+    )
+    if refusal:
+        print_error(refusal.split("\n")[0])
+        for line in refusal.split("\n")[1:]:
+            print(line)
+        raise SystemExit(2)
+    run_guardian(
+        intervention=intervention,
+        daemon=daemon,
+        strict=strict,
+        hardened=use_hardened,
+        allow_self_protect=allow_self_protect,
+        enable_fanotify=not no_fanotify,
+    )
 
 
 @main.command("protect")
+@click.option("--repo", type=click.Path(exists=True, file_okay=False), default=None,
+              help="Repo root to protect (default: auto-detect from cwd)")
 @click.option("--enable", is_flag=True, help="Enable persistent background guardian (auto-starts daemon after setup)")
 @click.option("--daemon", is_flag=True, help="Start the guardian as a persistent background daemon after performing full setup")
 @click.option("--soft", is_flag=True, help="Same-UID guardian at your own privileges (this is the default)")
@@ -80,7 +112,17 @@ def cmd_guard(repo, no_intervention, daemon, strict, soft, hardened):
     is_flag=True,
     help="Allow protecting the deadpush source repo itself (not recommended for development)",
 )
-def cmd_protect(enable, daemon, soft, hardened, allow_self_protect):
+@click.option(
+    "--no-configure",
+    is_flag=True,
+    help="Skip IDE MCP proxy wiring (default: wrap Cursor/VS Code/Claude MCP via mcp-proxy)",
+)
+@click.option(
+    "--no-fanotify",
+    is_flag=True,
+    help="Disable Linux fanotify pre-write deny in the guardian (watchdog-only)",
+)
+def cmd_protect(repo, enable, daemon, soft, hardened, allow_self_protect, no_configure, no_fanotify):
     """
     One-command setup to protect your vibe coding workflow.
 
@@ -93,19 +135,19 @@ def cmd_protect(enable, daemon, soft, hardened, allow_self_protect):
     Run this once per repo (or after major changes) then walk away.
     The guardian will monitor, score, quarantine dangerous files autonomously.
     """
-    from .config import is_guardian_dev_repo
-    config = load_config()
+    from .config import dev_repo_guard_refusal
+    config = load_config(explicit_root=Path(repo).resolve() if repo else None)
 
-    if is_guardian_dev_repo(config.repo_root) and not allow_self_protect:
-        print_error("Refusing to protect the deadpush development repository.")
-        print_error(
-            "Running protect here installs git hooks and a filesystem guardian that "
-            "will block your own commits and quarantine source files."
-        )
-        print("Test in a throwaway clone instead:")
-        print("  git clone . /tmp/deadpush-e2e && cd /tmp/deadpush-e2e && deadpush protect")
-        print("Or pass --allow-self-protect to override (not recommended).")
-        return
+    refusal = dev_repo_guard_refusal(
+        config.repo_root,
+        allow_self_protect=allow_self_protect,
+        full_setup=True,
+    )
+    if refusal:
+        print_error(refusal.split("\n")[0])
+        for line in refusal.split("\n")[1:]:
+            print(line)
+        raise SystemExit(2)
 
     start_background = bool(enable or daemon)
     if soft and hardened:
@@ -185,11 +227,30 @@ def cmd_protect(enable, daemon, soft, hardened, allow_self_protect):
         print_error(f"Could not write protection marker: {e}")
         critical_failures.append("protection marker not written")
     try:
-        from .hooks import setup_mcp_discovery
-        setup_mcp_discovery(config.repo_root)
-        print("  Agent auto-discovery configured (.cursor/mcp.json, .vscode/mcp.json).")
+        from .bootstrap import default_protect_bootstrap_paths, record_bootstrap_paths
+        record_bootstrap_paths(config.repo_root, default_protect_bootstrap_paths())
+    except Exception:
+        pass
+    try:
+        if no_configure:
+            from .hooks import setup_mcp_discovery
+            setup_mcp_discovery(config.repo_root)
+            print("  Agent auto-discovery configured (.cursor/mcp.json, .vscode/mcp.json).")
+        else:
+            from .configure import configure_all_ides
+            cfg_result = configure_all_ides(config.repo_root)
+            configured = [next(iter(d.keys())) for d in cfg_result.get("configured", [])]
+            skipped = cfg_result.get("skipped", [])
+            if configured:
+                print_success(
+                    f"  IDE MCP servers proxied through deadpush guardrails: {', '.join(configured)}"
+                )
+            if skipped:
+                print(f"  (No MCP config found for: {', '.join(skipped)})")
+            if cfg_result.get("gpc_snippet"):
+                print(f"  GPC agent snippet: {cfg_result['gpc_snippet']}")
     except Exception as e:
-        print_warning(f"MCP discovery setup issue: {e}")
+        print_warning(f"IDE MCP configure issue: {e}")
 
     # GitHub Actions server-side guard (must be committed to take effect)
     try:
@@ -269,7 +330,14 @@ def cmd_protect(enable, daemon, soft, hardened, allow_self_protect):
             if not _bootstrapped:
                 print("  (launchd unavailable — starting guardian directly)")
                 try:
-                    run_guardian(intervention=True, daemon=True, strict=False, hardened=False)
+                    run_guardian(
+                        intervention=True,
+                        daemon=True,
+                        strict=False,
+                        hardened=False,
+                        allow_self_protect=allow_self_protect,
+                        enable_fanotify=not no_fanotify,
+                    )
                 except SystemExit:
                     # Expected: the double-fork parent exits; the daemon child lives on.
                     pass
@@ -527,13 +595,16 @@ def cmd_status(repo, hardened):
                 print("\nNo intervention actions in recent log tail.")
 
             print(f"\nLog file: {log}")
-            print("Live tail: tail -f " + str(log))
+            print("Live tail:  deadpush logs -f")
+            print("Dashboard:  deadpush dashboard --open")
         except Exception as e:
             print_warning(f"Could not parse recent log: {e}")
     else:
         print_warning("No guardian.log found yet (start the guardian to begin logging).")
 
     print("\nOther checks:")
+    print("  - All repos:     deadpush repos list")
+    print("  - Global hub:    deadpush hub open --start")
     print("  - Per-repo quarantines: cd your-repo ; deadpush quarantine list")
     print("  - Health check: deadpush doctor")
 
@@ -544,8 +615,9 @@ def cmd_status(repo, hardened):
     if port_file.exists():
         try:
             port = port_file.read_text().strip()
-            print(f"\nLocal Control Interface (for AI agents): http://127.0.0.1:{port}")
-            print("  Agents can GET /status, /quarantine-list, /safety-score, etc.")
+            print(f"\nLocal Control Interface: http://127.0.0.1:{port}")
+            print(f"  Dashboard (live):      http://127.0.0.1:{port}/dashboard")
+            print("  JSON API (agents):     /status, /safety-score, /quarantine-list")
         except Exception:
             pass
 
@@ -807,15 +879,255 @@ def cmd_scan(base, head, scan_all, ref, repo, fmt):
 
 @main.command("intercept")
 @click.option("--daemon", is_flag=True, help="Run as persistent background daemon")
-def cmd_intercept(daemon):
+@click.option(
+    "--allow-self-protect",
+    is_flag=True,
+    help="Allow a persistent guardian on the deadpush source repo (not recommended)",
+)
+@click.option(
+    "--no-fanotify",
+    is_flag=True,
+    help="Disable Linux fanotify pre-write deny in the guardian (watchdog-only)",
+)
+def cmd_intercept(daemon, allow_self_protect, no_fanotify):
     """Start the file interception daemon (alias for `deadpush guard`).
 
     Uses the watchdog-based guardian to monitor all file writes and
     enforce guardrails. The staging-based intercept has been removed;
     the guardian daemon covers every write through the filesystem.
     """
+    from .config import dev_repo_guard_refusal
     from .guard import run_guardian
-    run_guardian(intervention=True, daemon=daemon, strict=False)
+
+    config = load_config()
+    refusal = dev_repo_guard_refusal(
+        config.repo_root,
+        allow_self_protect=allow_self_protect,
+        persistent=daemon,
+    )
+    if refusal:
+        print_error(refusal.split("\n")[0])
+        for line in refusal.split("\n")[1:]:
+            print(line)
+        raise SystemExit(2)
+    run_guardian(
+        intervention=True,
+        daemon=daemon,
+        strict=False,
+        allow_self_protect=allow_self_protect,
+        enable_fanotify=not no_fanotify,
+    )
+
+
+@main.command("mcp-proxy")
+@click.option("--config", "config_path", type=click.Path(exists=True, dir_okay=False), default=None,
+              help="MCP config JSON (use with --server)")
+@click.option("--server", "server_name", default=None, help="MCP server name from --config")
+@click.option("--repo", type=click.Path(exists=True, file_okay=False), default=None,
+              help="Repo root for guardrail checks")
+@click.argument("downstream", nargs=-1, type=click.UNPROCESSED)
+def cmd_mcp_proxy(config_path, server_name, repo, downstream):
+    """Transparent MCP proxy — scan tools/call before downstream servers execute.
+
+    Wrap a single MCP server:
+
+        deadpush mcp-proxy -- npx -y @modelcontextprotocol/server-filesystem .
+
+    Or load from config:
+
+        deadpush mcp-proxy --config .cursor/mcp.json --server filesystem
+    """
+    from .mcp_proxy import run_mcp_proxy
+
+    repo_root = Path(repo).resolve() if repo else None
+    downstream_cmd = list(downstream) if downstream else None
+    raise SystemExit(run_mcp_proxy(
+        downstream_cmd,
+        config_path=Path(config_path) if config_path else None,
+        server_name=server_name,
+        repo_root=repo_root,
+    ))
+
+
+@main.command("run")
+@click.option("--sandbox", is_flag=True, help="T2: run command in sandbox (Seatbelt on macOS, fanotify on Linux)")
+@click.option("--hardened", is_flag=True, help="Use hardened state paths")
+@click.option("--backend", default=None, type=click.Choice(["seatbelt", "linux", "noop"]),
+              help="Force a specific enforcement backend")
+@click.option("--repo", type=click.Path(exists=True, file_okay=False), default=None,
+              help="Repo root (default: auto-detect)")
+@click.option(
+    "--no-gpc",
+    is_flag=True,
+    help="Disable mandatory GPC for this sandbox session (not T2-complete)",
+)
+@click.argument("cmd", nargs=-1, required=True)
+def cmd_run(sandbox, hardened, backend, repo, no_gpc, cmd):
+    """Run a command inside a deadpush sandbox session (T2).
+
+    Example:
+
+        deadpush run --sandbox -- python my_agent_script.py
+    """
+    from .run_session import describe_session, run_sandbox
+
+    repo_root = Path(repo).resolve() if repo else None
+    if not sandbox:
+        print_warning("Running without --sandbox (T0). Use --sandbox for T2 confined I/O.")
+        import subprocess
+        raise SystemExit(subprocess.run(list(cmd)).returncode)
+
+    info = describe_session(repo_root, backend_prefer=backend)
+    backend_name = info["backend"]["name"]
+    print(f"Tier T2 sandbox — backend: {backend_name}")
+    if info.get("gpc", {}).get("mandatory") and not no_gpc:
+        print(f"  GPC mandatory — socket: {info['gpc']['socket']}")
+    if backend_name == "noop":
+        print_warning(
+            "OS sandbox unavailable — using T2-partial (noop). "
+            "Subprocess has normal filesystem access; enforcement is via git-wrapper, "
+            "MCP proxy, and guardian quarantine only."
+        )
+    elif info["backend"].get("last_error"):
+        print_warning(info["backend"]["last_error"])
+    raise SystemExit(run_sandbox(
+        list(cmd),
+        repo_root=repo_root,
+        hardened=hardened,
+        backend_prefer=backend,
+        require_gpc=not no_gpc,
+    ))
+
+
+@main.command("git-wrapper", context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
+@click.argument("args", nargs=-1, type=click.UNPROCESSED)
+def cmd_git_wrapper(args):
+    """Internal: git shim used by deadpush run --sandbox."""
+    from .git_wrapper import main as git_main
+    raise SystemExit(git_main(list(args)))
+
+
+@main.command("configure")
+@click.argument("target", type=click.Choice(["cursor", "claude", "vscode", "all"]))
+@click.option("--repo", type=click.Path(exists=True, file_okay=False), default=None,
+              help="Repo root (default: auto-detect)")
+@click.option("--unwrap", is_flag=True, help="Restore original MCP server commands")
+def cmd_configure(target, repo, unwrap):
+    """Wrap IDE MCP servers to route tools/call through deadpush mcp-proxy (T1).
+
+    Example:
+
+        deadpush configure all
+        deadpush configure cursor --unwrap
+    """
+    from .config import load_config
+    from .configure import (
+        configure_all_ides,
+        configure_claude_mcp,
+        configure_cursor_mcp,
+        configure_vscode_mcp,
+    )
+
+    config = load_config(explicit_root=Path(repo).resolve() if repo else None)
+    if target == "all":
+        result = configure_all_ides(config.repo_root, unwrap=unwrap)
+        action = "unwrapped" if unwrap else "proxied"
+        print_success(f"IDE MCP configuration {action}")
+        for item in result.get("configured", []):
+            for name, detail in item.items():
+                print(f"  {name}: {detail.get('path')} ({', '.join(detail.get('servers', []))})")
+        if result.get("skipped"):
+            print(f"  Skipped (not found): {', '.join(result['skipped'])}")
+        if result.get("gpc_snippet"):
+            print(f"  GPC agent snippet: {result['gpc_snippet']}")
+        return
+
+    fn = {"cursor": configure_cursor_mcp, "claude": configure_claude_mcp, "vscode": configure_vscode_mcp}[target]
+    result = fn(config.repo_root, unwrap=unwrap)
+
+    action = "unwrapped" if unwrap else "proxied"
+    print_success(f"MCP servers {action} via deadpush mcp-proxy")
+    print(f"  Config: {result['path']}")
+    if result.get("backup"):
+        print(f"  Backup: {result['backup']}")
+    print(f"  Servers: {', '.join(result.get('servers', [])) or '(none)'}")
+
+
+@main.command("verify-audit")
+@click.option("--repo", type=click.Path(exists=True, file_okay=False), default=None,
+              help="Repo root (default: auto-detect)")
+@click.option("--json", "as_json", is_flag=True, help="Emit machine-readable summary")
+def cmd_verify_audit(repo, as_json):
+    """Verify the tamper-evident audit hash chain for this repo."""
+    import json as json_mod
+
+    from .audit import audit_log_path, audit_summary, verify_audit_chain
+    from .config import load_config
+
+    config = load_config(explicit_root=Path(repo).resolve() if repo else None)
+    path = audit_log_path(config.repo_root)
+    ok, errors = verify_audit_chain(path)
+    summary = audit_summary(config.repo_root)
+
+    if as_json:
+        print(json_mod.dumps({"valid": ok, "errors": errors, **summary}, indent=2))
+        raise SystemExit(0 if ok else 1)
+
+    print_header("Audit chain verification", str(path))
+    print(f"  Entries: {summary['entries']}")
+    if summary.get("by_event"):
+        print(f"  Events: {summary['by_event']}")
+    if ok:
+        print_success("Audit chain is valid — no tampering detected.")
+    else:
+        print_error("Audit chain verification FAILED:")
+        for err in errors[:10]:
+            print(f"  - {err}")
+    raise SystemExit(0 if ok else 1)
+
+
+@main.command("export-sarif")
+@click.option("--repo", type=click.Path(exists=True, file_okay=False), default=None)
+@click.option("-o", "--output", type=click.Path(dir_okay=False), default=None,
+              help="Write SARIF file (default: stdout)")
+@click.option("--max-entries", default=500, show_default=True, type=int)
+def cmd_export_sarif(repo, output, max_entries):
+    """Export audit trail guardrail events as SARIF 2.1.0 for GitHub Security tab."""
+    import json as json_mod
+
+    from .audit import export_sarif
+    from .config import load_config
+
+    config = load_config(explicit_root=Path(repo).resolve() if repo else None)
+    sarif = export_sarif(config.repo_root, max_entries=max_entries)
+    text = json_mod.dumps(sarif, indent=2)
+    if output:
+        Path(output).write_text(text + "\n", encoding="utf-8")
+        print_success(f"SARIF written to {output}")
+    else:
+        print(text)
+
+
+@main.command("gpc-listen")
+@click.option("--repo", type=click.Path(exists=True, file_okay=False), default=None)
+@click.option("--hardened", is_flag=True)
+def cmd_gpc_listen(repo, hardened):
+    """Subscribe to Guardian Push Channel events (debug/integration)."""
+    import json
+
+    from .config import load_config
+    from .gpc import GpcClient, GpcMessage
+
+    config = load_config(explicit_root=Path(repo).resolve() if repo else None)
+
+    def on_msg(msg: GpcMessage) -> None:
+        print(f"[GPC {msg.type}] {json.dumps(msg.payload, default=str)}")
+    client = GpcClient(config.repo_root, hardened=hardened, on_message=on_msg)
+    print(f"Listening on {client.socket_path} (Ctrl+C to stop)")
+    try:
+        client.connect_and_listen(blocking=True)
+    except KeyboardInterrupt:
+        client.stop()
 
 
 @main.command("mcp")
@@ -863,210 +1175,264 @@ def cmd_unfreeze(hardened):
 @main.command("stop")
 @click.option("--repo", type=click.Path(exists=True, file_okay=False), default=None,
               help="Repo root to stop (default: auto-detect from cwd)")
+@click.option("--all", "stop_all", is_flag=True,
+              help="Stop guardians for every known repo (see: deadpush repos list)")
 @click.option("--hardened", is_flag=True, help="Stop a hardened guardian")
 @click.option("--force", is_flag=True, help="Force cleanup of stale lock/PID files (use if guardian crashed)")
-def cmd_stop(repo, hardened, force):
+def cmd_stop(repo, stop_all, hardened, force):
     """Stop the deadpush guardian and clean up.
 
     Sends SIGTERM to the guardian (which saves safety score with a clean-shutdown
     marker so restart doesn't trigger the "killed by agent" penalty), unloads the
     launchd plist, kills shadow processes, removes immutable flags from hooks,
     and cleans up PID / lock files.
+
+    Use ``--all`` to stop every known repo in one shot, then verify with
+    ``pgrep -fl deadpush`` (should print nothing).
     """
-    import os
-    import signal
-    import subprocess
-    import time
+    from .guard import (
+        stop_guardian_for_repo,
+        stop_guardian_by_id,
+        kill_orphan_guardian_processes,
+        count_running_guardians,
+    )
+    from .state import discover_repos
+
+    if stop_all:
+        print_header("deadpush stop --all", "Stopping every known guardian")
+        seen_paths: set[str] = set()
+        seen_ids: set[str] = set()
+        stopped = 0
+        for h in (False, True):
+            for entry in discover_repos(hardened=h):
+                rid = entry["id"]
+                path = entry.get("path") or ""
+                if path and path not in seen_paths:
+                    seen_paths.add(path)
+                    label = entry.get("label") or path
+                    if stop_guardian_for_repo(path, hardened=entry.get("hardened", h), force=force):
+                        print_success(f"Stopped {label} ({path})")
+                        stopped += 1
+                    elif force:
+                        print_info(f"Cleaned state for {label}")
+                        stopped += 1
+                elif rid not in seen_ids:
+                    seen_ids.add(rid)
+                    if stop_guardian_by_id(rid, hardened=h):
+                        print_success(f"Stopped guardian id={rid}")
+                        stopped += 1
+        orphans = kill_orphan_guardian_processes()
+        if orphans:
+            print_warning(f"Sent SIGTERM to {orphans} orphan process(es)")
+        remaining = count_running_guardians()
+        if remaining:
+            print_error(f"{remaining} guardian/shadow process(es) still running — try: pgrep -fl deadpush")
+        else:
+            print_success("No guardian processes running.")
+        return
 
     from .config import load_config
-    from .guard import (
-        _scoped_pidfile,
-        _scoped_lockfile,
-        _scoped_portfile,
-        _scoped_plist_label,
-        _scoped_plist_path,
-        stop_shadow_for_repo,
-    )
-    from .hooks import _make_mutable
 
     config = load_config(explicit_root=Path(repo).resolve() if repo else None)
     repo_root = config.repo_root
-    pidfile = _scoped_pidfile(repo_root, hardened)
-    lockfile = _scoped_lockfile(repo_root, hardened)
-    plist_label = _scoped_plist_label(repo_root)
-    plist_path = _scoped_plist_path(repo_root, hardened)
-    portfile = _scoped_portfile(repo_root, hardened)
-    shadow_pidfile = pidfile.with_suffix(".shadow")
+    if stop_guardian_for_repo(repo_root, hardened=hardened, force=force):
+        print_success(f"Guardian stopped for {repo_root.name}. Restart with: deadpush protect")
+    elif force:
+        print_success("Forced cleanup complete.")
+    else:
+        print_info("No guardian was running.")
 
-    # Force cleanup mode: just remove all state files and exit
-    if force:
-        from .guard import DaemonManager
-        dm = DaemonManager(pidfile, lockfile)
-        dm.force_cleanup()
-        # Also clean up plist and shared port
-        if hardened:
-            try:
-                subprocess.run(["sudo", "rm", "-f", str(plist_path)], capture_output=True, timeout=10)
-                subprocess.run(["sudo", "rm", "-f", str(repo_root / ".guardian" / "guardian.control.port")], capture_output=True, timeout=10)
-            except Exception:
-                pass
-        else:
-            if plist_path.exists():
-                plist_path.unlink()
-            shared_port = repo_root / ".guardian" / "guardian.control.port"
-            if shared_port.exists():
-                shared_port.unlink()
-        print("Forced cleanup complete. All guardian state removed.")
+
+
+@main.group("repos")
+def cmd_repos():
+    """List and manage per-repo guardian state under ~/.deadpush/repos/."""
+    pass
+
+
+@cmd_repos.command("list")
+@click.option("--hardened", is_flag=True, help="List hardened (/var/db/deadpush) repos only")
+def cmd_repos_list(hardened):
+    """Show all known repos with id, path, and running status."""
+    from .state import discover_repos, state_dir
+
+    entries = discover_repos(hardened=hardened)
+    if not entries:
+        print_info(f"No repos registered under {state_dir(hardened)}")
         return
 
-    guardian_killed = False
-    shadow_killed = False
+    print_header("deadpush repos", str(state_dir(hardened)))
+    print(f"{'ID':<14} {'STATUS':<10} {'LABEL':<22} PATH")
+    print("-" * 72)
+    for e in entries:
+        status = "RUNNING" if e.get("running") else "stopped"
+        pid = f" pid={e['pid']}" if e.get("pid") and e.get("running") else ""
+        label = (e.get("label") or e["id"])[:22]
+        path = e.get("path") or "(unknown path)"
+        print(f"{e['id']:<14} {status + pid:<10} {label:<22} {path}")
 
-    # 1. Kill shadow processes first (they re-spawn the guardian) — repo-scoped only
-    if not hardened:
-        count = stop_shadow_for_repo(repo_root, hardened)
-        if count:
-            shadow_killed = True
-            print(f"  Killed {count} shadow process(es)")
-            time.sleep(0.2)
 
-    # 2. Kill guardian via PID file for this repo only
-    guardian_pid = None
-    if hardened:
-        try:
-            r = subprocess.run(
-                ["sudo", "cat", str(pidfile)],
-                capture_output=True, text=True, timeout=5,
-            )
-            if r.returncode == 0 and r.stdout.strip():
-                guardian_pid = int(r.stdout.strip())
-        except Exception:
-            pass
-    elif pidfile.exists():
-        try:
-            guardian_pid = int(pidfile.read_text().strip())
-        except (ValueError, OSError):
-            pass
+@cmd_repos.command("clean")
+@click.option("--older-than", default=30, type=int, help="Remove stopped repos unseen for N days")
+@click.option("--dry-run", is_flag=True, help="Show what would be removed")
+def cmd_repos_clean(older_than, dry_run):
+    """Prune state dirs for repos that are stopped and stale."""
+    import shutil
+    from datetime import datetime, timedelta, timezone
 
-    if guardian_pid:
-        try:
-            if hardened:
-                r = subprocess.run(
-                    ["sudo", "kill", "-0", str(guardian_pid)],
-                    capture_output=True, timeout=5,
-                )
-                if r.returncode != 0:
-                    raise OSError("not running")
-                subprocess.run(
-                    ["sudo", "kill", str(guardian_pid)],
-                    capture_output=True, timeout=5,
-                )
-            else:
-                os.kill(guardian_pid, 0)  # check alive
-                os.kill(guardian_pid, signal.SIGTERM)
-            # Wait briefly so shutdown handler runs mark_clean_shutdown()
-            for _ in range(10):
-                try:
-                    if hardened:
-                        r = subprocess.run(
-                            ["sudo", "kill", "-0", str(guardian_pid)],
-                            capture_output=True, timeout=5,
-                        )
-                        if r.returncode != 0:
-                            break
-                    else:
-                        os.kill(guardian_pid, 0)
-                    time.sleep(0.2)
-                except OSError:
-                    break
-            else:
-                # Force kill if still alive
-                try:
-                    if hardened:
-                        subprocess.run(
-                            ["sudo", "kill", "-9", str(guardian_pid)],
-                            capture_output=True, timeout=5,
-                        )
-                    else:
-                        os.kill(guardian_pid, signal.SIGKILL)
-                except OSError:
-                    pass
-            guardian_killed = True
-            print(f"  Guardian PID {guardian_pid} stopped")
-        except OSError:
-            print(f"  Guardian PID {guardian_pid} not running (stale PID file)")
+    from .state import discover_repos, repo_state_dir, state_dir
 
-    # 3. Launchctl bootout (unload plist, prevents re-spawn)
-    try:
-        if hardened:
-            r = subprocess.run(
-                ["sudo", "launchctl", "bootout", "system", plist_label],
-                capture_output=True, text=True, timeout=10,
-            )
+    cutoff = datetime.now(timezone.utc) - timedelta(days=older_than)
+    removed = 0
+    for entry in discover_repos(hardened=False):
+        if entry.get("running"):
+            continue
+        path = entry.get("path")
+        if not path:
+            continue
+        d = repo_state_dir(path, hardened=False)
+        manifest = d / "manifest.json"
+        if manifest.exists():
+            try:
+                m = json.loads(manifest.read_text(encoding="utf-8"))
+                last = datetime.fromisoformat(m.get("last_seen", "1970-01-01T00:00:00+00:00"))
+                if last.tzinfo is None:
+                    last = last.replace(tzinfo=timezone.utc)
+                if last > cutoff:
+                    continue
+            except Exception:
+                pass
+        if dry_run:
+            print(f"would remove {d}")
         else:
-            uid = os.getuid()
-            r = subprocess.run(
-                ["launchctl", "bootout", f"gui/{uid}/{plist_label}"],
-                capture_output=True, text=True, timeout=10,
-            )
-        if r.returncode == 0:
-            print("  launchd plist unloaded")
-        elif "not found" in r.stderr.lower() or "does not exist" in r.stderr.lower():
-            pass  # not loaded — fine
-        else:
-            print(f"  launchctl bootout: {r.stderr.strip()}")
-    except Exception:
-        pass
-
-    # 5. Remove the plist from LaunchAgents / LaunchDaemons
-    try:
-        if hardened:
-            r = subprocess.run(["sudo", "test", "-e", str(plist_path)], capture_output=True, timeout=5)
-            if r.returncode == 0:
-                subprocess.run(["sudo", "rm", str(plist_path)], capture_output=True, text=True, timeout=10)
-                print(f"  Removed {plist_path.name}")
-        elif plist_path.exists():
-            plist_path.unlink()
-            print(f"  Removed {plist_path.name}")
-    except OSError as e:
-        print(f"  Could not remove plist: {e}")
-
-    # 6. Clean up PID / lock / port / shadow files for this repo only
-    for f in [pidfile, lockfile, portfile, shadow_pidfile]:
-        try:
-            if hardened:
-                subprocess.run(["sudo", "rm", "-f", str(f)], capture_output=True, text=True, timeout=10)
-            elif f.exists():
-                f.unlink()
-        except OSError:
-            pass
-
-    # 6b. Clean up shared port file (hardened mode)
-    if hardened:
-        shared_port = repo_root / ".guardian" / "guardian.control.port"
-        try:
-            subprocess.run(["sudo", "rm", "-f", str(shared_port)], capture_output=True, text=True, timeout=10)
-        except OSError:
-            pass
-
-    # 7. Remove immutable flag from git hooks
-    try:
-        hooks_dir = config.repo_root / ".git" / "hooks"
-        if hooks_dir.exists():
-            for hook in hooks_dir.iterdir():
-                if hook.is_file() and not hook.name.endswith(".sample"):
-                    _make_mutable(hook)
-            print("  Removed immutable flag from hooks")
-    except Exception:
-        pass
-
-    # 8. Print summary
-    if guardian_killed or shadow_killed:
-        print("\nGuardian stopped. You can restart it later with:")
-        print("  deadpush protect")
+            shutil.rmtree(d, ignore_errors=True)
+            removed += 1
+    if dry_run:
+        print_info("Dry run only — no files deleted.")
     else:
-        print("No guardian was running.")
+        print_success(f"Removed {removed} stale repo state dir(s) under {state_dir(False) / 'repos'}")
 
+
+@main.command("logs")
+@click.option("--repo", type=click.Path(exists=True, file_okay=False), default=None,
+              help="Repo root (default: auto-detect from cwd)")
+@click.option("-f", "--follow", is_flag=True, help="Tail log live (like tail -f)")
+@click.option("--lines", "-n", default=40, type=int, help="Number of lines to show (default 40)")
+def cmd_logs(repo, follow, lines):
+    """Show guardian log for the current (or given) repo."""
+    import subprocess
+
+    from .guard import _scoped_log_file
+
+    config = load_config(explicit_root=Path(repo).resolve() if repo else None)
+    log = _scoped_log_file(config.repo_root, hardened=False)
+    if not log.exists():
+        print_warning(f"No log yet: {log}")
+        return
+    if follow:
+        subprocess.run(["tail", "-f", str(log)])
+        return
+    text = log.read_text(errors="ignore")
+    chunk = text.strip().splitlines()[-lines:] if text.strip() else []
+    for line in chunk:
+        click.echo(line)
+    print(f"\n({log})")
+
+
+@main.command("dashboard")
+@click.option("--repo", type=click.Path(exists=True, file_okay=False), default=None,
+              help="Repo root (default: auto-detect from cwd)")
+@click.option("--open", "open_browser", is_flag=True, help="Open in default browser")
+def cmd_dashboard(repo, open_browser):
+    """Open the live guardian dashboard (http://127.0.0.1:PORT/dashboard)."""
+    import webbrowser
+
+    from .guard import _scoped_portfile, guardian_is_running
+
+    config = load_config(explicit_root=Path(repo).resolve() if repo else None)
+    repo_root = config.repo_root
+    if not guardian_is_running(repo_root, hardened=False):
+        print_error("Guardian is not running. Start with: deadpush protect --daemon")
+        return
+    port_file = _scoped_portfile(repo_root, hardened=False)
+    if not port_file.exists():
+        print_error("Control port file missing — is the guardian fully started?")
+        return
+    port = port_file.read_text().strip()
+    url = f"http://127.0.0.1:{port}/dashboard"
+    print(url)
+    if open_browser:
+        webbrowser.open(url)
+
+
+@main.group("hub")
+def cmd_hub():
+    """Global multi-repo dashboard (all guardians in one view)."""
+    pass
+
+
+@cmd_hub.command("start")
+@click.option("--port", default=8742, type=int, help="Hub listen port (default 8742)")
+@click.option("--daemon", is_flag=True, help="Run hub in background")
+def hub_start(port, daemon):
+    """Start the global deadpush hub on localhost."""
+    from .hub import hub_is_running, hub_url, start_hub
+
+    if hub_is_running():
+        print_success(f"Hub already running at {hub_url()}")
+        return
+    pid = start_hub(port=port, daemon=daemon)
+    if daemon:
+        print_success(f"Hub started (PID {pid}): {hub_url()}/hub")
+        print("  Open: deadpush hub open")
+    else:
+        print_info("Hub stopped.")
+
+
+@cmd_hub.command("stop")
+def hub_stop():
+    """Stop the global deadpush hub."""
+    from .hub import hub_is_running, stop_hub
+
+    if not hub_is_running():
+        print_info("Hub is not running.")
+        return
+    stop_hub()
+    print_success("Hub stopped.")
+
+
+@cmd_hub.command("status")
+def hub_status():
+    """Show whether the global hub is running."""
+    from .hub import hub_is_running, hub_url
+    from .state import hub_pidfile
+
+    print_header("deadpush Hub")
+    if hub_is_running():
+        pid = hub_pidfile().read_text().strip()
+        print_success(f"Hub RUNNING (PID {pid}) — {hub_url()}/hub")
+    else:
+        print_warning("Hub is not running. Start with: deadpush hub start --daemon")
+
+
+@cmd_hub.command("open")
+@click.option("--start", is_flag=True, help="Start hub in background if not running")
+def hub_open(start):
+    """Open the global hub in your browser."""
+    import webbrowser
+
+    from .hub import hub_is_running, hub_url, start_hub
+
+    if not hub_is_running():
+        if start:
+            start_hub(daemon=True)
+        else:
+            print_error("Hub is not running. Start with: deadpush hub start --daemon")
+            print("  Or: deadpush hub open --start")
+            return
+    url = f"{hub_url()}/hub"
+    print(url)
+    webbrowser.open(url)
 
 
 @main.command("uninstall")
@@ -1499,6 +1865,59 @@ def cmd_doctor(repo, hardened):
         except Exception:
             check("State dir permissions", False, "could not check")
 
+    # 9. Sandbox backends + guardrail plugins
+    print()
+    print("  Sandbox backends:")
+    try:
+        from .run_session import describe_backends
+        from .plugins import load_plugins, plugin_load_errors
+
+        backends = describe_backends(repo_root)
+        selected = backends["selected"]
+        os_sandbox = selected.get("os_sandbox", False)
+        check(
+            "Selected sandbox backend",
+            True,
+            f"{selected.get('name')} ({selected.get('tier')})"
+            + (" — OS syscall confinement" if os_sandbox else " — T2-partial, no OS sandbox"),
+        )
+        if selected.get("name") == "noop":
+            print("      → Run on macOS (Seatbelt) or Linux 5.13+ (fanotify) for full T2.")
+        for b in backends["available"]:
+            mark = "← selected" if b.get("name") == selected.get("name") else (
+                "available" if b.get("available") else "unavailable"
+            )
+            print(f"      · {b.get('name')}: {mark}")
+
+        load_plugins(reload=True)
+        plugin_errs = plugin_load_errors()
+        loaded = load_plugins()
+        check(
+            "Guardrail plugins",
+            not plugin_errs,
+            f"{len(loaded)} loaded" if not plugin_errs else "; ".join(plugin_errs[:2]),
+        )
+        if plugin_errs:
+            print("      → Fix or uninstall broken entry-point plugins in pyproject.toml.")
+    except Exception as e:
+        check("Sandbox backends", False, str(e))
+
+    # 10. Audit trail
+    try:
+        from .audit import audit_summary
+
+        audit = audit_summary(repo_root)
+        check(
+            "Audit chain",
+            audit.get("valid", True),
+            f"{audit.get('entries', 0)} entries at {audit.get('path')}",
+        )
+        if audit.get("errors"):
+            for err in audit["errors"][:3]:
+                print(f"      → {err}")
+    except Exception as e:
+        check("Audit chain", False, str(e))
+
     # Summary
     print()
     if all_ok:
@@ -1513,7 +1932,17 @@ def cmd_doctor(repo, hardened):
 @click.option("--mode", type=click.Choice(["default", "hardened"]), default="default", help="Protection mode: default (user-level) or hardened (privilege separation)")
 @click.option("--daemon/--no-daemon", default=True, help="Start guardian daemon after setup")
 @click.option("--force", is_flag=True, help="Skip confirmations")
-def cmd_init(mode, daemon, force):
+@click.option(
+    "--allow-self-protect",
+    is_flag=True,
+    help="Allow init on the deadpush source repo (not recommended)",
+)
+@click.option(
+    "--no-fanotify",
+    is_flag=True,
+    help="Disable Linux fanotify pre-write deny in the guardian (watchdog-only)",
+)
+def cmd_init(mode, daemon, force, allow_self_protect, no_fanotify):
     """Guided first-time setup for deadpush.
 
     Walks through:
@@ -1528,7 +1957,7 @@ def cmd_init(mode, daemon, force):
 
     Run this once per repo, then walk away.
     """
-    from .config import load_config
+    from .config import dev_repo_guard_refusal, load_config
     from .guard import setup_autostart, setup_hardened_environment, run_guardian
     from .hooks import (
         install_hook, install_precommit_hook, install_postcommit_hook,
@@ -1537,6 +1966,17 @@ def cmd_init(mode, daemon, force):
 
     config = load_config()
     repo_root = config.repo_root
+
+    refusal = dev_repo_guard_refusal(
+        repo_root,
+        allow_self_protect=allow_self_protect,
+        full_setup=True,
+    )
+    if refusal:
+        print_error(refusal.split("\n")[0])
+        for line in refusal.split("\n")[1:]:
+            print(line)
+        raise SystemExit(2)
 
     print_header("deadpush Init", f"Guided setup for {repo_root.name}")
     print(f"Mode: {mode}")
@@ -1636,7 +2076,13 @@ def cmd_init(mode, daemon, force):
             print_success("Hardened guardian already loaded via launchd")
         else:
             try:
-                run_guardian(intervention=True, daemon=True, strict=False)
+                run_guardian(
+                    intervention=True,
+                    daemon=True,
+                    strict=False,
+                    allow_self_protect=allow_self_protect,
+                    enable_fanotify=not no_fanotify,
+                )
             except SystemExit:
                 pass
             except Exception as e:
@@ -1661,6 +2107,9 @@ def cmd_init(mode, daemon, force):
     else:
         print("  Start guardian with: deadpush protect --daemon")
     print("  Configure your AI agent to use: deadpush mcp")
+    print("  T2 sandbox sessions: deadpush run --sandbox -- <agent-cmd>")
+    print("  MCP proxy: deadpush mcp-proxy -- <mcp-server-cmd>")
+    print("  Guarantee tiers: docs/guarantees.md")
     print("  View dashboard at: http://127.0.0.1:<port>/dashboard")
 
     return 0

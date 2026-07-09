@@ -13,9 +13,14 @@ from deadpush import guard
 def hardened_env(tmp_path, monkeypatch):
     """Simulate a writable hardened environment by redirecting state and
     autostart paths to a temp directory."""
+    from deadpush import state
+
     state_dir = tmp_path / "state"
     state_dir.mkdir(parents=True)
-    monkeypatch.setattr(guard, "_state_dir", lambda hardened=False: state_dir)
+    monkeypatch.setattr(state, "HARDENED_STATE_DIR", state_dir)
+    monkeypatch.setattr(state, "state_dir", lambda hardened=False: state_dir if hardened else Path.home() / ".deadpush")
+    state.reset_migration_flags()
+    monkeypatch.setattr(guard, "_state_dir", lambda hardened=False: state.state_dir(hardened))
     rid_fn = guard._repo_id
     if sys.platform == "darwin":
         monkeypatch.setattr(
@@ -112,31 +117,40 @@ class TestStateDir:
 
 
 class TestScopedPaths:
-    def test_scoped_pidfile_default(self):
+    def test_scoped_pidfile_default(self, tmp_path, monkeypatch):
+        from deadpush import state
+
+        home = tmp_path / "home"
+        home.mkdir()
+        monkeypatch.setattr(state.Path, "home", staticmethod(lambda: home))
+        state.reset_migration_flags()
+
         repo = Path("/tmp/test-repo")
         path = guard._scoped_pidfile(repo)
-        assert str(path).startswith(str(Path.home() / ".deadpush"))
-        assert path.name.endswith(".pid")
-        assert guard._repo_id(str(repo)) in path.name
+        rid = guard._repo_id(str(repo))
+        assert path == home / ".deadpush" / "repos" / rid / "guardian.pid"
 
-    def test_scoped_pidfile_hardened(self):
+    def test_scoped_pidfile_hardened(self, hardened_env):
         repo = Path("/tmp/test-repo")
         path = guard._scoped_pidfile(repo, hardened=True)
-        assert str(path).startswith("/var/db/deadpush")
-        assert path.name.endswith(".pid")
+        rid = guard._repo_id(str(repo))
+        assert path == hardened_env / "repos" / rid / "guardian.pid"
 
-    def test_scoped_lockfile_follows_state_dir(self):
-        path = guard._scoped_lockfile(Path("/tmp/test-repo"), hardened=True)
-        assert str(path).startswith("/var/db/deadpush")
+    def test_scoped_lockfile_follows_state_dir(self, hardened_env):
+        repo = Path("/tmp/test-repo")
+        path = guard._scoped_lockfile(repo, hardened=True)
+        assert str(path).startswith(str(hardened_env))
 
-    def test_scoped_portfile_follows_state_dir(self):
-        path = guard._scoped_portfile(Path("/tmp/test-repo"), hardened=True)
-        assert str(path).startswith("/var/db/deadpush")
-        assert "port" in path.name
+    def test_scoped_portfile_follows_state_dir(self, hardened_env):
+        repo = Path("/tmp/test-repo")
+        path = guard._scoped_portfile(repo, hardened=True)
+        assert str(path).startswith(str(hardened_env))
+        assert path.name == "control.port"
 
-    def test_scoped_suspend_file_follows_state_dir(self):
-        path = guard._scoped_suspend_file(Path("/tmp/test-repo"), hardened=True)
-        assert str(path).startswith("/var/db/deadpush")
+    def test_scoped_suspend_file_follows_state_dir(self, hardened_env):
+        repo = Path("/tmp/test-repo")
+        path = guard._scoped_suspend_file(repo, hardened=True)
+        assert str(path).startswith(str(hardened_env))
         assert "suspended" in path.name
 
     def test_scoped_plist_label_includes_repo_id(self):
@@ -293,7 +307,7 @@ class TestSetupAutostartHardenedDarwin:
 
 
 class TestMcpHardened:
-    def test_auto_detects_via_shared_port(self, temp_repo, monkeypatch):
+    def test_auto_detects_via_shared_port(self, temp_repo, monkeypatch, hardened_env):
         import os
         os.chdir(temp_repo)
 
@@ -310,7 +324,7 @@ class TestMcpHardened:
             run_mcp()
         assert guard._is_hardened(hardened=True)
 
-    def test_explicit_hardened_flag(self, temp_repo, monkeypatch):
+    def test_explicit_hardened_flag(self, temp_repo, monkeypatch, hardened_env):
         import os
         os.chdir(temp_repo)
 

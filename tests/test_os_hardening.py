@@ -17,8 +17,10 @@ def test_scoped_state_paths_are_per_repo(temp_repo: Path):
     rid = _repo_id(str(temp_repo))
     soft_score = _scoped_safety_score_file(temp_repo, hardened=False)
     soft_log = _scoped_log_file(temp_repo, hardened=False)
-    assert rid in soft_score.name
-    assert rid in soft_log.name
+    assert soft_score.parent.name == rid
+    assert soft_log.parent.name == rid
+    assert soft_score.name == "safety_score.json"
+    assert soft_log.name == "guardian.log"
     other = temp_repo.parent / "other"
     assert soft_score != _scoped_safety_score_file(other, hardened=False)
 
