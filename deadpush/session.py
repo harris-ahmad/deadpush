@@ -13,6 +13,7 @@ import json
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+import threading
 from typing import Any
 
 
@@ -38,55 +39,62 @@ class SessionManager:
 
     def __init__(self):
         SESSION_DIR.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # Session lifecycle
     # ------------------------------------------------------------------
     def start_session(self, label: str = "") -> VibeSession:
         """Start a new vibe session. Returns the session object."""
-        now = datetime.now()
-        session_id = now.strftime("%Y%m%d_%H%M%S")
+        with self._lock:
+            now = datetime.now()
+            session_id = now.strftime("%Y%m%d_%H%M%S")
 
-        session = VibeSession(
-            id=session_id,
-            label=label or f"Vibe session {session_id}",
-            start_time=now.isoformat(),
-        )
+            session = VibeSession(
+                id=session_id,
+                label=label or f"Vibe session {session_id}",
+                start_time=now.isoformat(),
+            )
 
-        ACTIVE_SESSION_FILE.write_text(
-            json.dumps(self._session_to_dict(session), indent=2, default=str),
-            encoding="utf-8",
-        )
-        return session
+            ACTIVE_SESSION_FILE.write_text(
+                json.dumps(self._session_to_dict(session), indent=2, default=str),
+                encoding="utf-8",
+            )
+            return session
 
     def end_session(self, safety_score: int | None = None) -> VibeSession | None:
         """End the active session. Returns the completed session or None."""
-        active = self.get_active_session()
-        if active is None:
-            return None
+        with self._lock:
+            active = self._get_active_session_unlocked()
+            if active is None:
+                return None
 
-        now = datetime.now()
-        active.end_time = now.isoformat()
-        active.safety_score_end = safety_score or active.safety_score_start
+            now = datetime.now()
+            active.end_time = now.isoformat()
+            active.safety_score_end = safety_score or active.safety_score_start
 
-        # Save to history
-        history_path = SESSION_DIR / f"{active.id}.json"
-        history_path.write_text(
-            json.dumps(self._session_to_dict(active), indent=2, default=str),
-            encoding="utf-8",
-        )
+            # Save to history
+            history_path = SESSION_DIR / f"{active.id}.json"
+            history_path.write_text(
+                json.dumps(self._session_to_dict(active), indent=2, default=str),
+                encoding="utf-8",
+            )
 
-        # Clear active
-        if ACTIVE_SESSION_FILE.exists():
-            ACTIVE_SESSION_FILE.unlink(missing_ok=True)
+            # Clear active
+            if ACTIVE_SESSION_FILE.exists():
+                ACTIVE_SESSION_FILE.unlink(missing_ok=True)
 
-        # Clean up old sessions (keep last 50)
-        self._cleanup_old_sessions()
+            # Clean up old sessions (keep last 50)
+            self._cleanup_old_sessions_unlocked()
 
-        return active
+            return active
 
     def get_active_session(self) -> VibeSession | None:
         """Get the currently active session, if any."""
+        with self._lock:
+            return self._get_active_session_unlocked()
+
+    def _get_active_session_unlocked(self) -> VibeSession | None:
         if not ACTIVE_SESSION_FILE.exists():
             return None
         try:
@@ -97,49 +105,53 @@ class SessionManager:
 
     def get_session_history(self, limit: int = 20) -> list[VibeSession]:
         """Get recent completed sessions."""
-        if not SESSION_DIR.exists():
-            return []
+        with self._lock:
+            if not SESSION_DIR.exists():
+                return []
 
-        sessions: list[VibeSession] = []
-        for f in sorted(SESSION_DIR.iterdir(), reverse=True):
-            if f.suffix == ".json":
-                try:
-                    data = json.loads(f.read_text(encoding="utf-8"))
-                    sessions.append(self._dict_to_session(data))
-                except Exception:
-                    pass
-                if len(sessions) >= limit:
-                    break
+            sessions: list[VibeSession] = []
+            for f in sorted(SESSION_DIR.iterdir(), reverse=True):
+                if f.suffix == ".json":
+                    try:
+                        data = json.loads(f.read_text(encoding="utf-8"))
+                        sessions.append(self._dict_to_session(data))
+                    except Exception:
+                        pass
+                    if len(sessions) >= limit:
+                        break
 
-        return sessions
+            return sessions
 
     # ------------------------------------------------------------------
     # Session tracking helpers (used by guardian)
     # ------------------------------------------------------------------
     def record_file_change(self, filepath: str):
         """Record a file change in the active session."""
-        active = self.get_active_session()
-        if active is None:
-            return
-        if filepath not in active.files_changed:
-            active.files_changed.append(filepath)
-        self._save_active(active)
+        with self._lock:
+            active = self._get_active_session_unlocked()
+            if active is None:
+                return
+            if filepath not in active.files_changed:
+                active.files_changed.append(filepath)
+            self._save_active_unlocked(active)
 
     def record_incident(self, incident: dict[str, Any]):
         """Record a guardian incident in the active session."""
-        active = self.get_active_session()
-        if active is None:
-            return
-        active.incidents.append(incident)
-        self._save_active(active)
+        with self._lock:
+            active = self._get_active_session_unlocked()
+            if active is None:
+                return
+            active.incidents.append(incident)
+            self._save_active_unlocked(active)
 
     def update_safety_score(self, score: int):
         """Update the running safety score for the session."""
-        active = self.get_active_session()
-        if active is None:
-            return
-        active.safety_score_end = score
-        self._save_active(active)
+        with self._lock:
+            active = self._get_active_session_unlocked()
+            if active is None:
+                return
+            active.safety_score_end = score
+            self._save_active_unlocked(active)
 
     def get_session_summary(self, session: VibeSession) -> str:
         """Generate a human-readable summary of a session."""
@@ -199,12 +211,20 @@ class SessionManager:
         )
 
     def _save_active(self, session: VibeSession):
+        with self._lock:
+            self._save_active_unlocked(session)
+
+    def _save_active_unlocked(self, session: VibeSession):
         ACTIVE_SESSION_FILE.write_text(
             json.dumps(self._session_to_dict(session), indent=2, default=str),
             encoding="utf-8",
         )
 
     def _cleanup_old_sessions(self, keep: int = 50):
+        with self._lock:
+            self._cleanup_old_sessions_unlocked(keep=keep)
+
+    def _cleanup_old_sessions_unlocked(self, keep: int = 50):
         if not SESSION_DIR.exists():
             return
         all_sessions = sorted(SESSION_DIR.iterdir(), reverse=True)

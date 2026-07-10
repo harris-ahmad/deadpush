@@ -12,13 +12,14 @@ Major improvements:
 from __future__ import annotations
 
 import atexit
-from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 import errno
 import fcntl
 import functools
 import hashlib
 import logging
 import os
+import queue
 import shutil
 import signal
 import sys
@@ -373,6 +374,7 @@ class QuarantineManager:
         self.quarantine_dir = base_dir / ".deadpush-quarantine"
         self.quarantine_dir.mkdir(parents=True, exist_ok=True)
         self.logger = logging.getLogger("deadpush.guardian")
+        self._lock = threading.Lock()
 
     def _unique_dest(self, basename: str, timestamp: str) -> Path:
         dest = self.quarantine_dir / f"{timestamp}_{basename}"
@@ -388,166 +390,174 @@ class QuarantineManager:
         )
 
     def quarantine(self, path: Path, reason: str) -> Path:
-        if not path.exists():
-            return path
+        with self._lock:
+            if not path.exists():
+                return path
 
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        dest = self._unique_dest(path.name, timestamp)
-        retry_errnos = {errno.EBUSY, errno.EACCES, errno.EPERM}
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            dest = self._unique_dest(path.name, timestamp)
+            retry_errnos = {errno.EBUSY, errno.EACCES, errno.EPERM}
 
-        for attempt in range(4):
-            try:
-                shutil.copy2(path, dest)
-                self._write_reason(dest, reason, path)
+            for attempt in range(4):
                 try:
-                    path.unlink()
-                except OSError as unlink_err:
-                    if unlink_err.errno in retry_errnos:
-                        time.sleep(0.05 * (attempt + 1))
-                        if not path.exists():
-                            return dest
-                        continue
+                    shutil.copy2(path, dest)
+                    self._write_reason(dest, reason, path)
                     try:
-                        path.write_text("", encoding="utf-8")
-                    except OSError:
-                        pass
-                return dest
-            except OSError as e:
-                if e.errno in retry_errnos and attempt < 3:
-                    time.sleep(0.05 * (attempt + 1))
-                    continue
-                break
+                        path.unlink()
+                    except OSError as unlink_err:
+                        if unlink_err.errno in retry_errnos:
+                            time.sleep(0.05 * (attempt + 1))
+                            if not path.exists():
+                                return dest
+                            continue
+                        try:
+                            path.write_text("", encoding="utf-8")
+                        except OSError:
+                            pass
+                    return dest
+                except OSError as e:
+                    if e.errno in retry_errnos and attempt < 3:
+                        time.sleep(0.05 * (attempt + 1))
+                        continue
+                    break
 
-        try:
-            path.rename(dest)
-            self._write_reason(dest, reason, path)
-            return dest
-        except Exception as e:
-            self.logger.error(f"Failed to quarantine {path}: {e}")
-            if dest.exists() and not path.exists():
+            try:
+                path.rename(dest)
+                self._write_reason(dest, reason, path)
                 return dest
-            return path
+            except Exception as e:
+                self.logger.error(f"Failed to quarantine {path}: {e}")
+                if dest.exists() and not path.exists():
+                    return dest
+                return path
 
     def list_quarantined(self):
         """Return list of dicts with info about quarantined files (newest first)."""
-        entries = []
-        if not self.quarantine_dir.exists():
+        with self._lock:
+            entries = []
+            if not self.quarantine_dir.exists():
+                return entries
+            for f in sorted(self.quarantine_dir.iterdir(), reverse=True):
+                if f.name.endswith(".reason"):
+                    continue
+                reason_path = self.quarantine_dir / (f.name + ".reason")
+                info = {
+                    "quarantined_file": f,
+                    "name": f.name,
+                    "size": f.stat().st_size if f.exists() else 0,
+                    "mtime": datetime.fromtimestamp(f.stat().st_mtime) if f.exists() else None,
+                }
+                if reason_path.exists():
+                    try:
+                        text = reason_path.read_text(errors="ignore")
+                        for line in text.splitlines():
+                            if line.startswith("Quarantined at "):
+                                info["quarantined_at"] = line.split("Quarantined at ", 1)[1]
+                            elif line.startswith("Reason: "):
+                                info["reason"] = line.split("Reason: ", 1)[1]
+                            elif line.startswith("Original path: "):
+                                info["original_path"] = line.split("Original path: ", 1)[1]
+                    except Exception:
+                        pass
+                entries.append(info)
             return entries
-        for f in sorted(self.quarantine_dir.iterdir(), reverse=True):
-            if f.name.endswith(".reason"):
-                continue
-            reason_path = self.quarantine_dir / (f.name + ".reason")
-            info = {
-                "quarantined_file": f,
-                "name": f.name,
-                "size": f.stat().st_size if f.exists() else 0,
-                "mtime": datetime.fromtimestamp(f.stat().st_mtime) if f.exists() else None,
-            }
-            if reason_path.exists():
-                try:
-                    text = reason_path.read_text(errors="ignore")
-                    for line in text.splitlines():
-                        if line.startswith("Quarantined at "):
-                            info["quarantined_at"] = line.split("Quarantined at ", 1)[1]
-                        elif line.startswith("Reason: "):
-                            info["reason"] = line.split("Reason: ", 1)[1]
-                        elif line.startswith("Original path: "):
-                            info["original_path"] = line.split("Original path: ", 1)[1]
-                except Exception:
-                    pass
-            entries.append(info)
-        return entries
 
     def restore(self, quarantined_name_or_path: str) -> Path | None:
         """Restore a quarantined file back to its original location if possible.
         Returns the restored path or None on failure.
         """
-        qpath = Path(quarantined_name_or_path)
-        if not qpath.is_absolute():
-            qpath = self.quarantine_dir / qpath.name
-        if not qpath.exists() or qpath.name.endswith(".reason"):
-            # try finding by name
-            candidates = list(self.quarantine_dir.glob(f"*{Path(quarantined_name_or_path).name}*"))
-            qpath = next((c for c in candidates if not c.name.endswith(".reason")), None)
-            if not qpath:
-                return None
-        reason_path = self.quarantine_dir / (qpath.name + ".reason")
-        original = None
-        if reason_path.exists():
-            for line in reason_path.read_text(errors="ignore").splitlines():
-                if line.startswith("Original path: "):
-                    original = Path(line.split("Original path: ", 1)[1].strip())
-                    break
-        if not original:
-            # fallback: strip timestamp_ prefix
-            name = qpath.name
-            if "_" in name and name.split("_", 1)[0].isdigit():
-                original = self.quarantine_dir.parent / name.split("_", 1)[1]
-            else:
-                original = self.quarantine_dir.parent / name
-        # Confine the restore destination to the repo tree. The "Original path"
-        # is read from an agent-writable .reason file, so without this a crafted
-        # .reason could make the guardian (running as _deadpush in hardened mode)
-        # move a file to an arbitrary absolute path — a confused-deputy write.
-        repo_root = self.quarantine_dir.parent
-        try:
-            resolved = original.resolve()
-            resolved.relative_to(repo_root.resolve())
-        except (ValueError, OSError, RuntimeError):
-            logging.getLogger("deadpush.guardian").warning(
-                f"Refusing to restore outside the repo: {original}")
-            return None
-        original = resolved
-        if original.exists():
-            logging.getLogger("deadpush.guardian").warning(f"Refusing to restore: original already exists at {original}")
-            return None
-        try:
-            original.parent.mkdir(parents=True, exist_ok=True)
-            qpath.rename(original)
+        with self._lock:
+            qpath = Path(quarantined_name_or_path)
+            if not qpath.is_absolute():
+                qpath = self.quarantine_dir / qpath.name
+            if not qpath.exists() or qpath.name.endswith(".reason"):
+                # try finding by name
+                candidates = list(self.quarantine_dir.glob(f"*{Path(quarantined_name_or_path).name}*"))
+                qpath = next((c for c in candidates if not c.name.endswith(".reason")), None)
+                if not qpath:
+                    return None
+            reason_path = self.quarantine_dir / (qpath.name + ".reason")
+            original = None
             if reason_path.exists():
-                reason_path.unlink()
-            logging.getLogger("deadpush.guardian").info(f"Restored {qpath.name} -> {original}")
-            return original
-        except Exception as e:
-            logging.getLogger("deadpush.guardian").error(f"Restore failed for {qpath}: {e}")
-            return None
+                try:
+                    for line in reason_path.read_text(errors="ignore").splitlines():
+                        if line.startswith("Original path: "):
+                            original = Path(line.split("Original path: ", 1)[1].strip())
+                            break
+                except Exception:
+                    pass
+
+            if not original:
+                # fallback: strip timestamp_ prefix
+                name = qpath.name
+                if "_" in name and name.split("_", 1)[0].isdigit():
+                    original = self.quarantine_dir.parent / name.split("_", 1)[1]
+                else:
+                    original = self.quarantine_dir.parent / name
+            # Confine the restore destination to the repo tree. The "Original path"
+            # is read from an agent-writable .reason file, so without this a crafted
+            # .reason could make the guardian (running as _deadpush in hardened mode)
+            # move a file to an arbitrary absolute path — a confused-deputy write.
+            repo_root = self.quarantine_dir.parent
+            try:
+                resolved = original.resolve()
+                resolved.relative_to(repo_root.resolve())
+            except (ValueError, OSError, RuntimeError):
+                logging.getLogger("deadpush.guardian").warning(
+                    f"Refusing to restore outside the repo: {original}")
+                return None
+            original = resolved
+            if original.exists():
+                logging.getLogger("deadpush.guardian").warning(f"Refusing to restore: original already exists at {original}")
+                return None
+            try:
+                original.parent.mkdir(parents=True, exist_ok=True)
+                qpath.rename(original)
+                if reason_path.exists():
+                    reason_path.unlink()
+                logging.getLogger("deadpush.guardian").info(f"Restored {qpath.name} -> {original}")
+                return original
+            except Exception as e:
+                logging.getLogger("deadpush.guardian").error(f"Restore failed for {qpath}: {e}")
+                return None
 
     def clear(self, older_than_days: int | None = None) -> int:
         """Delete quarantined files (and their .reason). Returns count deleted.
         If older_than_days, only those older than N days.
         """
-        count = 0
-        if not self.quarantine_dir.exists():
-            return 0
-        now = datetime.now()
-        for f in list(self.quarantine_dir.iterdir()):
-            if f.name.endswith(".reason"):
-                # will be handled with main file or orphaned cleanup
-                try:
-                    if older_than_days is None:
-                        f.unlink()
-                    else:
-                        mtime = datetime.fromtimestamp(f.stat().st_mtime)
-                        if (now - mtime).days >= older_than_days:
+        with self._lock:
+            count = 0
+            if not self.quarantine_dir.exists():
+                return 0
+            now = datetime.now()
+            for f in list(self.quarantine_dir.iterdir()):
+                if f.name.endswith(".reason"):
+                    # will be handled with main file or orphaned cleanup
+                    try:
+                        if older_than_days is None:
                             f.unlink()
-                            count += 1
-                    continue
-                except Exception:
-                    continue
-            # main file
-            try:
-                if older_than_days is not None:
-                    mtime = datetime.fromtimestamp(f.stat().st_mtime)
-                    if (now - mtime).days < older_than_days:
+                        else:
+                            mtime = datetime.fromtimestamp(f.stat().st_mtime)
+                            if (now - mtime).days >= older_than_days:
+                                f.unlink()
+                                count += 1
                         continue
-                f.unlink()
-                count += 1
-                rp = self.quarantine_dir / (f.name + ".reason")
-                if rp.exists():
-                    rp.unlink()
-            except Exception as e:
-                logging.getLogger("deadpush.guardian").error(f"Failed clearing {f}: {e}")
-        return count
+                    except Exception:
+                        continue
+                # main file
+                try:
+                    if older_than_days is not None:
+                        mtime = datetime.fromtimestamp(f.stat().st_mtime)
+                        if (now - mtime).days < older_than_days:
+                            continue
+                    f.unlink()
+                    count += 1
+                    rp = self.quarantine_dir / (f.name + ".reason")
+                    if rp.exists():
+                        rp.unlink()
+                except Exception as e:
+                    logging.getLogger("deadpush.guardian").error(f"Failed clearing {f}: {e}")
+            return count
 
 
 # =============================================================================
@@ -572,10 +582,29 @@ class SessionSafetyScore:
         self.session_start = datetime.now()
         self.recent_paths: list[str] = []  # last ~10 distinct-ish paths touched
         self.hardened = hardened
+        self._lock = threading.Lock()
 
     def _score_path(self) -> Path:
         """Path to the per-repo safety score JSON file."""
         return _scoped_safety_score_file(self.repo_root, self.hardened)
+
+    def _save_score_locked(self, *, clean_shutdown: bool) -> None:
+        path = self._score_path()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            import json
+            data = {
+                "score": self.score,
+                "event_count": self.events_count,
+                "guardian_pid": os.getpid(),
+                "last_updated": datetime.now().isoformat(),
+                "clean_shutdown": clean_shutdown,
+            }
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            tmp.replace(path)
+        except Exception:
+            pass
 
     def mark_clean_shutdown(self):
         """Mark clean shutdown so restart doesn't apply penalty.
@@ -583,112 +612,134 @@ class SessionSafetyScore:
         Saves score with clean_shutdown=True. On next load, the penalty for
         PID mismatch is skipped.
         """
-        path = self._score_path()
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            import json
-            data = {
-                "score": self.score,
-                "event_count": self.events_count,
-                "guardian_pid": os.getpid(),
-                "last_updated": datetime.now().isoformat(),
-                "clean_shutdown": True,
-            }
-            tmp = path.with_suffix(".tmp")
-            tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
-            tmp.replace(path)
-        except Exception:
-            pass
+        with self._lock:
+            self._save_score_locked(clean_shutdown=True)
 
     def save_score(self):
         """Persist current score to JSON file for MCP server to read."""
-        path = self._score_path()
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            import json
-            data = {
-                "score": self.score,
-                "event_count": self.events_count,
-                "guardian_pid": os.getpid(),
-                "last_updated": datetime.now().isoformat(),
-                "clean_shutdown": False,
-            }
-            tmp = path.with_suffix(".tmp")
-            tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
-            tmp.replace(path)
-        except Exception:
-            pass
+        with self._lock:
+            self._save_score_locked(clean_shutdown=False)
 
     def load_score(self):
         """Load score from JSON file on startup."""
-        path = self._score_path()
-        if not path.exists():
-            return
-        try:
-            import json
-            data = json.loads(path.read_text(encoding="utf-8"))
-            self.score = data.get("score", 100)
-            self.events_count = data.get("event_count", 0)
-        except Exception:
-            pass
+        with self._lock:
+            path = self._score_path()
+            if not path.exists():
+                return
+            try:
+                import json
+                data = json.loads(path.read_text(encoding="utf-8"))
+                self.score = data.get("score", 100)
+                self.events_count = data.get("event_count", 0)
+            except Exception:
+                pass
 
     def report_incident(self, severity: int, reason: str, filepath: str = ""):
-        now = datetime.now()
-        self.score = max(0, self.score - severity)
-        self.events_count += 1
-        if filepath:
-            # keep recent unique-ish
-            if filepath not in self.recent_paths:
-                self.recent_paths = (self.recent_paths + [filepath])[-10:]
+        with self._lock:
+            now = datetime.now()
+            self.score = max(0, self.score - severity)
+            self.events_count += 1
+            if filepath:
+                # keep recent unique-ish
+                if filepath not in self.recent_paths:
+                    self.recent_paths = (self.recent_paths + [filepath])[-10:]
 
-        self.incidents.append({
-            "time": now,
-            "severity": severity,
-            "reason": reason,
-            "file": filepath
-        })
+            self.incidents.append({
+                "time": now,
+                "severity": severity,
+                "reason": reason,
+                "file": filepath
+            })
 
-        # Decay old incidents for recent activity calculation
-        self.incidents = [inc for inc in self.incidents if (now - inc["time"]).total_seconds() < self.recent_window]
+            # Decay old incidents for recent activity calculation
+            self.incidents = [
+                inc for inc in self.incidents
+                if (now - inc["time"]).total_seconds() < self.recent_window
+            ]
 
-        # Bonus penalty for high recent activity (multi-agent bursts from parallel Claude/Cursor etc)
-        recent_count = len(self.incidents)
-        if recent_count > 3:
-            extra_penalty = min(5 * (recent_count - 3), 20)
-            self.score = max(0, self.score - extra_penalty)
-        if recent_count >= 6:
-            # Very bursty - many agents firing at once
-            self.score = max(0, self.score - 5)
+            # Bonus penalty for high recent activity (multi-agent bursts from parallel Claude/Cursor etc)
+            recent_count = len(self.incidents)
+            if recent_count > 3:
+                extra_penalty = min(5 * (recent_count - 3), 20)
+                self.score = max(0, self.score - extra_penalty)
+            if recent_count >= 6:
+                # Very bursty - many agents firing at once
+                self.score = max(0, self.score - 5)
 
-        self.save_score()
-        return self.score
+            self._save_score_locked(clean_shutdown=False)
+            return self.score
 
     def get_status(self) -> str:
-        if self.score >= 90:
-            return "🟢 Excellent"
-        if self.score >= 70:
-            return "🟡 Good"
-        if self.score >= 50:
-            return "🟠 Caution"
-        return "🔴 At Risk"
+        with self._lock:
+            if self.score >= 90:
+                return "🟢 Excellent"
+            if self.score >= 70:
+                return "🟡 Good"
+            if self.score >= 50:
+                return "🟠 Caution"
+            return "🔴 At Risk"
+
+    def recent_incident_count(self) -> int:
+        with self._lock:
+            now = datetime.now()
+            return len(
+                [inc for inc in self.incidents if (now - inc["time"]).total_seconds() < self.recent_window]
+            )
+
+    def incident_count(self) -> int:
+        with self._lock:
+            return len(self.incidents)
+
+    def get_score(self) -> int:
+        with self._lock:
+            return self.score
+
+    def get_recent_incidents(self, limit: int = 10) -> list[dict[str, Any]]:
+        with self._lock:
+            return list(self.incidents[-limit:])
 
     def get_activity_level(self) -> str:
         """Simple heuristic for 'how busy are the agents right now?'"""
-        recent = len([inc for inc in self.incidents if (datetime.now() - inc["time"]).total_seconds() < self.recent_window])
-        if recent >= 8:
-            return "🔥 High (multiple agents in parallel?)"
-        if recent >= 4:
-            return "⚡ Elevated burst"
-        return "Normal"
+        with self._lock:
+            recent = len(
+                [
+                    inc for inc in self.incidents
+                    if (datetime.now() - inc["time"]).total_seconds() < self.recent_window
+                ]
+            )
+            if recent >= 8:
+                return "🔥 High (multiple agents in parallel?)"
+            if recent >= 4:
+                return "⚡ Elevated burst"
+            return "Normal"
 
     def get_session_summary(self) -> str:
-        dur_min = (datetime.now() - self.session_start).total_seconds() / 60.0
-        recent_files = len(set(self.recent_paths))
-        return f"Session: {dur_min:.1f}min | Total events: {self.events_count} | Recent files: {recent_files}"
+        with self._lock:
+            dur_min = (datetime.now() - self.session_start).total_seconds() / 60.0
+            recent_files = len(set(self.recent_paths))
+            return f"Session: {dur_min:.1f}min | Total events: {self.events_count} | Recent files: {recent_files}"
 
     def get_summary(self) -> str:
-        recent = len([inc for inc in self.incidents if (datetime.now() - inc["time"]).total_seconds() < self.recent_window])
-        return f"Score: {self.score}/100 | Status: {self.get_status()} | Recent incidents (last 60s): {recent} | Activity: {self.get_activity_level()}"
+        with self._lock:
+            recent = len(
+                [inc for inc in self.incidents if (datetime.now() - inc["time"]).total_seconds() < self.recent_window]
+            )
+            if self.score >= 90:
+                status = "🟢 Excellent"
+            elif self.score >= 70:
+                status = "🟡 Good"
+            elif self.score >= 50:
+                status = "🟠 Caution"
+            else:
+                status = "🔴 At Risk"
+            if recent >= 8:
+                activity = "🔥 High (multiple agents in parallel?)"
+            elif recent >= 4:
+                activity = "⚡ Elevated burst"
+            else:
+                activity = "Normal"
+            return f"Score: {self.score}/100 | Status: {status} | Recent incidents (last 60s): {recent} | Activity: {activity}"
+
 
 
 # =============================================================================
@@ -1102,7 +1153,7 @@ class GuardianControlHandler(BaseHTTPRequestHandler):
                     "safety_score": score.get_summary(),
                     "activity_level": score.get_activity_level(),
                     "session_summary": score.get_session_summary(),
-                    "recent_incidents_count": len([i for i in score.incidents if (datetime.now() - i["time"]).total_seconds() < score.recent_window]),
+                    "recent_incidents_count": score.recent_incident_count(),
                     "quarantine_count": len(handler.quarantine.list_quarantined()),
                     "intervention_enabled": handler.intervention,
                     "strict_mode": handler.strict_mode,
@@ -1113,7 +1164,7 @@ class GuardianControlHandler(BaseHTTPRequestHandler):
                 self._send_json({"safety_score": handler.safety_score.get_summary(), "details": handler.safety_score.get_session_summary()})
             elif path == "/recent-incidents":
                 limit = int(qs.get("limit", [10])[0])
-                recent = handler.safety_score.incidents[-limit:]
+                recent = handler.safety_score.get_recent_incidents(limit)
                 self._send_json({"incidents": recent})
             elif path == "/quarantine-list":
                 limit = int(qs.get("limit", [20])[0])
@@ -1363,7 +1414,16 @@ class GuardianHandler(FileSystemEventHandler or object):
 
         # Dynamic rate limiting (based on safety score)
         self.last_intervention_ts = 0.0
-        self._pending_events: deque[tuple[Path, str]] = deque()
+        self._executor = ThreadPoolExecutor(
+            max_workers=min(32, (os.cpu_count() or 4) * 4),
+            thread_name_prefix="deadpush-worker",
+        )
+        try:
+            self._work_queue: "queue.Queue[tuple[Path, str]]" = self._executor._work_queue
+        except AttributeError:
+            self._work_queue = queue.Queue()
+        self._path_lock = threading.Lock()
+        self._last_path_ts: dict[str, float] = {}
         self._last_hook_repair_ts = 0.0
         self._last_hook_problems_key = ""
 
@@ -1463,7 +1523,7 @@ class GuardianHandler(FileSystemEventHandler or object):
 
         Lower score = shorter cooldown = more vigilant checking.
         """
-        score = self.safety_score.score
+        score = self.safety_score.get_score()
         if score >= 80:
             return 1.0
         elif score >= 50:
@@ -1476,12 +1536,12 @@ class GuardianHandler(FileSystemEventHandler or object):
     def on_created(self, event):
         if event.is_directory:
             return
-        self._evaluate(Path(event.src_path), event_type="created")
+        self._enqueue(Path(event.src_path), event_type="created")
 
     def on_modified(self, event):
         if event.is_directory:
             return
-        self._evaluate(Path(event.src_path), event_type="modified")
+        self._enqueue(Path(event.src_path), event_type="modified")
 
     def on_moved(self, event):
         # A rename/move can drop UN-SCANNED content into the repo: e.g. stage a
@@ -1493,7 +1553,7 @@ class GuardianHandler(FileSystemEventHandler or object):
         dest = getattr(event, "dest_path", None)
         if not dest:
             return
-        self._evaluate(Path(dest), event_type="moved")
+        self._enqueue(Path(dest), event_type="moved")
 
     def on_deleted(self, event):
         # A deleted file's bytes are already gone (nothing to quarantine), and
@@ -1781,7 +1841,7 @@ class GuardianHandler(FileSystemEventHandler or object):
         """Emit INSTRUCTION when agents trigger repeated violations in a short window."""
         if self.gpc is None:
             return
-        recent = len(self.safety_score.incidents)
+        recent = self.safety_score.recent_incident_count()
         if recent < 3:
             return
         try:
@@ -1789,7 +1849,7 @@ class GuardianHandler(FileSystemEventHandler or object):
                 "Repeated guardrail violations detected. Stop weakening protections; "
                 "review feedback and restore quarantined files before continuing.",
                 recent_incidents=recent,
-                score=self.safety_score.score,
+                score=self.safety_score.get_score(),
             )
         except Exception:
             pass
@@ -1801,10 +1861,10 @@ class GuardianHandler(FileSystemEventHandler or object):
             suspend_file.parent.mkdir(parents=True, exist_ok=True)
             suspend_file.write_text(reason, encoding="utf-8")
             self.logger.warning(f"MCP suspended: {reason}")
-            self._record_audit("session.pause", {"reason": reason, "score": self.safety_score.score})
+            self._record_audit("session.pause", {"reason": reason, "score": self.safety_score.get_score()})
             if self.gpc is not None:
                 try:
-                    self.gpc.emit_session_pause(reason, score=self.safety_score.score)
+                    self.gpc.emit_session_pause(reason, score=self.safety_score.get_score())
                 except Exception:
                     pass
         except Exception as e:
@@ -1819,21 +1879,21 @@ class GuardianHandler(FileSystemEventHandler or object):
                 self.logger.info("MCP unsuspended")
                 self._gpc_policy_update(
                     "MCP access restored",
-                    score=self.safety_score.score,
+                    score=self.safety_score.get_score(),
                 )
         except Exception as e:
             self.logger.error(f"Failed to remove MCP suspension file: {e}")
 
     def _check_suspension(self):
         """Periodic check: suspend MCP if score <= 5, unsuspend if recovered."""
-        if self.safety_score.score <= 5:
+        if self.safety_score.get_score() <= 5:
             suspend_file = _scoped_suspend_file(self.config.repo_root, self.hardened)
             if not suspend_file.exists():
                 self._suspend_mcp(
-                    f"Safety score dropped to {self.safety_score.score}/100. "
+                    f"Safety score dropped to {self.safety_score.get_score()}/100. "
                     "Agent weakened guardrails repeatedly."
                 )
-        elif self.safety_score.score > 10:
+        elif self.safety_score.get_score() > 10:
             self._unsuspend_mcp()
 
     # ------------------------------------------------------------------
@@ -1916,43 +1976,74 @@ class GuardianHandler(FileSystemEventHandler or object):
     # ------------------------------------------------------------------
     # Main evaluation pipeline (called on every file create/modify)
     # ------------------------------------------------------------------
-    def _evaluate(self, path: Path, event_type: str):
+    STABILITY_SECONDS = 0.25
+
+    def _enqueue(self, path: Path, event_type: str):
         try:
             if not path.exists():
                 return
-            # Skip internal dirs
             skip_names = {"__pycache__", ".git", "node_modules", ".deadpush",
                           ".deadpush-quarantine", ".deadpush-archive",
                           ".deadpush-config-backups"}
             if any(part in skip_names for part in path.parts):
                 return
-
-            # Dynamic rate limiting: queue events during cooldown, drain when ready
-            now = time.time()
-            cooldown = self._get_cooldown()
-            if now - self.last_intervention_ts < cooldown:
-                self._pending_events.append((path, event_type))
+            try:
+                rel = path.relative_to(self.config.repo_root).as_posix()
+            except ValueError:
                 return
 
-            # Drain queued events first (from previous bursts)
-            self._drain_pending()
+            now = time.time()
+            with self._path_lock:
+                last = self._last_path_ts.get(rel)
+                if last is not None and now - last < self._get_cooldown():
+                    return
+                self._last_path_ts[rel] = now
+                if len(self._last_path_ts) > 5000:
+                    self._last_path_ts = {
+                        k: v for k, v in self._last_path_ts.items()
+                        if now - v < 5.0
+                    }
 
-            # Process the current event
-            self._process_event(path, event_type)
+            try:
+                queue_size = self._work_queue.qsize()
+            except Exception:
+                queue_size = 0
+            if queue_size >= 2000:
+                return
+            self._executor.submit(self._worker_run, path, event_type)
 
         except Exception as e:
-            self.logger.debug(f"Evaluation error on {path}: {e}")
+            self.logger.debug(f"Enqueue error on {path}: {e}")
 
-    def _drain_pending(self):
-        """Process all events queued during cooldown."""
-        while self._pending_events:
-            p, et = self._pending_events.popleft()
-            if p.exists():
-                try:
-                    self._process_event(p, et)
-                except Exception as e:
-                    self.logger.debug(f"Pending event error on {p}: {e}")
-                time.sleep(0.01)  # Brief yield between batch items
+    def _worker_run(self, path: Path, event_type: str):
+        try:
+            if self._is_stable(path):
+                self._process_event(path, event_type)
+        except Exception as e:
+            self.logger.debug(f"Worker error on {path}: {e}")
+
+    def _is_stable(self, path: Path, timeout: float = 1.0) -> bool:
+        """Return True when size+mtime stay unchanged for STABILITY_SECONDS."""
+        deadline = time.time() + timeout
+        prev: tuple[tuple[int, int], float] | None = None
+        while time.time() < deadline:
+            try:
+                st = path.stat()
+                key = (st.st_size, st.st_mtime_ns)
+            except OSError:
+                return False
+            now = time.time()
+            if prev is not None and key == prev[0] and (now - prev[1]) >= self.STABILITY_SECONDS:
+                return True
+            prev = (key, now)
+            time.sleep(0.05)
+        return prev is not None
+
+    def _shutdown_workers(self) -> None:
+        try:
+            self._executor.shutdown(wait=True)
+        except Exception as e:
+            self.logger.debug(f"Worker shutdown skipped: {e}")
 
     @staticmethod
     def _looks_transient(name: str) -> bool:
@@ -2012,7 +2103,7 @@ class GuardianHandler(FileSystemEventHandler or object):
             return
 
         # Lockdown: at score 0, quarantine every write (no pass-through)
-        if self.intervention and self.safety_score.score <= 0 and path.exists():
+        if self.intervention and self.safety_score.get_score() <= 0 and path.exists():
             from .intercept import GuardrailResult, Violation, _write_feedback, FEEDBACK_DIR
 
             result = GuardrailResult()
@@ -2034,14 +2125,14 @@ class GuardianHandler(FileSystemEventHandler or object):
                     self.gpc.emit_lockdown(
                         "Guardian lockdown active (safety score 0): all writes quarantined",
                         file=rel,
-                        score=self.safety_score.score,
+                        score=self.safety_score.get_score(),
                     )
                 except Exception:
                     pass
             self._record_audit("guardrail.lockdown", {
                 "file": rel,
                 "description": "Guardian lockdown active (safety score 0)",
-                "score": self.safety_score.score,
+                "score": self.safety_score.get_score(),
             })
             return
 
@@ -2073,7 +2164,7 @@ class GuardianHandler(FileSystemEventHandler or object):
             self.logger.warning(
                 f"WARN [{event_type.upper()}] {rel} | "
                 f"{len(result.violations)} warn-level violation(s) | "
-                f"Safety: {self.safety_score.score}/100"
+                f"Safety: {self.safety_score.get_score()}/100"
             )
             try:
                 _write_feedback(self.config.repo_root / FEEDBACK_DIR, rel, result)
@@ -2104,7 +2195,7 @@ class GuardianHandler(FileSystemEventHandler or object):
         # === STEP 5: Record in session ===
         try:
             self.session_mgr.record_file_change(rel)
-            self.session_mgr.update_safety_score(self.safety_score.score)
+            self.session_mgr.update_safety_score(self.safety_score.get_score())
         except Exception:
             pass
 
@@ -2921,6 +3012,10 @@ def _run_observer(handler: GuardianHandler, logger, daemon_mgr: DaemonManager | 
             handler._stop_shadow()
         except Exception:
             pass
+        try:
+            handler._shutdown_workers()
+        except Exception:
+            pass
         if daemon_mgr is not None:
             try:
                 daemon_mgr.cleanup()
@@ -2975,6 +3070,10 @@ def _run_observer(handler: GuardianHandler, logger, daemon_mgr: DaemonManager | 
             handler._stop_shadow()
         except Exception:
             pass
+        try:
+            handler._shutdown_workers()
+        except Exception:
+            pass
         if observer:
             try:
                 observer.stop()
@@ -2998,8 +3097,9 @@ def _run_observer(handler: GuardianHandler, logger, daemon_mgr: DaemonManager | 
         try:
             if handler and hasattr(handler, "safety_score"):
                 summary = handler.safety_score.get_summary()
-                logger.info(f"SESSION SUMMARY: {summary} | Total incidents this session: {len(handler.safety_score.incidents)}")
-                print(f"\n[Guardian Session Summary]\n{summary}\nIncidents logged: {len(handler.safety_score.incidents)}")
+                incidents = handler.safety_score.incident_count()
+                logger.info(f"SESSION SUMMARY: {summary} | Total incidents this session: {incidents}")
+                print(f"\n[Guardian Session Summary]\n{summary}\nIncidents logged: {incidents}")
                 print("Review full activity in ~/.deadpush/guardian.log")
         except Exception:
             pass
