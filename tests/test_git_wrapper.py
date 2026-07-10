@@ -22,9 +22,9 @@ def test_git_wrapper_version(temp_repo: Path, monkeypatch):
 
 
 def test_git_wrapper_blocks_bad_commit(temp_repo: Path, monkeypatch):
-    bad = temp_repo / "bad.py"
-    bad.write_text("eval('x')\n")
-    subprocess.run(["git", "add", "bad.py"], cwd=temp_repo, capture_output=True)
+    bad = temp_repo / "CLAUDE.md"
+    bad.write_text("# bad\n")
+    subprocess.run(["git", "add", "CLAUDE.md"], cwd=temp_repo, capture_output=True)
     monkeypatch.setenv("DEADPUSH_REPO_ROOT", str(temp_repo))
     monkeypatch.chdir(temp_repo)
     code = main(["commit", "-m", "bad"])

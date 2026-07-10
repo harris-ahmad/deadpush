@@ -27,14 +27,13 @@ class TestSafeGitSource:
         assert guardian._safe_git_source("hello.py") == "x = 1\n"
 
     def test_refuses_head_that_violates_guardrails(self, guardian: GuardianHandler, temp_repo: Path):
-        bad = "import subprocess\nsubprocess.run('ls', shell=True)\n"
-        (temp_repo / "debug.py").write_text(bad)
-        subprocess.run(["git", "add", "debug.py"], capture_output=True, cwd=temp_repo)
+        (temp_repo / "CLAUDE.md").write_text("# bad instructions\n")
+        subprocess.run(["git", "add", "CLAUDE.md"], capture_output=True, cwd=temp_repo)
         subprocess.run(
             ["git", "-c", "core.hooksPath=/dev/null", "commit", "-m", "bad head"],
             capture_output=True, cwd=temp_repo,
         )
-        assert guardian._safe_git_source("debug.py") is None
+        assert guardian._safe_git_source("CLAUDE.md") is None
 
     def test_missing_file_returns_none(self, guardian: GuardianHandler):
         assert guardian._safe_git_source("nonexistent.py") is None
@@ -70,20 +69,19 @@ class TestQuarantineAndRestore:
     def test_no_restore_when_head_also_bad(self, guardian: GuardianHandler, temp_repo: Path):
         from deadpush.intercept import GuardrailResult, Violation
 
-        bad = "import subprocess\nsubprocess.run('ls', shell=True)\n"
-        (temp_repo / "debug.py").write_text(bad)
-        subprocess.run(["git", "add", "debug.py"], capture_output=True, cwd=temp_repo)
+        (temp_repo / "CLAUDE.md").write_text("# bad instructions\n")
+        subprocess.run(["git", "add", "CLAUDE.md"], capture_output=True, cwd=temp_repo)
         subprocess.run(
             ["git", "-c", "core.hooksPath=/dev/null", "commit", "-m", "bad"],
             capture_output=True, cwd=temp_repo,
         )
-        (temp_repo / "debug.py").write_text("eval('worse')\n")
+        (temp_repo / "CLAUDE.md").write_text("# worse instructions\n")
 
         result = GuardrailResult()
-        result.reject(Violation("security", "eval", 1, "high"))
-        guardian._quarantine_and_restore(temp_repo / "debug.py", "debug.py", result)
+        result.reject(Violation("blocked_file", "CLAUDE.md is blocked", 0, "critical"))
+        guardian._quarantine_and_restore(temp_repo / "CLAUDE.md", "CLAUDE.md", result)
 
-        assert not (temp_repo / "debug.py").exists()
+        assert not (temp_repo / "CLAUDE.md").exists()
 
 
 class TestBlockingDebrisIntervention:

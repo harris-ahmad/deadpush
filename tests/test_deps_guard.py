@@ -16,9 +16,6 @@ from deadpush.deps_guard import (
     get_ecosystem,
     parse_deps,
 )
-from deadpush.intercept import _check_dependency_integrity, Violation
-from deadpush.rules import RuntimeConfig
-
 
 # ======================================================================
 # Levenshtein
@@ -302,44 +299,4 @@ class TestCheckDeps:
         assert len(vs) >= 1
 
 
-# ======================================================================
-# Integration with intercept guardrails
-# ======================================================================
 
-class TestCheckDependencyIntegrity:
-    def test_no_violations(self, temp_dir):
-        f = temp_dir / "requirements.txt"
-        f.write_text("requests==2.28.0\n")
-        vs = _check_dependency_integrity("requests==2.28.0\n", "requirements.txt", temp_dir)
-        assert vs == []
-
-    def test_typosquat_violation(self, temp_dir):
-        f = temp_dir / "requirements.txt"
-        f.write_text("")
-        vs = _check_dependency_integrity("requets==2.28.0\n", "requirements.txt", temp_dir)
-        assert len(vs) >= 1
-        assert vs[0].category == "dependency"
-
-    def test_off_level_skips(self, temp_dir):
-        runtime = RuntimeConfig(temp_dir)
-        runtime.set_guardrail_level("dependency", "off")
-        vs = _check_dependency_integrity("ssss==1.0\n", "requirements.txt", temp_dir, runtime)
-        assert vs == []
-
-    def test_allowed_pattern_bypasses(self, temp_dir):
-        runtime = RuntimeConfig(temp_dir)
-        runtime.add_allowed_pattern("requets")
-        vs = _check_dependency_integrity("requets==2.28.0\n", "requirements.txt", temp_dir, runtime)
-        assert vs == []
-
-    def test_non_dep_file_no_violations(self, temp_dir):
-        vs = _check_dependency_integrity("print('hello')\n", "hello.py", temp_dir)
-        assert vs == []
-
-    def test_new_file_no_old_source(self, temp_dir):
-        vs = _check_dependency_integrity("requets==2.28.0\n", "requirements.txt", temp_dir)
-        assert len(vs) >= 1
-
-    def test_returns_violation_objects(self, temp_dir):
-        vs = _check_dependency_integrity("requets==2.28.0\n", "requirements.txt", temp_dir)
-        assert all(isinstance(v, Violation) for v in vs)

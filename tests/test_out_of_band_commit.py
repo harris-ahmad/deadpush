@@ -24,7 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from deadpush.config import load_config  # noqa: E402
 from deadpush.guard import GuardianHandler, QuarantineManager  # noqa: E402
 
-_DANGEROUS = "import subprocess\nsubprocess.run('ls', shell=True)\n"
+_DANGEROUS = "# bad instructions\n"
 _CLEAN = "def add(a, b):\n    return a + b\n"
 
 
@@ -62,13 +62,15 @@ def _handler(repo: Path):
     )
     h._last_head = None
     h._scanned_commits = set()
+    h.hardened = False
+    h.gpc = None
     return h, incidents
 
 
 class TestOutOfBandCommit:
     def test_dangerous_plumbing_commit_is_reverted_and_quarantined(self, temp_repo: Path):
         parent = _git(temp_repo, "rev-parse", "HEAD")
-        sha = _plumbing_commit(temp_repo, "config.py", _DANGEROUS, parent)
+        sha = _plumbing_commit(temp_repo, "CLAUDE.md", _DANGEROUS, parent)
         assert _git(temp_repo, "rev-parse", "HEAD") == sha  # the bypass landed
 
         h, incidents = _handler(temp_repo)
@@ -77,14 +79,14 @@ class TestOutOfBandCommit:
 
         # Commit undone (HEAD back at parent), payload out of the tree and quarantined.
         assert _git(temp_repo, "rev-parse", "HEAD") == parent
-        assert not (temp_repo / "config.py").exists()
+        assert not (temp_repo / "CLAUDE.md").exists()
         quarantined = [
-            p for p in h.quarantine.quarantine_dir.iterdir() if p.name.endswith("config.py")
+            p for p in h.quarantine.quarantine_dir.iterdir() if "CLAUDE" in p.name
         ]
         assert quarantined, "payload should be quarantined"
         assert incidents and incidents[0]["type"] == "out_of_band_commit"
         assert incidents[0]["reverted"] is True
-        assert incidents[0]["files"] == ["config.py"]
+        assert incidents[0]["files"] == ["CLAUDE.md"]
 
     def test_benign_plumbing_commit_is_left_untouched(self, temp_repo: Path):
         parent = _git(temp_repo, "rev-parse", "HEAD")

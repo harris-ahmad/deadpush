@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import difflib
 import json
-import re
 import shutil
 import subprocess
 from datetime import datetime
@@ -26,33 +25,7 @@ QUARANTINE_DIR = ".deadpush-quarantine"
 GUARDRAIL_DIR = ".deadpush"
 LEARNED_PATTERNS_FILE = ".deadpush/learned_patterns.json"
 
-# ---------------------------------------------------------------------------
-# Test/mock context detection
-# ---------------------------------------------------------------------------
-
-_TEST_FILE_INDICATORS = [
-    "test", "spec", "mock", "fixture", "stub", "fake", "conftest",
-    "factory", "helper", "assertion", "matcher",
-]
-
-_TEST_DIR_INDICATORS = [
-    "/test/", "/tests/", "/spec/", "/specs/", "/__tests__/",
-    "/mocks/", "/fixtures/", "/testing/",
-]
-
 _LEARNED_PATTERNS: dict[str, list[dict[str, Any]]] | None = None
-
-
-def _is_test_or_mock(rel_path: str) -> bool:
-    lower = rel_path.lower()
-    for indicator in _TEST_DIR_INDICATORS:
-        if indicator in lower:
-            return True
-    stem = Path(lower).stem
-    for indicator in _TEST_FILE_INDICATORS:
-        if stem.startswith(indicator) or stem.endswith(indicator):
-            return True
-    return False
 
 
 def _load_learned_patterns(repo_root: Path) -> dict[str, list[dict[str, Any]]]:
@@ -81,19 +54,7 @@ def _save_learned_patterns(repo_root: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(_LEARNED_PATTERNS, indent=2), encoding="utf-8")
     except OSError:
-        # In hardened mode the policy dir is root-owned; a same-UID write is
-        # denied by design (suppressions must go through the privileged path).
         pass
-
-
-def _is_suppressed(category: str, description: str, repo_root: Path) -> bool:
-    learned = _load_learned_patterns(repo_root)
-    for entry in learned.get("patterns", []):
-        if entry.get("category") != category:
-            continue
-        if entry.get("pattern") and entry["pattern"] in description:
-            return True
-    return False
 
 
 def _learn_false_positive(category: str, pattern: str, reason: str, repo_root: Path) -> None:
@@ -159,235 +120,8 @@ class GuardrailResult:
 
 
 # ---------------------------------------------------------------------------
-# Individual guardrail checkers
-# ---------------------------------------------------------------------------
-
-def _check_prompt_injection(source: str, runtime: RuntimeConfig | None = None) -> list[Violation]:
-    violations: list[Violation] = []
-    level = runtime.get_guardrail_level("prompt_injection") if runtime else "block"
-    if level == "off":
-        return violations
-    patterns = [
-        (r"ignore\s+(all\s+)?(previous|prior|above)\s+instructions", "Ignore-previous-instructions attempt"),
-        (r"you\s+are\s+(now|an?\s+(AI|autonomous|unconstrained|free))", "AI role-play / identity override"),
-        (r"system\s+prompt", "System prompt reference"),
-        (r"<\|im_start\|>|<\|im_end\|>|<\|sys\|>", "Chat markup token"),
-        (r"you\s+(must|will|shall)\s+obey", "Command-style instruction to AI"),
-        (r"forget\s+(all\s+)?(previous|prior)", "Forget-previous instruction attempt"),
-        (r"\[\/?INST\]|\[\/?SYS\]", "LLaMA-style instruction token"),
-        (r"###\s*(System|Instruction|Response)\s*:", "Section header mimicking system prompt"),
-        (r"do\s+not\s+(follow|obey|listen\s+to)", "Defiance instruction"),
-        (r"output\s+(only|just|exclusively)\s+(the\s+)?(JSON|code|result)", "Output constraint injection"),
-    ]
-    lines = source.splitlines()
-    for i, line in enumerate(lines, 1):
-        for pattern, desc in patterns:
-            m = re.search(pattern, line, re.IGNORECASE)
-            if m and runtime and runtime.is_allowed(m.group()):
-                continue
-            if m:
-                violations.append(Violation("prompt_injection", f"{desc}: {line.strip()[:60]}", i, "high"))
-    return violations
-
-
-def _check_security(source: str, runtime: RuntimeConfig | None = None, rel_path: str | None = None) -> list[Violation]:
-    violations: list[Violation] = []
-    level = runtime.get_guardrail_level("security") if runtime else "block"
-    if level == "off":
-        return violations
-    is_test = _is_test_or_mock(rel_path) if rel_path else False
-    patterns = [
-        (r"\b(eval|exec)\s*\(", "Dynamic code execution"),
-        (r"\b(subprocess\.(call|run|Popen|check_output|check_call)|os\.system|os\.popen)\s*\(", "Shell command execution"),
-        (r"\b(pickle\.loads|pickle\.load|shelve\.open)\s*\(", "Unsafe deserialization"),
-        (r"\bexecute\s*\(\s*['\"`](SELECT|INSERT|UPDATE|DELETE|DROP|ALTER|CREATE)", "SQL query construction"),
-        (r"\bos\.(remove|unlink|rmdir)\s*\(", "File deletion operation"),
-    ]
-    lines = source.splitlines()
-    for i, line in enumerate(lines, 1):
-        for pattern, desc in patterns:
-            m = re.search(pattern, line)
-            if m and runtime and runtime.is_allowed(m.group()):
-                continue
-            if m:
-                sev = "high" if "exec" in pattern or "pickle" in pattern else "medium"
-                if is_test:
-                    sev = "low"
-                violations.append(Violation("security", desc, i, sev))
-    return violations
-
-
-def _check_debris_patterns(source: str, suffix: str, runtime: RuntimeConfig | None = None) -> list[Violation]:
-    """Check for common AI-generated debris patterns."""
-    violations: list[Violation] = []
-    level = runtime.get_guardrail_level("debris") if runtime else "warn"
-    if level == "off":
-        return violations
-    patterns: list[tuple[str, str]] = []
-    if suffix in (".py", ".js", ".ts", ".jsx", ".tsx"):
-        patterns.append((r"pass\s*$", "Stub pass statement"), )
-    lines = source.splitlines()
-    for i, line in enumerate(lines, 1):
-        for pattern, desc in patterns:
-            m = re.search(pattern, line)
-            if m and runtime and runtime.is_allowed(m.group()):
-                continue
-            if m:
-                violations.append(Violation("debris", f"{desc}: {line.strip()[:60]}", i, "low"))
-    return violations
-
-
-def _check_layer_violations(source: str, rel_path: str, config: DeadpushConfig, runtime: RuntimeConfig | None = None) -> list[Violation]:
-    """Check if the file's imports violate layer rules."""
-    violations: list[Violation] = []
-    level = runtime.get_guardrail_level("layer") if runtime else "block"
-    if level == "off":
-        return violations
-    try:
-        from .layers import LayerEnforcer
-        enforcer = LayerEnforcer()
-        suffix = Path(rel_path).suffix
-        imports_list = enforcer.extract_imports_regex(source, suffix)
-        if imports_list:
-            layer_vs = enforcer.analyze_imports(rel_path, imports_list)
-            for lv in layer_vs:
-                if runtime and runtime.is_allowed(lv.description):
-                    continue
-                violations.append(Violation("layer", lv.description, lv.line, "medium"))
-    except Exception:
-        pass
-    return violations
-
-
-def _check_dependency_integrity(source: str, rel_path: str, repo_root: Path | str, runtime: RuntimeConfig | None = None) -> list[Violation]:
-    """Check dependency files for typosquats and suspicious package additions."""
-    violations: list[Violation] = []
-    level = runtime.get_guardrail_level("dependency") if runtime else "warn"
-    if level == "off":
-        return violations
-    try:
-        from .deps_guard import check_deps
-
-        old_source = ""
-        dest = Path(repo_root) / rel_path if not Path(rel_path).is_absolute() else Path(rel_path)
-        if dest.exists():
-            old_source = dest.read_text(encoding="utf-8", errors="replace")
-        dep_vs = check_deps(source, rel_path, old_source)
-        for dv in dep_vs:
-            if runtime and runtime.is_allowed(dv["description"]):
-                continue
-            violations.append(Violation(dv["category"], dv["description"], dv["line"], dv["severity"]))
-    except Exception:
-        pass
-    return violations
-
-
-def _check_hardcoded_secrets(source: str, runtime: RuntimeConfig | None = None, rel_path: str | None = None) -> list[Violation]:
-    """Check for hardcoded secrets, API keys, tokens."""
-    violations: list[Violation] = []
-    level = runtime.get_guardrail_level("secret") if runtime else "block"
-    if level == "off":
-        return violations
-    is_test = _is_test_or_mock(rel_path) if rel_path else False
-    patterns = [
-        (r'(?:api[_-]?key|apikey|secret[_-]?key|secret[_-]?token)\s*[:=]\s*["\'].+["\']', "Hardcoded API key/secret", "high"),
-        (r'(?:sk-[a-zA-Z0-9]{20,}|pk-[a-zA-Z0-9]{20,})', "Hardcoded API token (starts with sk-/pk-)", "critical"),
-        (r'AKIA[0-9A-Z]{16}', "Hardcoded AWS Access Key", "critical"),
-        (r'(?:password|passwd|pwd)\s*[:=]\s*["\'][^"\']{4,}["\']', "Hardcoded password", "high"),
-        (r'ghp_[a-zA-Z0-9]{36}', "Hardcoded GitHub token", "critical"),
-        (r'xox[baprs]-[0-9a-zA-Z-]{10,}', "Hardcoded Slack token", "critical"),
-    ]
-    lines = source.splitlines()
-    for i, line in enumerate(lines, 1):
-        for pattern, desc, severity in patterns:
-            m = re.search(pattern, line, re.IGNORECASE)
-            if m and runtime and runtime.is_allowed(m.group()):
-                continue
-            if m:
-                effective_sev = "warn" if (is_test and severity in ("high", "critical")) else severity
-                violations.append(Violation("secret", f"{desc}: {line.strip()[:60]}", i, effective_sev))
-    return violations
-
-
-# ---------------------------------------------------------------------------
-# Sensitive write checker
-# ---------------------------------------------------------------------------
-
-def _check_sensitive_write(source: str, rel_path: str, config: DeadpushConfig, runtime: RuntimeConfig | None = None) -> list[Violation]:
-    """Block writes to sensitive config files (CI/CD, deployment, Docker, etc.)."""
-    violations: list[Violation] = []
-    level = runtime.get_guardrail_level("sensitive") if runtime else "block"
-    if level == "off":
-        return violations
-    if config.is_sensitive_config(rel_path):
-        if runtime and runtime.is_allowed(rel_path):
-            return violations
-        violations.append(Violation(
-            "sensitive",
-            f"Write to sensitive config file blocked: {rel_path}",
-            0, "high"
-        ))
-    return violations
-
-
-# ---------------------------------------------------------------------------
-# Destructive change checker
-# ---------------------------------------------------------------------------
-
-def _check_destructive_changes(
-    source: str, rel_path: str, repo_root: Path,
-    runtime: RuntimeConfig | None = None,
-    _old_source: str | None = None,
-) -> list[Violation]:
-    """Check if the write would destroy existing content (near-empty rewrites, massive deletions)."""
-    violations: list[Violation] = []
-    level = runtime.get_guardrail_level("destructive") if runtime else "warn"
-    if level == "off":
-        return violations
-
-    if _old_source is not None:
-        old_content = _old_source
-    else:
-        dest = (repo_root / rel_path).resolve()
-        if not dest.exists():
-            return violations
-        try:
-            old_content = dest.read_text(encoding="utf-8", errors="ignore")
-        except Exception:
-            return violations
-
-    old_lines = old_content.splitlines()
-    new_lines = source.splitlines()
-
-    if len(old_lines) > 20 and len(new_lines) < 3:
-        violations.append(Violation(
-            "destructive",
-            f"Replacing {len(old_lines)}-line file with {len(new_lines)} lines — potential content deletion",
-            0, "high" if level == "block" else "medium"
-        ))
-
-    if old_lines and len(new_lines) < len(old_lines) * 0.5 and len(old_lines) > 10:
-        violations.append(Violation(
-            "destructive",
-            f"Writing {len(new_lines)} lines to replace {len(old_lines)} lines — >50% reduction",
-            0, "medium"
-        ))
-
-    return violations
-
-
-# ---------------------------------------------------------------------------
 # Full guardrail check pipeline
 # ---------------------------------------------------------------------------
-
-def _apply_guardrail_level(result: GuardrailResult, violations: list[Violation], runtime: RuntimeConfig | None, category: str) -> None:
-    level = runtime.get_guardrail_level(category) if runtime else "block"
-    if level == "block":
-        for v in violations:
-            result.reject(v)
-    else:
-        result.violations.extend(violations)
-
 
 _ENFORCEABLE_EXTENSIONS = frozenset({
     # Scripting / application code
@@ -510,34 +244,6 @@ def enforce_content(
         ))
         return result
 
-    suffix = Path(rel).suffix.lower()
-
-    learned = _load_learned_patterns(config.repo_root)
-    suppressed_desc: set[str] = set()
-    for entry in learned.get("patterns", []):
-        if entry.get("pattern"):
-            suppressed_desc.add(entry["pattern"])
-
-    _apply_guardrail_level(result, _check_prompt_injection(source, runtime), runtime, "prompt_injection")
-    _apply_guardrail_level(result, _check_hardcoded_secrets(source, runtime, rel_path=rel), runtime, "secret")
-    _apply_guardrail_level(result, _check_security(source, runtime, rel_path=rel), runtime, "security")
-
-    result.violations = [v for v in result.violations if v.description not in suppressed_desc]
-
-    if not bootstrap:
-        _apply_guardrail_level(result, _check_sensitive_write(source, rel, config, runtime), runtime, "sensitive")
-    destructive_level = runtime.get_guardrail_level("destructive") if runtime else "warn"
-    for v in _check_destructive_changes(source, rel, config.repo_root, runtime, _old_source=old_source):
-        if destructive_level == "block":
-            result.reject(v)
-        else:
-            result.violations.append(v)
-
-    _apply_guardrail_level(result, _check_debris_patterns(source, suffix, runtime), runtime, "debris")
-    _apply_guardrail_level(result, _check_layer_violations(source, rel, config, runtime), runtime, "layer")
-    _apply_guardrail_level(result, _check_dependency_integrity(source, rel, config.repo_root, runtime), runtime, "dependency")
-
-    # Third-party guardrail plugins (entry point: deadpush.guardrails)
     from .plugins import run_plugins
     plugin_violations = run_plugins(rel, source, config, runtime)
     for v in plugin_violations:
