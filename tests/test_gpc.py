@@ -93,26 +93,41 @@ def test_gpc_client_ack(temp_repo: Path):
 
 
 def test_gpc_override_request_logged(temp_repo: Path):
-    server = GpcServer(temp_repo, hardened=False)
+    import threading
+    import time
+
+    got_override = threading.Event()
+
+    def on_client_message(msg: GpcMessage, _state) -> None:
+        if msg.type == "REQUEST_OVERRIDE":
+            got_override.set()
+
+    server = GpcServer(temp_repo, hardened=False, on_client_message=on_client_message)
     server.start()
+    client = GpcClient(temp_repo)
     try:
-        import time
         for _ in range(50):
             if server.socket_path.exists():
                 break
             time.sleep(0.02)
-        client = GpcClient(temp_repo)
-        assert client.send_heartbeat() is True
+        # Keep a persistent listen connection so REQUEST_OVERRIDE is not racy
+        # against short-lived connect/send/close on Linux CI.
+        client.connect_and_listen()
+        deadline = time.time() + 5.0
+        while time.time() < deadline and server.client_count < 1:
+            time.sleep(0.05)
         assert client.send_request_override("need to push hotfix", related_message_id="inc-1")
+        assert got_override.wait(5.0), "server never handled REQUEST_OVERRIDE"
         log = temp_repo / ".deadpush" / "gpc_overrides.jsonl"
         for _ in range(50):
             if log.exists():
                 break
-            time.sleep(0.1)
+            time.sleep(0.05)
         assert log.exists()
         line = json.loads(log.read_text(encoding="utf-8").strip().splitlines()[-1])
         assert line["payload"]["reason"] == "need to push hotfix"
     finally:
+        client.stop()
         server.stop()
 
 
