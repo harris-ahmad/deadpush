@@ -32,6 +32,7 @@ DEFAULT_RULES: dict[str, Any] = {
         "destructive": "warn",
         "debris": "warn",
         "dependency": "warn",
+        "reachability": "warn",
     },
 }
 
