@@ -257,7 +257,7 @@ def enforce_content(
     reachability_level = runtime.get_guardrail_level("reachability") if runtime else "warn"
     if reachability_level != "off":
         try:
-            from .reachability import check_reachability, violations_from_reachability
+            from .reachability import check_reachability
             reach_violations = check_reachability(rel, source, config)
             if reach_violations:
                 for rv in reach_violations:
