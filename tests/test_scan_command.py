@@ -20,7 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from deadpush.cli import main  # noqa: E402
 from deadpush.hooks import scan_range, scan_tree, scan_range_paths, _ZERO_SHA  # noqa: E402
 
-_DANGEROUS = "# bad instructions\n"
+_DANGEROUS = "import subprocess\nsubprocess.run('ls', shell=True)\n"
 _CLEAN = "def add(a, b):\n    return a + b\n"
 
 
@@ -41,10 +41,10 @@ def _commit(repo: Path, name: str, content: str, *, force: bool = False) -> str:
 class TestScanEngine:
     def test_scan_range_flags_dangerous_file(self, temp_repo: Path):
         base = _git(temp_repo, "rev-parse", "HEAD")
-        head = _commit(temp_repo, "CLAUDE.md", _DANGEROUS)
+        head = _commit(temp_repo, "config.py", _DANGEROUS)
         violations = scan_range(temp_repo, base, head)
         assert violations, "dangerous file in the range should be flagged"
-        assert any(v["file"] == "CLAUDE.md" for v in violations)
+        assert any(v["file"] == "config.py" for v in violations)
 
     def test_scan_range_clean_for_benign(self, temp_repo: Path):
         base = _git(temp_repo, "rev-parse", "HEAD")
@@ -52,9 +52,9 @@ class TestScanEngine:
         assert scan_range(temp_repo, base, head) == []
 
     def test_scan_tree_flags_dangerous(self, temp_repo: Path):
-        _commit(temp_repo, "CLAUDE.md", _DANGEROUS)
+        _commit(temp_repo, "config.py", _DANGEROUS)
         violations = scan_tree(temp_repo, "HEAD")
-        assert any(v["file"] == "CLAUDE.md" for v in violations)
+        assert any(v["file"] == "config.py" for v in violations)
 
     def test_scan_tree_excludes_deadpush_own_state(self, temp_repo: Path):
         # deadpush's own dir is gitignored; even force-committed, it must not be scanned
@@ -65,15 +65,15 @@ class TestScanEngine:
 
     def test_zero_base_triggers_whole_tree_scan(self, temp_repo: Path):
         # A new branch (zero base) has no trustworthy boundary -> whole tree scanned.
-        head = _commit(temp_repo, "CLAUDE.md", _DANGEROUS)
+        head = _commit(temp_repo, "config.py", _DANGEROUS)
         paths = scan_range_paths(temp_repo, _ZERO_SHA, head)
-        assert "CLAUDE.md" in paths
+        assert "config.py" in paths
         assert "hello.py" in paths  # whole tree, not just the range
 
 
 class TestScanCommand:
     def test_exit_nonzero_on_violation(self, temp_repo: Path):
-        _commit(temp_repo, "CLAUDE.md", _DANGEROUS)
+        _commit(temp_repo, "config.py", _DANGEROUS)
         result = CliRunner().invoke(main, ["scan", "--all", "--repo", str(temp_repo)])
         assert result.exit_code == 1
         assert "violation" in result.output.lower()
@@ -85,7 +85,7 @@ class TestScanCommand:
         assert "clean" in result.output.lower()
 
     def test_json_format(self, temp_repo: Path):
-        _commit(temp_repo, "CLAUDE.md", _DANGEROUS)
+        _commit(temp_repo, "config.py", _DANGEROUS)
         result = CliRunner().invoke(
             main, ["scan", "--all", "--repo", str(temp_repo), "--format", "json"]
         )
@@ -93,11 +93,11 @@ class TestScanCommand:
         payload = json.loads(result.output)
         assert payload["clean"] is False
         assert payload["count"] >= 1
-        assert any(v["file"] == "CLAUDE.md" for v in payload["violations"])
+        assert any(v["file"] == "config.py" for v in payload["violations"])
 
     def test_range_scan_via_cli(self, temp_repo: Path):
         base = _git(temp_repo, "rev-parse", "HEAD")
-        head = _commit(temp_repo, "CLAUDE.md", _DANGEROUS)
+        head = _commit(temp_repo, "config.py", _DANGEROUS)
         result = CliRunner().invoke(
             main, ["scan", "--base", base, "--head", head, "--repo", str(temp_repo)]
         )

@@ -37,12 +37,12 @@ def test_linux_backend_wrap_sets_env(temp_repo: Path):
     assert env.get("DEADPUSH_LINUX_SANDBOX") == "1"
 
 
-def test_decide_fanotify_write_blocks_blocked_file(temp_repo: Path):
-    evil = temp_repo / "CLAUDE.md"
+def test_decide_fanotify_write_blocks_eval(temp_repo: Path):
+    evil = temp_repo / "evil.py"
     allowed, reason = decide_fanotify_write(
         temp_repo,
         abs_path=str(evil),
-        content="# bad\n",
+        content="eval('bad')\n",
     )
     assert not allowed
     assert reason
@@ -77,7 +77,7 @@ def test_decide_fanotify_write_skips_bootstrap_paths(temp_repo: Path):
 
 
 def test_evaluate_repo_write_uses_enforcement_kernel(temp_repo: Path):
-    allowed, _ = evaluate_repo_write(temp_repo, "CLAUDE.md", "# bad\n")
+    allowed, _ = evaluate_repo_write(temp_repo, "bad.py", "eval(1)\n")
     assert not allowed
     allowed2, _ = evaluate_repo_write(temp_repo, "fine.py", "print('hi')\n")
     assert allowed2

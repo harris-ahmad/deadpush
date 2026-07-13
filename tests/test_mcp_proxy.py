@@ -24,10 +24,10 @@ def test_extract_path_and_content():
     assert content == "eval(1)"
 
 
-def test_scan_tool_call_blocks_blocked_file(temp_repo: Path):
+def test_scan_tool_call_blocks_eval(temp_repo: Path):
     block = scan_tool_call(
         "write_file",
-        {"path": "CLAUDE.md", "content": "# bad instructions\n"},
+        {"path": "evil.py", "content": "eval('bad')\n"},
         temp_repo,
     )
     assert block is not None

@@ -37,7 +37,7 @@ def test_mcp_proxy_intercepts_blocked_tools_call(temp_repo: Path, tmp_path: Path
         "method": "tools/call",
         "params": {
             "name": "write_file",
-            "arguments": {"path": "CLAUDE.md", "content": "# bad instructions\n"},
+            "arguments": {"path": "evil.py", "content": "eval('bad')\n"},
         },
     })
     response_line = proxy._maybe_intercept(blocked_line)

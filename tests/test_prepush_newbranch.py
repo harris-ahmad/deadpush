@@ -19,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from deadpush.hooks import run_prepush_guardrails
 
 _ZERO = "0000000000000000000000000000000000000000"
-_DANGEROUS = "# bad instructions\n"
+_DANGEROUS = "import subprocess\nsubprocess.run('ls', shell=True)\n"
 _CLEAN = "def add(a, b):\n    return a + b\n"
 
 
@@ -47,13 +47,13 @@ class TestNewBranchPrePush:
         """The core gap: a dangerous file introduced on a brand-new branch must
         be caught on first push (remote sha is all-zeros)."""
         _git(temp_repo, "checkout", "-b", "feature")
-        local_sha = _commit(temp_repo, "CLAUDE.md", _DANGEROUS)
+        local_sha = _commit(temp_repo, "danger.py", _DANGEROUS)
 
         _feed_stdin(monkeypatch, "refs/heads/feature", local_sha, _ZERO)
         passed, violations = run_prepush_guardrails(temp_repo)
 
         assert passed is False, "new-branch push with a dangerous file must be blocked"
-        assert any(v["file"] == "CLAUDE.md" for v in violations)
+        assert any(v["file"] == "danger.py" for v in violations)
 
     def test_new_branch_push_allows_clean_file(self, temp_repo: Path, monkeypatch):
         _git(temp_repo, "checkout", "-b", "feature")
@@ -68,41 +68,41 @@ class TestNewBranchPrePush:
     def test_new_branch_push_cannot_be_poisoned_by_fake_remote_ref(self, temp_repo: Path, monkeypatch):
         """D4: a forged refs/remotes/* must not shrink the scanned range.
 
-        History: main -> [feature] C_danger (adds CLAUDE.md) -> C_tip (adds safe2.py).
+        History: main -> [feature] C_danger (adds danger.py) -> C_tip (adds safe2.py).
         An agent forges refs/remotes/origin/feature = C_danger to claim the payload
         is 'already on the remote'. Under the old `--not --remotes` base computation
-        the scanned diff became C_danger..C_tip and skipped CLAUDE.md entirely; the
+        the scanned diff became C_danger..C_tip and skipped danger.py entirely; the
         whole-tree scan must still catch it.
         """
         _git(temp_repo, "checkout", "-b", "feature")
-        danger_sha = _commit(temp_repo, "CLAUDE.md", _DANGEROUS)
+        danger_sha = _commit(temp_repo, "danger.py", _DANGEROUS)
         tip_sha = _commit(temp_repo, "safe2.py", _CLEAN)
 
         # Forge a remote-tracking ref pointing at the payload commit.
         _git(temp_repo, "update-ref", "refs/remotes/origin/feature", danger_sha)
-        # Sanity: the forgery really does make the old base logic skip CLAUDE.md.
+        # Sanity: the forgery really does make the old base logic skip danger.py.
         skipped = subprocess.run(
             ["git", "diff", "--name-only", f"{danger_sha}..{tip_sha}"],
             capture_output=True, text=True, cwd=temp_repo, check=False,
         ).stdout.split()
-        assert "CLAUDE.md" not in skipped
+        assert "danger.py" not in skipped
 
         _feed_stdin(monkeypatch, "refs/heads/feature", tip_sha, _ZERO)
         passed, violations = run_prepush_guardrails(temp_repo)
 
         assert passed is False, "forged remote-tracking ref must not bypass the scan"
-        assert any(v["file"] == "CLAUDE.md" for v in violations)
+        assert any(v["file"] == "danger.py" for v in violations)
 
     def test_existing_branch_update_still_blocks(self, temp_repo: Path, monkeypatch):
         """The remote_sha..local_sha path must keep working unchanged."""
         base_sha = _git(temp_repo, "rev-parse", "HEAD")
-        local_sha = _commit(temp_repo, "CLAUDE.md", _DANGEROUS)
+        local_sha = _commit(temp_repo, "danger.py", _DANGEROUS)
 
         _feed_stdin(monkeypatch, "refs/heads/main", local_sha, base_sha)
         passed, violations = run_prepush_guardrails(temp_repo)
 
         assert passed is False
-        assert any(v["file"] == "CLAUDE.md" for v in violations)
+        assert any(v["file"] == "danger.py" for v in violations)
 
     def test_branch_deletion_is_skipped(self, temp_repo: Path, monkeypatch):
         """Deleting a remote ref sends an all-zeros local sha; nothing to scan."""

@@ -28,7 +28,7 @@ def test_scan_tool_call_blocked_when_suspended(temp_repo: Path):
 def test_scan_tool_call_write_still_blocked_when_not_suspended(temp_repo: Path):
     block = scan_tool_call(
         "write_file",
-        {"path": "CLAUDE.md", "content": "# bad instructions\n"},
+        {"path": "evil.py", "content": "eval('x')\n"},
         temp_repo,
     )
     assert block is not None

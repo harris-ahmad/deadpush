@@ -17,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from deadpush.hooks import run_prereceive_guardrails, _ZERO_SHA  # noqa: E402
 
-_DANGEROUS = "# bad instructions\n"
+_DANGEROUS = "import subprocess\nsubprocess.run('ls', shell=True)\n"
 _CLEAN = "def add(a, b):\n    return a + b\n"
 
 
@@ -41,11 +41,11 @@ def _feed(monkeypatch, text: str) -> None:
 class TestPreReceive:
     def test_rejects_dangerous_update(self, temp_repo: Path, monkeypatch):
         old = _git(temp_repo, "rev-parse", "HEAD")
-        new = _commit(temp_repo, "CLAUDE.md", _DANGEROUS)
+        new = _commit(temp_repo, "config.py", _DANGEROUS)
         _feed(monkeypatch, f"{old} {new} refs/heads/main\n")
         passed, violations = run_prereceive_guardrails(temp_repo)
         assert passed is False
-        assert any(v["file"] == "CLAUDE.md" for v in violations)
+        assert any(v["file"] == "config.py" for v in violations)
 
     def test_allows_benign_update(self, temp_repo: Path, monkeypatch):
         old = _git(temp_repo, "rev-parse", "HEAD")
@@ -65,11 +65,11 @@ class TestPreReceive:
     def test_new_branch_whole_tree_scan(self, temp_repo: Path, monkeypatch):
         # A brand-new ref (zero old) must scan the ENTIRE pushed tree, so a payload
         # committed before the branch point is still caught.
-        new = _commit(temp_repo, "CLAUDE.md", _DANGEROUS)
+        new = _commit(temp_repo, "config.py", _DANGEROUS)
         _feed(monkeypatch, f"{_ZERO_SHA} {new} refs/heads/newbranch\n")
         passed, violations = run_prereceive_guardrails(temp_repo)
         assert passed is False
-        assert any(v["file"] == "CLAUDE.md" for v in violations)
+        assert any(v["file"] == "config.py" for v in violations)
 
     def test_empty_stdin_passes(self, temp_repo: Path, monkeypatch):
         _feed(monkeypatch, "")
