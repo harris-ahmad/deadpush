@@ -548,6 +548,26 @@ def enforce_content(
         elif level == "warn":
             result.violations.append(v)
 
+    # Multi-hop reachability (transitive sensitive ops via imports). Default warn.
+    reachability_level = runtime.get_guardrail_level("reachability") if runtime else "warn"
+    if reachability_level != "off":
+        try:
+            from .reachability import check_reachability
+            reach_violations = check_reachability(rel, source, config)
+            if reach_violations:
+                for rv in reach_violations:
+                    desc = (
+                        f"Transitive reachability: {rv.file} reaches "
+                        f"{rv.sensitive_op.category} via {rv.path}"
+                    )
+                    v = Violation("reachability", desc, rv.sensitive_op.line, "medium")
+                    if reachability_level == "block":
+                        result.reject(v)
+                    else:
+                        result.violations.append(v)
+        except Exception:
+            pass
+
     return result
 
 

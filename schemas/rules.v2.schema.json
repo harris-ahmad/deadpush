@@ -39,7 +39,8 @@
         "sensitive": { "type": "string", "enum": ["off", "warn", "block"] },
         "destructive": { "type": "string", "enum": ["off", "warn", "block"] },
         "debris": { "type": "string", "enum": ["off", "warn", "block"] },
-        "dependency": { "type": "string", "enum": ["off", "warn", "block"] }
+        "dependency": { "type": "string", "enum": ["off", "warn", "block"] },
+        "reachability": { "type": "string", "enum": ["off", "warn", "block"] }
       }
     }
   }

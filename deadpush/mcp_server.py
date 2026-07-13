@@ -966,7 +966,6 @@ def run_mcp(danger_mode: bool = False, hardened: bool = False):
               f"Or override with: deadpush mcp --danger\n",
               file=sys.stderr)
         return
-    from .guard import _scoped_suspend_file
     suspend_file = _scoped_suspend_file(config.repo_root, hardened)
     server = McpServer(config.repo_root, danger_mode=danger_mode)
     server.suspend_file = suspend_file

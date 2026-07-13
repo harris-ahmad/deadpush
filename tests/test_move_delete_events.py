@@ -28,27 +28,27 @@ from deadpush.guard import GuardianHandler  # noqa: E402
 # ---------------------------------------------------------------------------
 class TestOnMoved:
     def test_move_evaluates_destination(self):
-        fake = types.SimpleNamespace(_evaluate=Mock())
+        fake = types.SimpleNamespace(_enqueue=Mock())
         ev = types.SimpleNamespace(is_directory=False, src_path="/repo/a.txt",
                                    dest_path="/repo/evil.py")
         GuardianHandler.on_moved(fake, ev)
-        fake._evaluate.assert_called_once()
-        (path_arg,), kwargs = fake._evaluate.call_args
+        fake._enqueue.assert_called_once()
+        (path_arg,), kwargs = fake._enqueue.call_args
         assert path_arg == Path("/repo/evil.py")
         assert kwargs.get("event_type") == "moved"
 
     def test_directory_move_ignored(self):
-        fake = types.SimpleNamespace(_evaluate=Mock())
+        fake = types.SimpleNamespace(_enqueue=Mock())
         ev = types.SimpleNamespace(is_directory=True, src_path="/repo/a",
                                    dest_path="/repo/b")
         GuardianHandler.on_moved(fake, ev)
-        fake._evaluate.assert_not_called()
+        fake._enqueue.assert_not_called()
 
     def test_missing_dest_ignored(self):
-        fake = types.SimpleNamespace(_evaluate=Mock())
+        fake = types.SimpleNamespace(_enqueue=Mock())
         ev = types.SimpleNamespace(is_directory=False, src_path="/repo/a", dest_path=None)
         GuardianHandler.on_moved(fake, ev)
-        fake._evaluate.assert_not_called()
+        fake._enqueue.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
