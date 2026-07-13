@@ -79,7 +79,13 @@ def repo_state_dir(repo_root: Path | str, hardened: bool = False) -> Path:
     rid = repo_id(repo_root)
     root = state_dir(hardened)
     repos_root = root / "repos"
-    repos_root.mkdir(parents=True, exist_ok=True)
+    try:
+        repos_root.mkdir(parents=True, exist_ok=True)
+    except PermissionError:
+        # Hardened state under /var/db/deadpush is root-owned; soft-mode callers
+        # may probe hardened=True paths (e.g. MCP get_safety_score) without write access.
+        if not hardened:
+            raise
     return repos_root / rid
 
 
@@ -204,11 +210,9 @@ def ensure_layout_migrated(hardened: bool = False) -> None:
     if hardened:
         if _migrated_hardened:
             return
-        flag = "_migrated_hardened"
     else:
         if _migrated_soft:
             return
-        flag = "_migrated_soft"
 
     root = state_dir(hardened)
     try:

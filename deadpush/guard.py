@@ -15,8 +15,6 @@ import atexit
 from collections import deque
 import errno
 import fcntl
-import functools
-import hashlib
 import logging
 import os
 import shutil
@@ -36,18 +34,19 @@ except ImportError:
     FileSystemEventHandler = None
     WATCHDOG_AVAILABLE = False
 
-from .config import load_config
-from .debris import DebrisDetector
-from .intercept import FEEDBACK_DIR
-from .session import SessionManager
-
-# For Local Control Interface (AGENT priority 4 - for automatic interaction by Claude/Cursor/etc agents)
 import json
 import subprocess
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 from urllib.parse import urlparse, parse_qs
+
+from .config import load_config
+from .config import repo_id as _repo_id
+from .debris import DebrisDetector
+from .intercept import FEEDBACK_DIR
+from .session import SessionManager
+from . import state as _state
 
 
 _HARDENED_STATE_DIR = Path("/var/db/deadpush")
@@ -77,10 +76,6 @@ def _find_bootstrap_python() -> str:
         return found
     import sys
     return sys.executable
-
-
-from .config import repo_id as _repo_id
-from . import state as _state
 
 
 def _state_dir(hardened: bool = False) -> Path:

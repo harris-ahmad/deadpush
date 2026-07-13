@@ -9,7 +9,7 @@ from pathlib import Path
 import click
 
 from .config import load_config
-from .ui import is_rich_available, print_error, print_header, print_success, print_warning
+from .ui import is_rich_available, print_error, print_header, print_info, print_success, print_warning
 
 
 def _auto_merge_ignore_files(repo_root: Path, new_patterns: set[str]):
@@ -1632,11 +1632,22 @@ def cmd_uninstall(hardened, force):
         print("  Removed empty .guardian directory")
 
     # .deadpush holds deadpush's bookkeeping (install marker, hook checksums,
-    # feedback). Prune now-empty subdirs (e.g. feedback/, hooks/) first, then drop
-    # the dir itself only if nothing user-relevant (config.toml, rules.json, real
-    # feedback data) remains.
+    # feedback). Remove install-owned leaf files first, prune now-empty subdirs
+    # (e.g. feedback/, hooks/), then drop the dir itself only if nothing
+    # user-relevant (config.toml, rules.json, real feedback data) remains.
     deadpush_dir = repo_root / ".deadpush"
     if deadpush_dir.is_dir():
+        for owned in (
+            "installed",
+            "bootstrap_paths.json",
+            "audit.chain.jsonl",
+            "gpc_overrides.jsonl",
+            "mcp_proxy_blocks.jsonl",
+        ):
+            try:
+                (deadpush_dir / owned).unlink(missing_ok=True)
+            except OSError:
+                pass
         for child in list(deadpush_dir.iterdir()):
             if child.is_dir():
                 _rmdir_if_empty(child)

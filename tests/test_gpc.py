@@ -97,16 +97,20 @@ def test_gpc_override_request_logged(temp_repo: Path):
     server.start()
     try:
         import time
-        time.sleep(0.1)
+        for _ in range(50):
+            if server.socket_path.exists():
+                break
+            time.sleep(0.02)
         client = GpcClient(temp_repo)
+        assert client.send_heartbeat() is True
         assert client.send_request_override("need to push hotfix", related_message_id="inc-1")
         log = temp_repo / ".deadpush" / "gpc_overrides.jsonl"
-        for _ in range(20):
+        for _ in range(50):
             if log.exists():
                 break
             time.sleep(0.1)
         assert log.exists()
-        line = json.loads(log.read_text(encoding="utf-8").strip())
+        line = json.loads(log.read_text(encoding="utf-8").strip().splitlines()[-1])
         assert line["payload"]["reason"] == "need to push hotfix"
     finally:
         server.stop()

@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .config import is_hardened_install, repo_id
+from . import state as _state
 
 logger = logging.getLogger("deadpush.gpc")
 
@@ -35,9 +36,6 @@ GUARDIAN_TO_CLIENT = frozenset({
     "INCIDENT", "LOCKDOWN", "INSTRUCTION", "POLICY_UPDATE", "SESSION_PAUSE", "WELCOME",
 })
 CLIENT_TO_GUARDIAN = frozenset({"ACK", "HEARTBEAT", "REQUEST_OVERRIDE", "PROXY_BLOCK"})
-
-
-from . import state as _state
 
 
 def gpc_socket_path(repo_root: Path, *, hardened: bool | None = None) -> Path:

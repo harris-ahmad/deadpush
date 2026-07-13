@@ -37,7 +37,7 @@ ENFORCED = [
     # env variants
     ".env", ".env.local", ".env.production", "config/.env.test",
     # LLM / AI-assistant context files (extensionless)
-    ".cursorrules", ".claude_instructions", ".cursorignore",
+    ".cursorrules", ".claude_instructions",
 ]
 
 SKIPPED = [
@@ -46,6 +46,8 @@ SKIPPED = [
     "libfoo.so", "app.exe", "data.sqlite", "keystore.p12", "font.woff2",
     # unknown / data formats we intentionally don't scan
     "data.csv", "notes.unknownext", "table.parquet",
+    # deadpush protect bootstrap ignore files (owned by deadpush, not LLM context)
+    ".cursorignore",
     # deadpush's own state + git internals: scanning them re-flags deadpush's own
     # feedback records (which quote caught secrets) and lets `git add -A` weaponize
     # deadpush's logs. Even a .py/.json inside these dirs must be skipped.
