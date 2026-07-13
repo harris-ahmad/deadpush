@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import ctypes
 import ctypes.util
-import errno
 import os
 import sys
 import threading

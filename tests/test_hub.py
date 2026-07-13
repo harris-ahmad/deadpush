@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import threading
-from pathlib import Path
 from urllib.request import urlopen
 
 import pytest
@@ -52,7 +51,6 @@ class TestCollectSnapshots:
 
 class TestHubHTTP:
     def test_api_repos_and_page(self, hub_home, tmp_path):
-        from http.server import HTTPServer
 
         repo = tmp_path / "proj"
         repo.mkdir()
