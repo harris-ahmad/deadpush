@@ -1,5 +1,6 @@
 # deadpush
 
+![deadpush](./assets/deadpush-logo.svg)
 [![GitHub stars](https://img.shields.io/github/stars/harris-ahmad/deadpush?style=social)](https://github.com/harris-ahmad/deadpush)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
