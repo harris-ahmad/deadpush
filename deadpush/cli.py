@@ -290,7 +290,9 @@ def cmd_protect(repo, enable, daemon, soft, hardened, allow_self_protect, no_con
         if not use_hardened:
             try:
                 from .guard import run_guardian, setup_autostart, _scoped_plist_path
-                autostart_info = setup_autostart(config.repo_root, hardened=False)
+                autostart_info = setup_autostart(
+                    config.repo_root, hardened=False, enable_fanotify=not no_fanotify,
+                )
                 if autostart_info:
                     print("\n[Auto-start for reboots]")
                     print(autostart_info)
@@ -2074,7 +2076,9 @@ def cmd_init(mode, daemon, force, allow_self_protect, no_fanotify):
             print_warning(f"  Could not lock hooks root-immutable: {e}")
     else:
         try:
-            autostart_info = setup_autostart(repo_root, hardened=False)
+            autostart_info = setup_autostart(
+                repo_root, hardened=False, enable_fanotify=not no_fanotify,
+            )
             if autostart_info:
                 print(autostart_info)
         except Exception as e:

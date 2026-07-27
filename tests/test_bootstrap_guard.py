@@ -111,7 +111,7 @@ class TestDebrisBootstrapSkip:
 
 
 class TestQuarantineHardening:
-    def test_quarantine_copies_then_unlinks(self, temp_repo: Path):
+    def test_quarantine_rename_first_removes_live_path(self, temp_repo: Path):
         target = temp_repo / "evil.py"
         target.write_text("eval('bad')\n")
         qm = QuarantineManager(temp_repo)
@@ -138,8 +138,10 @@ class TestQuarantineHardening:
                 raise OSError(errno.EPERM, "Operation not permitted")
             return real_unlink(self, missing_ok=missing_ok)
 
-        with patch.object(Path, "unlink", flaky_unlink):
-            dest = qm.quarantine(target, "retry test")
+        # Force the copy+unlink fallback (rename-first is the common path).
+        with patch.object(Path, "rename", side_effect=OSError(errno.EXDEV, "cross-device")):
+            with patch.object(Path, "unlink", flaky_unlink):
+                dest = qm.quarantine(target, "retry test")
 
         assert calls["n"] == 1
         assert not target.exists()

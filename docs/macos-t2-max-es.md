@@ -23,7 +23,16 @@ framework via a **System Extension**. This cannot be shipped inside the pip pack
 - Agent subprocesses launched via `deadpush run --sandbox`
 - Git operations through the deadpush-git PATH wrapper
 - MCP tool writes through `deadpush mcp-proxy`
-- IDE native editor writes → watchdog quarantine (reactive, same as Linux T2 without fanotify)
+- IDE native editor writes → **not covered by Seatbelt**; the always-on watchdog
+  quarantines after the write (H-04 race: tens–hundreds of ms, not zero).
+  Same limitation as Linux T2 without fanotify `CAP_SYS_ADMIN`.
+
+## Soft daemon vs T2-max fanotify (Linux)
+
+`deadpush protect --daemon` **attempts** to start the fanotify backend, but without
+`CAP_SYS_ADMIN` it stays watchdog-only. Pre-write `FAN_DENY` is not automatic for
+a normal user soft install. Use `deadpush run --sandbox` (session-scoped) or grant
+capabilities when you need T2-max deny on Linux.
 
 ## Entitlement process (orgs)
 
