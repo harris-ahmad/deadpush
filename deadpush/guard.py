@@ -12,12 +12,10 @@ Major improvements:
 from __future__ import annotations
 
 import atexit
-from concurrent.futures import ThreadPoolExecutor
 import errno
 import fcntl
 import logging
 import os
-import queue
 import shutil
 import signal
 import sys
@@ -25,6 +23,8 @@ import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
+
+from .event_pipeline import EventPipeline
 
 try:
     from watchdog.observers import Observer
@@ -1153,6 +1153,7 @@ class GuardianControlHandler(BaseHTTPRequestHandler):
                     "intervention_enabled": handler.intervention,
                     "strict_mode": handler.strict_mode,
                     "fanotify": handler.fanotify_status(),
+                    "pipeline": handler.pipeline_status(),
                 }
                 self._send_json(data)
             elif path == "/safety-score":
@@ -1409,16 +1410,14 @@ class GuardianHandler(FileSystemEventHandler or object):
 
         # Dynamic rate limiting (based on safety score)
         self.last_intervention_ts = 0.0
-        self._executor = ThreadPoolExecutor(
-            max_workers=min(32, (os.cpu_count() or 4) * 4),
-            thread_name_prefix="deadpush-worker",
+        # Bound FS events: coalesce per-path, drop under backpressure (never
+        # touch ThreadPoolExecutor's private work queue).
+        self._pipeline = EventPipeline(
+            process_fn=lambda path, event_type: self._worker_run(path, event_type),
+            cooldown_fn=lambda: self._get_cooldown(),
+            max_pending=2000,
+            logger=self.logger,
         )
-        try:
-            self._work_queue: "queue.Queue[tuple[Path, str]]" = self._executor._work_queue
-        except AttributeError:
-            self._work_queue = queue.Queue()
-        self._path_lock = threading.Lock()
-        self._last_path_ts: dict[str, float] = {}
         self._last_hook_repair_ts = 0.0
         self._last_hook_problems_key = ""
 
@@ -1434,6 +1433,9 @@ class GuardianHandler(FileSystemEventHandler or object):
         if self._fanotify_backend is None:
             return None
         return self._fanotify_backend.describe()
+
+    def pipeline_status(self) -> dict:
+        return self._pipeline.describe()
 
     def _start_fanotify(self) -> None:
         if not self.enable_fanotify or self._fanotify_backend is not None:
@@ -1986,27 +1988,7 @@ class GuardianHandler(FileSystemEventHandler or object):
                 rel = path.relative_to(self.config.repo_root).as_posix()
             except ValueError:
                 return
-
-            now = time.time()
-            with self._path_lock:
-                last = self._last_path_ts.get(rel)
-                if last is not None and now - last < self._get_cooldown():
-                    return
-                self._last_path_ts[rel] = now
-                if len(self._last_path_ts) > 5000:
-                    self._last_path_ts = {
-                        k: v for k, v in self._last_path_ts.items()
-                        if now - v < 5.0
-                    }
-
-            try:
-                queue_size = self._work_queue.qsize()
-            except Exception:
-                queue_size = 0
-            if queue_size >= 2000:
-                return
-            self._executor.submit(self._worker_run, path, event_type)
-
+            self._pipeline.enqueue(path, event_type, rel=rel)
         except Exception as e:
             self.logger.debug(f"Enqueue error on {path}: {e}")
 
@@ -2036,7 +2018,7 @@ class GuardianHandler(FileSystemEventHandler or object):
 
     def _shutdown_workers(self) -> None:
         try:
-            self._executor.shutdown(wait=True)
+            self._pipeline.shutdown(wait=True)
         except Exception as e:
             self.logger.debug(f"Worker shutdown skipped: {e}")
 
