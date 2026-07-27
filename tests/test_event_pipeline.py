@@ -31,6 +31,7 @@ def test_pipeline_coalesces_pending_burst():
 
     assert processed == ["coalesce.txt:created", "coalesce.txt:modified"]
     assert pipe.stats.coalesced >= 2
+    assert pipe.stats.enqueued == 1  # external accepts only; requeues counted separately
     assert pipe.stats.requeued == 1
     assert pipe.stats.dropped == 0
 
@@ -69,6 +70,43 @@ def test_pipeline_cooldown_suppresses_repeat():
     pipe.shutdown(wait=True)
     assert calls == ["cool.txt"]
     assert pipe.stats.coalesced >= 1
+
+
+def test_prune_last_done_respects_long_cooldown():
+    pipe = EventPipeline(process_fn=lambda p, e: None, cooldown_fn=lambda: 30.0, max_pending=10)
+    now = time.time()
+    # Simulate churn past the prune trigger with entries still inside cooldown.
+    pipe._last_done = {f"p{i}": now - 6.0 for i in range(5001)}
+    with pipe._lock:
+        pipe._prune_last_done()
+    assert len(pipe._last_done) == 5001  # 6s-old entries kept when cooldown is 30s
+    pipe.shutdown(wait=False)
+
+
+def test_wait_idle_logs_on_timeout(caplog):
+    import logging
+
+    block = threading.Event()
+    entered = threading.Event()
+
+    def process(path: Path, event_type: str):
+        entered.set()
+        block.wait(timeout=5)
+
+    pipe = EventPipeline(
+        process_fn=process,
+        cooldown_fn=lambda: 0.0,
+        max_pending=10,
+        max_workers=1,
+        idle_timeout=0.05,
+    )
+    assert pipe.enqueue(Path("/tmp/slow"), "created", rel="slow")
+    assert entered.wait(timeout=2)
+    with caplog.at_level(logging.WARNING, logger="deadpush.pipeline"):
+        assert pipe._wait_idle() is False
+    assert any("idle wait timed out" in r.message for r in caplog.records)
+    block.set()
+    pipe.shutdown(wait=True)
 
 
 def test_enqueue_coalesces_event_type(temp_repo: Path, monkeypatch):

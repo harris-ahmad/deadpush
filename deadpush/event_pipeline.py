@@ -67,11 +67,13 @@ class EventPipeline:
         cooldown_fn: CooldownFn | None = None,
         max_pending: int = 2000,
         max_workers: int | None = None,
+        idle_timeout: float = 60.0,
         logger: logging.Logger | None = None,
     ):
         self._process_fn = process_fn
         self._cooldown_fn = cooldown_fn or (lambda: 0.0)
         self._max_pending = max(1, max_pending)
+        self._idle_timeout = max(0.0, float(idle_timeout))
         workers = max_workers if max_workers is not None else min(32, (os.cpu_count() or 4) * 4)
         self._executor = ThreadPoolExecutor(
             max_workers=max(1, workers),
@@ -99,10 +101,17 @@ class EventPipeline:
                 "inflight": len(self._inflight),
                 "dirty": len(self._dirty),
                 "max_pending": self._max_pending,
+                "idle_timeout": self._idle_timeout,
                 "accepting": self._accepting,
                 "closed": self._closed,
                 **self._stats.snapshot(),
             }
+
+    def _current_cooldown(self) -> float:
+        try:
+            return max(0.0, float(self._cooldown_fn()))
+        except Exception:
+            return 0.0
 
     def enqueue(self, path: Path, event_type: str, *, rel: str | None = None) -> bool:
         """Accept a filesystem event. Returns False when dropped under backpressure."""
@@ -124,11 +133,7 @@ class EventPipeline:
 
             now = time.time()
             last = self._last_done.get(key)
-            cooldown = 0.0
-            try:
-                cooldown = float(self._cooldown_fn())
-            except Exception:
-                cooldown = 0.0
+            cooldown = self._current_cooldown()
             if last is not None and cooldown > 0 and (now - last) < cooldown:
                 self._stats.coalesced += 1
                 return True
@@ -150,9 +155,14 @@ class EventPipeline:
             return True
 
     def _schedule(self, key: str) -> None:
+        # Caller must hold self._lock.
         fut = self._executor.submit(self._run, key)
         self._futures.add(fut)
-        fut.add_done_callback(self._futures.discard)
+        fut.add_done_callback(self._on_future_done)
+
+    def _on_future_done(self, fut: Future) -> None:
+        with self._lock:
+            self._futures.discard(fut)
 
     def _run(self, key: str) -> None:
         with self._lock:
@@ -175,24 +185,45 @@ class EventPipeline:
                     if len(self._pending) < self._max_pending:
                         self._pending[key] = dirty
                         self._stats.requeued += 1
-                        self._stats.enqueued += 1
                         self._schedule(key)
                     else:
                         self._stats.dropped += 1
 
     def _prune_last_done(self) -> None:
+        # Caller must hold self._lock.
         if len(self._last_done) <= 5000:
             return
         now = time.time()
-        self._last_done = {k: v for k, v in self._last_done.items() if now - v < 5.0}
+        # Keep entries for at least the active cooldown so suppression cannot
+        # be bypassed by pruning under high unique-path churn.
+        keep_for = max(5.0, self._current_cooldown())
+        self._last_done = {k: v for k, v in self._last_done.items() if now - v < keep_for}
 
-    def _wait_idle(self, timeout: float = 60.0) -> None:
-        deadline = time.time() + timeout
+    def _wait_idle(self, timeout: float | None = None) -> bool:
+        """Block until the pipeline is idle, or ``timeout`` elapses.
+
+        Returns True when idle, False if the timeout expired with work remaining.
+        """
+        limit = self._idle_timeout if timeout is None else max(0.0, float(timeout))
+        deadline = time.time() + limit
         while time.time() < deadline:
             with self._lock:
                 if not self._pending and not self._inflight and not self._dirty:
-                    return
+                    return True
             time.sleep(0.01)
+        with self._lock:
+            pending = len(self._pending)
+            inflight = len(self._inflight)
+            dirty = len(self._dirty)
+        self._logger.warning(
+            "Event pipeline idle wait timed out after %.1fs "
+            "(pending=%s inflight=%s dirty=%s); remaining dirty updates may be dropped",
+            limit,
+            pending,
+            inflight,
+            dirty,
+        )
+        return False
 
     def shutdown(self, *, wait: bool = True) -> None:
         # Stop accepting external events, but allow in-flight dirty coalesces
