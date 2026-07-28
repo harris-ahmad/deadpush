@@ -78,6 +78,31 @@ def test_run_sandbox_fails_loud_without_backend(temp_repo: Path):
     assert code == 2
 
 
+def test_run_sandbox_stops_gpc_when_backend_unavailable(temp_repo: Path):
+    """GPC started before get_backend must be cleaned up on SandboxUnavailableError."""
+    from unittest.mock import MagicMock
+
+    from deadpush.gpc_session import GpcSession
+
+    fake = GpcSession(
+        repo_root=temp_repo,
+        socket_path=temp_repo / "gpc.sock",
+        relay=MagicMock(),
+        server=None,
+        attached_external=False,
+    )
+    with patch("deadpush.run_session.start_gpc_session", return_value=fake), \
+         patch("deadpush.run_session.get_backend", side_effect=SandboxUnavailableError("no backend")), \
+         patch("deadpush.run_session.stop_gpc_session") as stop:
+        code = run_sandbox(
+            [sys.executable, "-c", "print('ok')"],
+            repo_root=temp_repo,
+            require_gpc=True,
+        )
+    assert code == 2
+    stop.assert_called_once_with(fake)
+
+
 def test_run_sandbox_start_failure_no_noop_fallback(temp_repo: Path):
     backend = NoopEnforcementBackend(temp_repo)
 

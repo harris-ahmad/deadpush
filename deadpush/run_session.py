@@ -116,6 +116,7 @@ def run_sandbox(
         backend = get_backend(repo, prefer=backend_prefer)
     except SandboxUnavailableError as e:
         logger.error("%s", e)
+        stop_gpc_session(gpc_session)
         return 2
 
     if isinstance(backend, LinuxEnforcementBackend):
