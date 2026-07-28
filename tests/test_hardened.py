@@ -7,41 +7,45 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import pytest
 from deadpush import guard
+from deadpush import hardened as _hardened_mod
 
 
 @pytest.fixture
 def hardened_env(tmp_path, monkeypatch):
     """Simulate a writable hardened environment by redirecting state and
-    autostart paths to a temp directory."""
+    autostart paths to a temp directory.
+
+    Path helpers are dual-patched (facade + hardened) via ``patch_guard_helper``
+    because ``setup_autostart`` resolves ``_scoped_*`` from hardened's globals.
+    """
     from deadpush import state
+    from tests.conftest import patch_guard_helper
 
     state_dir = tmp_path / "state"
     state_dir.mkdir(parents=True)
     monkeypatch.setattr(state, "HARDENED_STATE_DIR", state_dir)
     monkeypatch.setattr(state, "state_dir", lambda hardened=False: state_dir if hardened else Path.home() / ".deadpush")
     state.reset_migration_flags()
-    monkeypatch.setattr(guard, "_state_dir", lambda hardened=False: state.state_dir(hardened))
+
+    _state_fn = lambda hardened=False: state.state_dir(hardened)  # noqa: E731
+    patch_guard_helper(monkeypatch, "_state_dir", _state_fn, _hardened_mod)
+
     rid_fn = guard._repo_id
     if sys.platform == "darwin":
-        monkeypatch.setattr(
-            guard,
-            "_scoped_plist_path",
-            lambda r, hardened=False: state_dir
-            / f"com.deadpush.guardian.{rid_fn(str(r))}.plist",
-        )
+        _plist_fn = lambda r, hardened=False: state_dir / f"com.deadpush.guardian.{rid_fn(str(r))}.plist"  # noqa: E731
+        patch_guard_helper(monkeypatch, "_scoped_plist_path", _plist_fn, _hardened_mod)
     elif sys.platform.startswith("linux"):
-        monkeypatch.setattr(
-            guard,
-            "_scoped_systemd_unit_path",
-            lambda r, hardened=False: state_dir
-            / f"deadpush-guardian.{rid_fn(str(r))}.service",
-        )
+        _unit_fn = lambda r, hardened=False: state_dir / f"deadpush-guardian.{rid_fn(str(r))}.service"  # noqa: E731
+        patch_guard_helper(monkeypatch, "_scoped_systemd_unit_path", _unit_fn, _hardened_mod)
     return state_dir
 
 
 class TestEnsureDeadpushAccount:
     def test_skips_when_user_already_valid(self, monkeypatch):
-        monkeypatch.setattr(guard, "_deadpush_account_valid", lambda: True)
+        # Dual-patch: _ensure_deadpush_account calls hardened._deadpush_account_valid.
+        from tests.conftest import patch_guard_helper
+
+        patch_guard_helper(monkeypatch, "_deadpush_account_valid", lambda: True, _hardened_mod)
         lines: list[str] = []
         calls: list[list[str]] = []
 
@@ -66,10 +70,12 @@ class TestEnsureDeadpushAccount:
 
     def test_darwin_repairs_broken_user_with_separate_dscl_calls(self, monkeypatch):
         from types import SimpleNamespace
+        from tests.conftest import patch_guard_helper
 
         valid_checks = iter([False, True])
-        monkeypatch.setattr(guard, "_deadpush_account_valid", lambda: next(valid_checks))
-        monkeypatch.setattr(guard, "_find_free_system_id", lambda kind: "450")
+        _valid_fn = lambda: next(valid_checks)  # noqa: E731
+        patch_guard_helper(monkeypatch, "_deadpush_account_valid", _valid_fn, _hardened_mod)
+        patch_guard_helper(monkeypatch, "_find_free_system_id", lambda kind: "450", _hardened_mod)
 
         class FakeGrp:
             gr_gid = 449

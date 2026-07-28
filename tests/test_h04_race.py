@@ -12,6 +12,7 @@ from unittest.mock import patch
 import pytest
 
 from deadpush import guard as guard_mod
+from deadpush import hardened as hardened_mod
 from deadpush import state
 from deadpush.config import Config
 from deadpush.guard import GuardianHandler, QuarantineManager, setup_autostart
@@ -19,7 +20,13 @@ from deadpush.guard import GuardianHandler, QuarantineManager, setup_autostart
 
 @pytest.fixture
 def autostart_env(tmp_path, monkeypatch):
-    """Redirect autostart unit paths into tmp so tests do not litter ~/Library."""
+    """Redirect autostart unit paths into tmp so tests do not litter ~/Library.
+
+    Dual-patches facade + hardened (see ``patch_guard_helper``) because
+    ``setup_autostart`` resolves path helpers from hardened's module globals.
+    """
+    from tests.conftest import patch_guard_helper
+
     state_dir = tmp_path / "state"
     state_dir.mkdir(parents=True)
     monkeypatch.setattr(state, "HARDENED_STATE_DIR", state_dir)
@@ -27,20 +34,17 @@ def autostart_env(tmp_path, monkeypatch):
         state, "state_dir", lambda hardened=False: state_dir if hardened else Path.home() / ".deadpush"
     )
     state.reset_migration_flags()
-    monkeypatch.setattr(guard_mod, "_state_dir", lambda hardened=False: state.state_dir(hardened))
+
+    _state_fn = lambda hardened=False: state.state_dir(hardened)  # noqa: E731
+    patch_guard_helper(monkeypatch, "_state_dir", _state_fn, hardened_mod)
+
     rid_fn = guard_mod._repo_id
     if sys.platform == "darwin":
-        monkeypatch.setattr(
-            guard_mod,
-            "_scoped_plist_path",
-            lambda r, hardened=False: state_dir / f"com.deadpush.guardian.{rid_fn(str(r))}.plist",
-        )
+        _plist_fn = lambda r, hardened=False: state_dir / f"com.deadpush.guardian.{rid_fn(str(r))}.plist"  # noqa: E731
+        patch_guard_helper(monkeypatch, "_scoped_plist_path", _plist_fn, hardened_mod)
     elif sys.platform.startswith("linux"):
-        monkeypatch.setattr(
-            guard_mod,
-            "_scoped_systemd_unit_path",
-            lambda r, hardened=False: state_dir / f"deadpush-guardian.{rid_fn(str(r))}.service",
-        )
+        _unit_fn = lambda r, hardened=False: state_dir / f"deadpush-guardian.{rid_fn(str(r))}.service"  # noqa: E731
+        patch_guard_helper(monkeypatch, "_scoped_systemd_unit_path", _unit_fn, hardened_mod)
     return state_dir
 
 

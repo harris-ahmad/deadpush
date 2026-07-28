@@ -149,9 +149,10 @@ class TestHardenedHookInterpreter:
 # ---------------------------------------------------------------------------
 class TestControlServerAuth:
     def test_token_created_with_0600(self, tmp_path, monkeypatch):
+        import deadpush.control_plane as control_plane
         import deadpush.guard as guard
         tf = tmp_path / "control.token"
-        monkeypatch.setattr(guard, "_scoped_token_file", lambda r, h=False: tf)
+        monkeypatch.setattr(control_plane, "scoped_token_file", lambda r, h=False: tf)
         tok = guard._load_or_create_control_token(tmp_path, hardened=True)
         assert tok
         assert tf.exists()
