@@ -229,7 +229,12 @@ class GuardianControlHandler(BaseHTTPRequestHandler):
     def _handle_dashboard(self, subpath: str):
         handler = self._get_handler()
         if not handler:
-            return self._send_html("<h1>Guardian not ready</h1>", 503)
+            self.send_response(503)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(b"<h1>Guardian not ready</h1>")
+            return
 
         if subpath == "" or subpath == "/":
             feedback = self._read_feedback(limit=5)
