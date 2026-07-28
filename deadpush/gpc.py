@@ -105,6 +105,9 @@ class _ClientState:
     # Serializes sendall so broadcast and outbox drain cannot interleave bytes
     # on the same socket (NDJSON stream corruption).
     write_lock: threading.Lock = field(default_factory=threading.Lock)
+    # Per-connection message_ids already written — prevents broadcast+drain
+    # double delivery of the same durable event on one socket.
+    delivered_ids: set[str] = field(default_factory=set)
 
 
 class GpcServer:
@@ -217,10 +220,12 @@ class GpcServer:
         dead: list[int] = []
         with self._lock:
             for cid, state in self._clients.items():
-                if self._send_to_client(state, msg):
-                    delivered += 1
-                else:
+                result = self._send_to_client(state, msg)
+                if result == "error":
                     dead.append(cid)
+                else:
+                    # "sent" or "dup" — client already has / now has the message
+                    delivered += 1
             for cid in dead:
                 try:
                     self._clients[cid].conn.close()
@@ -229,14 +234,34 @@ class GpcServer:
                 self._clients.pop(cid, None)
         return delivered
 
-    def _send_to_client(self, state: _ClientState, msg: GpcMessage) -> bool:
+    def _prune_delivered_ids(self, state: _ClientState) -> None:
+        # Caller must hold state.write_lock.
+        if len(state.delivered_ids) <= 2000:
+            return
+        # Drop an arbitrary half; ACKed outbox entries are not re-drained, so
+        # forgetting old IDs cannot resurrect duplicates from the outbox.
+        for stale in list(state.delivered_ids)[:1000]:
+            state.delivered_ids.discard(stale)
+
+    def _send_to_client(self, state: _ClientState, msg: GpcMessage) -> str:
+        """Write one message to a client.
+
+        Returns ``"sent"`` on a new write, ``"dup"`` if this connection already
+        received ``message_id``, or ``"error"`` on socket failure.
+        """
+        mid = msg.message_id
         try:
-            payload = msg.to_line().encode("utf-8")
             with state.write_lock:
+                if mid and mid in state.delivered_ids:
+                    return "dup"
+                payload = msg.to_line().encode("utf-8")
                 state.conn.sendall(payload)
-            return True
+                if mid:
+                    state.delivered_ids.add(mid)
+                    self._prune_delivered_ids(state)
+            return "sent"
         except OSError:
-            return False
+            return "error"
 
     def _drain_outbox_to_client(self, state: _ClientState) -> int:
         pending = self._outbox.list_pending()
@@ -244,7 +269,7 @@ class GpcServer:
             return 0
         sent = 0
         for msg in pending:
-            if self._send_to_client(state, msg):
+            if self._send_to_client(state, msg) == "sent":
                 sent += 1
         if sent:
             self._outbox.mark_drained(sent)
