@@ -102,6 +102,9 @@ class _ClientState:
     connected_at: float
     last_heartbeat: float
     acks: set[str] = field(default_factory=set)
+    # Serializes sendall so broadcast and outbox drain cannot interleave bytes
+    # on the same socket (NDJSON stream corruption).
+    write_lock: threading.Lock = field(default_factory=threading.Lock)
 
 
 class GpcServer:
@@ -210,16 +213,13 @@ class GpcServer:
         msg = self._prepare(msg)
         if msg.type in DURABLE_TYPES:
             self._outbox.append(msg)
-        line = msg.to_line()
-        payload = line.encode("utf-8")
         delivered = 0
         dead: list[int] = []
         with self._lock:
             for cid, state in self._clients.items():
-                try:
-                    state.conn.sendall(payload)
+                if self._send_to_client(state, msg):
                     delivered += 1
-                except OSError:
+                else:
                     dead.append(cid)
             for cid in dead:
                 try:
@@ -231,7 +231,9 @@ class GpcServer:
 
     def _send_to_client(self, state: _ClientState, msg: GpcMessage) -> bool:
         try:
-            state.conn.sendall(msg.to_line().encode("utf-8"))
+            payload = msg.to_line().encode("utf-8")
+            with state.write_lock:
+                state.conn.sendall(payload)
             return True
         except OSError:
             return False
