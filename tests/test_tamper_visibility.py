@@ -15,6 +15,7 @@ from click.testing import CliRunner
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import deadpush.guard as guard  # noqa: E402
+import deadpush.guardian_lifecycle as _lifecycle  # noqa: E402
 from deadpush import config as dp_config  # noqa: E402
 from deadpush.cli import main  # noqa: E402
 
@@ -22,7 +23,9 @@ from deadpush.cli import main  # noqa: E402
 class TestKilledUncleanly:
     def test_stale_pidfile_with_dead_process_is_flagged(self, temp_repo: Path, monkeypatch):
         pidfile = temp_repo / "guardian.pid"
-        monkeypatch.setattr(guard, "_scoped_pidfile", lambda r, h=False: pidfile)
+        _pidfile_fn = lambda r, h=False: pidfile  # noqa: E731
+        monkeypatch.setattr(guard, "_scoped_pidfile", _pidfile_fn)
+        monkeypatch.setattr(_lifecycle, "_scoped_pidfile", _pidfile_fn)
 
         # No pidfile yet -> not "killed", just not running.
         assert guard.guardian_killed_uncleanly(temp_repo) is False
@@ -34,7 +37,9 @@ class TestKilledUncleanly:
 
     def test_clean_state_is_not_flagged(self, temp_repo: Path, monkeypatch):
         pidfile = temp_repo / "guardian.pid"
-        monkeypatch.setattr(guard, "_scoped_pidfile", lambda r, h=False: pidfile)
+        _pidfile_fn = lambda r, h=False: pidfile  # noqa: E731
+        monkeypatch.setattr(guard, "_scoped_pidfile", _pidfile_fn)
+        monkeypatch.setattr(_lifecycle, "_scoped_pidfile", _pidfile_fn)
         # No pidfile (clean stop removes it) -> not flagged as killed.
         assert guard.guardian_killed_uncleanly(temp_repo) is False
 
