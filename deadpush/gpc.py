@@ -483,7 +483,7 @@ class GpcClient:
                 "file": file,
                 "category": "mcp_proxy",
             },
-        ), keep_open=False)
+        ))
 
     def _send(self, msg: GpcMessage, *, keep_open: bool | None = None) -> bool:
         if keep_open is None:
