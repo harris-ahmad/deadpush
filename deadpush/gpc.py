@@ -251,10 +251,10 @@ class GpcServer:
         """
         mid = msg.message_id
         try:
-            payload = msg.to_line().encode("utf-8")
             with state.write_lock:
                 if mid and mid in state.delivered_ids:
                     return "dup"
+                payload = msg.to_line().encode("utf-8")
                 state.conn.sendall(payload)
                 if mid:
                     state.delivered_ids.add(mid)
