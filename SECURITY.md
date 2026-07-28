@@ -85,32 +85,27 @@ as an obstacle and attempting to remove it.
 
 ## Two modes, two very different guarantees
 
-deadpush runs in one of two modes. **The distinction is the single most important
-thing to understand about its security.**
+deadpush has one supported persistent mode (`--hardened`) and a sandbox mode for
+wrapped agent sessions. **The distinction is the single most important thing to
+understand about its security.**
 
-### Soft mode (default) — deterrence, not a boundary
+**Recommended:** `deadpush protect --hardened` for persistent repos;
+`deadpush run --sandbox -- <cmd>` for wrapped agent sessions.
 
-Everything runs as **your user**: the daemon, the hooks, and the policy files under
-the in-repo `.deadpush/` directory. A same-UID agent can, in principle, do anything
-you can do — including editing `.deadpush/rules.json` to disable a guardrail,
-deleting the install marker, clearing a user-immutable (`uchg`) hook, or killing
-the daemon.
+### Same-UID mode — unsupported, CI escape hatch only
 
-Soft mode is therefore **deterrence and accident-prevention**: it reliably catches
-the overwhelmingly common case (an agent doing something dangerous *without trying
-to evade the guard*), and it makes deliberate evasion noisy and inconvenient. It is
-**not** a hard security boundary against a determined same-UID adversary, and it is
-not marketed as one.
+> **Same-UID guardian (`--no-root`) is not a supported configuration.** It exists
+> solely as a hidden CI escape hatch (`deadpush protect --no-root` /
+> `deadpush guard --no-root`) for environments where creating the `_deadpush` system
+> user is impossible. Do **not** rely on it for real protection.
 
-In particular, a same-UID agent can **kill the daemon** (`pkill`, `launchctl
-unload`, …). Soft mode cannot prevent this — no user-privileged process can stop
-another process at the same privilege from being killed. What soft mode does is make
-a kill **loud instead of silent**: the shadow process respawns the guardian, the
-restart is logged as a possible-tamper event, and `deadpush status` / `deadpush
-doctor` report a killed guardian (a stale PID file with no live process) distinctly
-from a clean stop. To make the guardian genuinely unkillable by a same-UID agent,
-use hardened mode; to make a kill *irrelevant* to what actually ships, use the
-server-side check.
+When running same-UID, the daemon, hooks, and policy files all run as your user. A
+same-UID agent can do anything you can — kill the daemon, edit `.deadpush/rules.json`,
+or clear a user-immutable hook. Same-UID mode provides no security boundary against
+a determined same-UID adversary.
+
+For agent sessions that do not warrant an elevated install, use
+`deadpush run --sandbox -- <cmd>` (T2 sandbox) instead.
 
 ### Hardened mode — a real same-UID boundary
 
@@ -124,7 +119,7 @@ Hardened mode provides:
 
 - **Root-immutable hooks.** Hooks are locked with `chflags schg` (macOS) /
   `chattr +i` (Linux). Only root can clear the flag, so the agent cannot delete or
-  rewrite a hook. (Soft mode uses owner-clearable `uchg`.)
+  rewrite a hook. (Without hardened mode, hooks use owner-clearable `uchg`.)
 - **A root-owned interpreter for hooks.** Hooks execute
   `/var/db/deadpush/venv/bin/python` (owned by `_deadpush`, not user-writable), so
   the agent cannot neuter enforcement by editing the `deadpush` package it runs —
@@ -180,8 +175,8 @@ promise. Treat deadpush as **defense-in-depth**, never as your only control.
   update). Content that is added and then removed **within** a single pushed range
   is not surfaced by the diff, though the commits still ship. History review /
   server-side scanning covers this.
-- **Soft mode is not a boundary** (see above). If you need a real same-UID
-  boundary, use hardened mode.
+- **Same-UID mode (`--no-root`) is not a boundary** (see above). For a real
+  same-UID boundary use `--hardened`; for confined agent sessions use `deadpush run --sandbox`.
 - **deadpush is not a secrets manager or SAST suite.** It reduces the blast radius
   of agent mistakes; it does not replace secret rotation, least-privilege
   credentials, dependency auditing, or human code review.

@@ -254,9 +254,10 @@ def main() -> None:
     parser.add_argument("--simulate-agent", action="store_true", help="Write dangerous test files")
     parser.add_argument("--burst", action="store_true", help="Burst of bad writes")
     parser.add_argument(
-        "--soft",
+        "--no-root",
         action="store_true",
-        help="Run protect in --soft (same-UID) mode; required in CI where the "
+        dest="no_root",
+        help="Run protect in --no-root (same-UID) mode; required in CI where the "
              "hardened _deadpush user cannot be created",
     )
     parser.add_argument("--no-clean", action="store_true", help="Leave guardian running and sandbox in place")
@@ -298,10 +299,10 @@ def main() -> None:
 
     results: dict[str, bool] = {}
 
-    soft_args = ["--soft"] if args.soft else []
+    no_root_args = ["--no-root"] if args.no_root else []
 
     print("\n=== 1. deadpush protect ===")
-    protect_res = deadpush_cmd("protect", *soft_args, repo=repo)
+    protect_res = deadpush_cmd("protect", *no_root_args, repo=repo)
     # protect now exits non-zero if protection is incomplete — treat that as a failure.
     results["protect"] = protect_res.returncode == 0
     if protect_res.returncode != 0:
@@ -324,7 +325,7 @@ def main() -> None:
         (sandbox / name).write_text("# prep\n")
 
     print("\n=== 3. deadpush protect --daemon ===")
-    daemon_res = deadpush_cmd("protect", "--daemon", *soft_args, repo=repo)
+    daemon_res = deadpush_cmd("protect", "--daemon", *no_root_args, repo=repo)
     results["daemon_start"] = daemon_res.returncode == 0
     if daemon_res.returncode != 0:
         print(f"[daemon] exit={daemon_res.returncode}")

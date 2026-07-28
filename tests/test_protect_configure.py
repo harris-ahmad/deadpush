@@ -34,7 +34,7 @@ def test_protect_calls_configure_all_by_default(temp_repo: Path):
          patch("deadpush.hooks.merge_guardian_ignore_files"), \
          patch("deadpush.hooks.setup_github_guard_action", return_value=None):
         result = runner.invoke(
-            main, ["protect", "--repo", str(temp_repo)], catch_exceptions=False,
+            main, ["protect", "--no-root", "--repo", str(temp_repo)], catch_exceptions=False,
         )
 
     assert result.exit_code == 0
@@ -63,7 +63,7 @@ def test_protect_no_configure_skips_proxy_wrap(temp_repo: Path):
          patch("deadpush.hooks.merge_guardian_ignore_files"), \
          patch("deadpush.hooks.setup_github_guard_action", return_value=None):
         result = runner.invoke(
-            main, ["protect", "--repo", str(temp_repo), "--no-configure"],
+            main, ["protect", "--no-root", "--repo", str(temp_repo), "--no-configure"],
             catch_exceptions=False,
         )
 
@@ -85,7 +85,7 @@ def test_protect_records_bootstrap_manifest(temp_repo: Path):
          patch("deadpush.hooks.setup_github_guard_action", return_value=None), \
          patch("deadpush.configure.configure_all_ides", return_value={"configured": [], "skipped": []}):
         result = runner.invoke(
-            main, ["protect", "--repo", str(temp_repo)], catch_exceptions=False,
+            main, ["protect", "--no-root", "--repo", str(temp_repo)], catch_exceptions=False,
         )
 
     assert result.exit_code == 0
