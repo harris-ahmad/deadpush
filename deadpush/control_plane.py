@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import logging
 import os
@@ -648,7 +649,7 @@ class GuardianControlServer:
                 self.logger.info(f"Local control interface started: http://127.0.0.1:{self.port} (for AI agents)")
                 return
             except OSError as e:
-                if e.errno == 48:  # Address already in use
+                if e.errno == errno.EADDRINUSE:
                     self.logger.warning(f"Port {candidate} in use, trying next...")
                     continue
                 else:
