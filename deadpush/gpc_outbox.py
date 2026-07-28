@@ -79,7 +79,6 @@ class GpcOutbox:
             "payload": msg.payload,
             "protocol_version": msg.protocol_version,
         }
-        line = json.dumps(record, default=str, separators=(",", ":"))
         with self._lock:
             pending = self._read_pending_unlocked()
             if any(e["message_id"] == msg.message_id for e in pending):
@@ -96,8 +95,6 @@ class GpcOutbox:
             self._stats.appended += 1
 
     def list_pending(self) -> list["GpcMessage"]:
-        from .gpc import GpcMessage
-
         with self._lock:
             return [self._record_to_message(r) for r in self._read_pending_unlocked()]
 
