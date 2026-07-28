@@ -7,7 +7,7 @@
 **Your personal AI Agent Guardian.**  
 Protects you from the mistakes, secrets, and context pollution that AI coding agents (Claude, Cursor, Windsurf, etc.) inevitably create — even when you're not watching.
 
-Run it once with `deadpush protect --daemon` and it runs in the background forever, monitoring your filesystem in real time.
+Run it once with `deadpush protect --hardened --daemon` and it runs in the background forever, monitoring your filesystem in real time.
 
 ---
 
@@ -27,7 +27,9 @@ You tell your agent to "add the new feature" and walk away.
 
 ```bash
 pip install deadpush
-deadpush protect --daemon
+deadpush protect --hardened   # elevated install (recommended)
+# or for wrapped agent sessions only:
+deadpush run --sandbox -- <agent-cmd>
 ```
 
 That's it.
@@ -44,7 +46,7 @@ While you're at the gym, in a meeting, or sleeping, deadpush is on duty.
 ## See It In Action
 
 ```bash
-# After running protect --daemon, try simulating an agent:
+# After running protect --hardened --daemon, try simulating an agent:
 mkdir -p .deadpush-e2e-sandbox
 touch .deadpush-e2e-sandbox/claude.md
 echo 'OPENAI_API_KEY=sk-...' > .deadpush-e2e-sandbox/.env.bad
@@ -67,12 +69,12 @@ deadpush uses explicit tiers so you know what is **proven** vs **heuristic**. Fu
 
 | Tier | Command | What it guarantees |
 |------|---------|-------------------|
-| **T0 Deter** | `deadpush protect --daemon` | Accident prevention, loud tamper logs |
 | **T1 Harden** | `deadpush protect --hardened` | Agent cannot kill guardian, edit policy, or tamper hooks |
 | **T2 Sandbox** | `deadpush run --sandbox -- …` | Confined agent I/O + git/MCP gates |
 | **T3 Ship** | GitHub Action + branch protection | Violations cannot merge (uncircumventable) |
 
-**Recommended default:** T0 locally + [T3 on GitHub](docs/github-setup.md) (5-minute setup).
+**Recommended:** `deadpush protect --hardened` (T1) locally + [T3 on GitHub](docs/github-setup.md).
+For agent sessions without an elevated install: `deadpush run --sandbox -- <cmd>` (T2).
 
 ## Key Features
 
@@ -87,9 +89,8 @@ deadpush uses explicit tiers so you know what is **proven** vs **heuristic**. Fu
 ## Commands You'll Actually Use
 
 ```bash
-deadpush protect --daemon     # T0: one command per repo
-deadpush protect --hardened   # T1: unkillable guardian (requires sudo)
-deadpush run --sandbox -- …   # T2: sandboxed agent session
+deadpush protect --hardened   # T1: unkillable guardian (requires sudo) — recommended
+deadpush run --sandbox -- …   # T2: sandboxed agent session (no install needed)
 deadpush mcp-proxy -- …       # Wrap MCP servers with guardrails
 deadpush status               # Safety Score + guardian health
 deadpush quarantine list      # See what it caught
@@ -113,7 +114,7 @@ deadpush is the missing safety net.
 pip install deadpush
 ```
 
-Then run `deadpush protect --daemon` in any repo you care about.
+Then run `deadpush protect --hardened --daemon` in any repo you care about.
 
 ## Windows Users
 

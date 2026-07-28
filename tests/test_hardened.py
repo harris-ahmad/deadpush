@@ -110,15 +110,11 @@ class TestEnsureDeadpushAccount:
 class TestStateDir:
     def test_default_is_home_dot_deadpush(self):
         assert guard._state_dir() == Path.home() / ".deadpush"
-        assert not guard._is_hardened()
 
     def test_hardened_returns_var_db(self):
-        assert guard._is_hardened(hardened=True)
         assert guard._state_dir(hardened=True) == guard._HARDENED_STATE_DIR
 
-    def test_is_hardened_idempotent(self):
-        assert guard._is_hardened(hardened=True)
-        assert guard._is_hardened(hardened=True)
+    def test_state_dir_hardened_is_var_db(self):
         assert guard._state_dir(hardened=True) == Path("/var/db/deadpush")
 
 
@@ -274,10 +270,6 @@ class TestSetupAutostartHardened:
         assert "--daemon" in text
         assert "--hardened" in text
 
-    def test_sets_state_dir(self, tmp_path, hardened_env):
-        guard.setup_autostart(tmp_path, hardened=True)
-        assert guard._is_hardened(hardened=True)
-
     def test_unit_has_working_directory(self, tmp_path, hardened_env):
         guard.setup_autostart(tmp_path, hardened=True)
         text = guard._scoped_systemd_unit_path(tmp_path, hardened=True).read_text()
@@ -328,7 +320,6 @@ class TestMcpHardened:
 
         with pytest.raises((AttributeError, TypeError, RuntimeError)):
             run_mcp()
-        assert guard._is_hardened(hardened=True)
 
     def test_explicit_hardened_flag(self, temp_repo, monkeypatch, hardened_env):
         import os
@@ -341,7 +332,6 @@ class TestMcpHardened:
 
         with pytest.raises((AttributeError, TypeError, RuntimeError)):
             run_mcp(hardened=True)
-        assert guard._is_hardened(hardened=True)
 
     def test_default_no_hardened_detection(self, temp_repo, monkeypatch):
         import os
@@ -354,7 +344,6 @@ class TestMcpHardened:
 
         with pytest.raises((AttributeError, TypeError, RuntimeError)):
             run_mcp()
-        assert not guard._is_hardened(hardened=False)
 
 
 class TestTeardownHardenedEnvironment:

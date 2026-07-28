@@ -76,7 +76,7 @@ class TestGuardCLI:
         monkeypatch.setattr("deadpush.guard.WATCHDOG_AVAILABLE", False)
         monkeypatch.chdir(dev_repo)
         runner = CliRunner()
-        result = runner.invoke(main, ["guard"])
+        result = runner.invoke(main, ["guard", "--no-root"])
         assert result.exit_code == 0
         assert "watchdog" in result.output.lower()
 
@@ -84,18 +84,18 @@ class TestGuardCLI:
         monkeypatch.setattr("deadpush.guard.WATCHDOG_AVAILABLE", False)
         monkeypatch.chdir(dev_repo)
         runner = CliRunner()
-        result = runner.invoke(main, ["guard", "--daemon", "--allow-self-protect"])
+        result = runner.invoke(main, ["guard", "--daemon", "--allow-self-protect", "--no-root"])
         assert result.exit_code == 0
 
     def test_protect_refused_on_dev_repo(self, dev_repo: Path, monkeypatch):
         monkeypatch.chdir(dev_repo)
         runner = CliRunner()
-        result = runner.invoke(main, ["protect"])
+        result = runner.invoke(main, ["protect", "--no-root"])
         assert result.exit_code == 2
         assert "Refusing to protect" in result.output
 
-    def test_intercept_daemon_refused(self, dev_repo: Path, monkeypatch):
+    def test_guard_daemon_refused(self, dev_repo: Path, monkeypatch):
         monkeypatch.chdir(dev_repo)
         runner = CliRunner()
-        result = runner.invoke(main, ["intercept", "--daemon"])
+        result = runner.invoke(main, ["guard", "--daemon", "--no-root"])
         assert result.exit_code == 2

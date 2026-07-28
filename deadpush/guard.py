@@ -78,10 +78,6 @@ def _scoped_systemd_unit_path(repo_root: Path, hardened: bool = False) -> Path:
     return _state.scoped_systemd_unit_path(repo_root, hardened)
 
 
-def _is_hardened(hardened: bool = False) -> bool:
-    return hardened
-
-
 # ---------------------------------------------------------------------------
 # Re-exports from sub-modules (noqa: F401 — these are the public facade API)
 # ---------------------------------------------------------------------------
@@ -89,10 +85,8 @@ def _is_hardened(hardened: bool = False) -> bool:
 # control_plane
 from .control_plane import _load_or_create_control_token  # noqa: E402, F401
 from .control_plane import (  # noqa: E402, F401
-    DASHBOARD_HTML,
     GuardianControlHandler,
     GuardianControlServer,
-    ThreadedHTTPServer,
 )
 
 # quarantine
@@ -131,12 +125,6 @@ from .guardian_handler import GuardianHandler  # noqa: E402, F401
 # guardian_lifecycle
 from .guardian_lifecycle import (  # noqa: E402, F401
     DaemonManager,
-    setup_logging,
-    _SHADOW_SCRIPT,
-    _SHADOW_TAG_PREFIX,
-    _shadow_tag,
-    start_shadow_process,
-    stop_shadow_for_repo,
     stop_guardian_for_repo,
     stop_guardian_by_id,
     kill_orphan_guardian_processes,
@@ -158,16 +146,11 @@ __all__ = [
     "WATCHDOG_AVAILABLE",
     "QuarantineManager",
     "SessionSafetyScore",
-    "ThreadedHTTPServer",
-    "DASHBOARD_HTML",
     "GuardianControlHandler",
     "GuardianControlServer",
     "GuardianHandler",
     "DaemonManager",
-    "setup_logging",
     "run_guardian",
-    "start_shadow_process",
-    "stop_shadow_for_repo",
     "stop_guardian_for_repo",
     "stop_guardian_by_id",
     "kill_orphan_guardian_processes",

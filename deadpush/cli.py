@@ -50,8 +50,7 @@ def main():
 @click.option("--no-intervention", is_flag=True, help="Warning mode only (no blocking/quarantine)")
 @click.option("--daemon", is_flag=True, help="Run as background daemon")
 @click.option("--strict", is_flag=True, help="Enable strict intervention mode")
-@click.option("--soft", is_flag=True, help="Run as your own UID (this is the default)")
-@click.option("--hardened", is_flag=True, help="Opt into hardened mode: run under a root-owned _deadpush user (requires sudo)")
+@click.option("--hardened", is_flag=True, help="Hardened mode: run under a root-owned _deadpush user (requires sudo)")
 @click.option(
     "--allow-self-protect",
     is_flag=True,
@@ -62,34 +61,39 @@ def main():
     is_flag=True,
     help="Disable Linux fanotify pre-write deny in the guardian (watchdog-only)",
 )
-def cmd_guard(repo, no_intervention, daemon, strict, soft, hardened, allow_self_protect, no_fanotify):
+@click.option("--no-root", is_flag=True, hidden=True,
+              help="Same-UID guardian (unsupported; CI/dev only)")
+def cmd_guard(repo, no_intervention, daemon, strict, hardened, allow_self_protect, no_fanotify, no_root):
     """
     Start the AI Agent Guardian.
 
-    This is the core always-on protection while using AI coding agents.
+    Requires elevated install (`deadpush protect --hardened`) or the hidden
+    `--no-root` escape hatch for CI/dev environments.
     """
     from .config import dev_repo_guard_refusal
     from .guard import run_guardian
     import os
     intervention = not no_intervention
-    if soft and hardened:
-        print_error("Cannot use --soft with --hardened")
-        return
-    # Soft (same-UID) is the default; hardened (privilege separation, sudo) is opt-in.
-    use_hardened = bool(hardened)
     if repo:
         os.chdir(Path(repo).resolve())
     config = load_config()
     refusal = dev_repo_guard_refusal(
         config.repo_root,
         allow_self_protect=allow_self_protect,
-        persistent=bool(daemon or use_hardened),
+        persistent=bool(daemon or hardened),
     )
     if refusal:
         print_error(refusal.split("\n")[0])
         for line in refusal.split("\n")[1:]:
             print(line)
         raise SystemExit(2)
+    if not hardened and not no_root:
+        print_error("deadpush guard requires an elevated install.")
+        print_error("  Install with:  deadpush protect --hardened")
+        print_error("  Or sandbox:    deadpush run --sandbox -- <cmd>")
+        print_error("  CI/dev only:   deadpush guard --no-root  (same-UID, unsupported)")
+        raise SystemExit(2)
+    use_hardened = bool(hardened)
     run_guardian(
         intervention=intervention,
         daemon=daemon,
@@ -105,8 +109,7 @@ def cmd_guard(repo, no_intervention, daemon, strict, soft, hardened, allow_self_
               help="Repo root to protect (default: auto-detect from cwd)")
 @click.option("--enable", is_flag=True, help="Enable persistent background guardian (auto-starts daemon after setup)")
 @click.option("--daemon", is_flag=True, help="Start the guardian as a persistent background daemon after performing full setup")
-@click.option("--soft", is_flag=True, help="Same-UID guardian at your own privileges (this is the default)")
-@click.option("--hardened", is_flag=True, help="Opt into hardened mode: privilege separation via a root-owned _deadpush user (requires sudo)")
+@click.option("--hardened", is_flag=True, help="Hardened mode: privilege separation via a root-owned _deadpush user (requires sudo)")
 @click.option(
     "--allow-self-protect",
     is_flag=True,
@@ -122,7 +125,9 @@ def cmd_guard(repo, no_intervention, daemon, strict, soft, hardened, allow_self_
     is_flag=True,
     help="Disable Linux fanotify pre-write deny in the guardian (watchdog-only)",
 )
-def cmd_protect(repo, enable, daemon, soft, hardened, allow_self_protect, no_configure, no_fanotify):
+@click.option("--no-root", is_flag=True, hidden=True,
+              help="Same-UID guardian (unsupported; CI/dev only)")
+def cmd_protect(repo, enable, daemon, hardened, allow_self_protect, no_configure, no_fanotify, no_root):
     """
     One-command setup to protect your vibe coding workflow.
 
@@ -149,13 +154,14 @@ def cmd_protect(repo, enable, daemon, soft, hardened, allow_self_protect, no_con
             print(line)
         raise SystemExit(2)
 
-    start_background = bool(enable or daemon)
-    if soft and hardened:
-        print_error("Cannot use --soft with --hardened")
+    if not hardened and not no_root:
+        print_error("deadpush protect requires an elevated install.")
+        print_error("  Use:     deadpush protect --hardened  (privilege separation via _deadpush user)")
+        print_error("  Or:      deadpush run --sandbox -- <cmd>  (confined agent session, no install)")
+        print_error("  CI only: deadpush protect --no-root  (same-UID, unsupported outside CI/dev)")
         raise SystemExit(2)
-    # Soft (same-UID) is the default so the documented `pip install deadpush &&
-    # deadpush protect --daemon` one-liner never silently requires sudo. Hardened
-    # mode (privilege separation via a root-owned _deadpush user) is opt-in.
+
+    start_background = bool(enable or daemon)
     use_hardened = bool(hardened)
 
     # Track failures that make protection incomplete. A production install must
@@ -173,12 +179,13 @@ def cmd_protect(repo, enable, daemon, soft, hardened, allow_self_protect, no_con
         except Exception as e:
             print_error(f"Hardened environment setup failed: {e}")
             print_error("Try running with sudo directly, or check system logs.")
-            print_error("Nothing was protected. Re-run `deadpush protect` after fixing the above,")
-            print_error("or use `deadpush protect --soft` for a same-UID (dev-only) guardian.")
+            print_error("Nothing was protected. Re-run `deadpush protect --hardened` after fixing the above.")
+            print_error("Or use `deadpush run --sandbox -- <cmd>` for confined agent sessions.")
             raise SystemExit(1)
-    elif start_background:
-        print_warning("Running in soft mode (default): the guardian runs at your UID, so an "
-                      "agent could kill it. Use `--hardened` for a root-backed boundary (requires sudo).")
+    elif start_background and no_root:
+        print_warning("Running in same-UID mode (--no-root): the guardian runs at your UID, so an "
+                      "agent could kill it. This is unsupported outside CI/dev. "
+                      "Use `--hardened` for a root-backed boundary (requires sudo).")
 
     print_header("deadpush Protect", "One-command setup for AI Agent Guardian (persistent background protection)")
 
@@ -277,14 +284,6 @@ def cmd_protect(repo, enable, daemon, soft, hardened, allow_self_protect, no_con
     if start_background:
         print("Starting AI Agent Guardian in persistent background (daemon) mode...")
         print("  (Survives terminal close/logout. Use `deadpush status` to inspect.)")
-
-        # Ensure directories for feedback and quarantine
-        try:
-            from .intercept import FEEDBACK_DIR, QUARANTINE_DIR
-            for d in [FEEDBACK_DIR, QUARANTINE_DIR]:
-                (config.repo_root / d).mkdir(parents=True, exist_ok=True)
-        except Exception:
-            pass
 
         # Auto-start helpers for reboot survival (AGENT priority 2)
         if not use_hardened:
@@ -878,47 +877,6 @@ def cmd_scan(base, head, scan_all, ref, repo, fmt):
 
     sys.exit(1 if violations else 0)
 
-
-@main.command("intercept")
-@click.option("--daemon", is_flag=True, help="Run as persistent background daemon")
-@click.option(
-    "--allow-self-protect",
-    is_flag=True,
-    help="Allow a persistent guardian on the deadpush source repo (not recommended)",
-)
-@click.option(
-    "--no-fanotify",
-    is_flag=True,
-    help="Disable Linux fanotify pre-write deny in the guardian (watchdog-only)",
-)
-def cmd_intercept(daemon, allow_self_protect, no_fanotify):
-    """Start the file interception daemon (alias for `deadpush guard`).
-
-    Uses the watchdog-based guardian to monitor all file writes and
-    enforce guardrails. The staging-based intercept has been removed;
-    the guardian daemon covers every write through the filesystem.
-    """
-    from .config import dev_repo_guard_refusal
-    from .guard import run_guardian
-
-    config = load_config()
-    refusal = dev_repo_guard_refusal(
-        config.repo_root,
-        allow_self_protect=allow_self_protect,
-        persistent=daemon,
-    )
-    if refusal:
-        print_error(refusal.split("\n")[0])
-        for line in refusal.split("\n")[1:]:
-            print(line)
-        raise SystemExit(2)
-    run_guardian(
-        intervention=True,
-        daemon=daemon,
-        strict=False,
-        allow_self_protect=allow_self_protect,
-        enable_fanotify=not no_fanotify,
-    )
 
 
 @main.command("mcp-proxy")
@@ -1941,10 +1899,11 @@ def cmd_doctor(repo, hardened):
     return 0 if all_ok else 1
 
 
-@main.command("init")
-@click.option("--mode", type=click.Choice(["default", "hardened"]), default="default", help="Protection mode: default (user-level) or hardened (privilege separation)")
+@main.command("init", hidden=True)
+@click.option("--mode", type=click.Choice(["default", "hardened"]), default="default",
+              help="Protection mode (only 'hardened' is supported; 'default' is removed)")
 @click.option("--daemon/--no-daemon", default=True, help="Start guardian daemon after setup")
-@click.option("--force", is_flag=True, help="Skip confirmations")
+@click.option("--force", is_flag=True, hidden=True)
 @click.option(
     "--allow-self-protect",
     is_flag=True,
@@ -1956,178 +1915,25 @@ def cmd_doctor(repo, hardened):
     help="Disable Linux fanotify pre-write deny in the guardian (watchdog-only)",
 )
 def cmd_init(mode, daemon, force, allow_self_protect, no_fanotify):
-    """Guided first-time setup for deadpush.
-
-    Walks through:
-    1. Detects OS and repo
-    2. Chooses protection mode (default vs hardened)
-    3. Installs git hooks (pre-push, pre-commit, post-commit)
-    4. Updates smart ignore files (.cursorignore, .claudeignore, .gitignore)
-    5. Sets up GitHub Actions guard (optional)
-    6. Generates autostart config (launchd/systemd)
-    7. Starts guardian daemon (optional)
-    8. Runs health check (doctor)
-
-    Run this once per repo, then walk away.
-    """
-    from .config import dev_repo_guard_refusal, load_config
-    from .guard import setup_autostart, setup_hardened_environment, run_guardian
-    from .hooks import (
-        install_hook, install_precommit_hook, install_postcommit_hook,
-        verify_hooks_installed, setup_mcp_discovery, setup_github_guard_action
-    )
-
-    config = load_config()
-    repo_root = config.repo_root
-
-    refusal = dev_repo_guard_refusal(
-        repo_root,
-        allow_self_protect=allow_self_protect,
-        full_setup=True,
-    )
-    if refusal:
-        print_error(refusal.split("\n")[0])
-        for line in refusal.split("\n")[1:]:
-            print(line)
+    """[Deprecated] Use: deadpush protect --hardened [--daemon]"""
+    print_warning("`deadpush init` is deprecated. Use: deadpush protect --hardened [--daemon]")
+    if mode != "hardened":
+        print_error("Non-hardened init was removed. Elevated install is required.")
+        print_error("  Use:  deadpush protect --hardened")
+        print_error("  Or:   deadpush run --sandbox -- <cmd>  (confined agent session)")
         raise SystemExit(2)
-
-    print_header("deadpush Init", f"Guided setup for {repo_root.name}")
-    print(f"Mode: {mode}")
-    print(f"Daemon: {'yes' if daemon else 'no'}")
-    print()
-
-    if not force:
-        confirm = input(f"Initialize deadpush ({mode}) for {repo_root}? [Y/n]: ")
-        if confirm.lower() == "n":
-            print("Aborted.")
-            return
-
-    # 1. Install git hooks
-    print("\n[1/7] Installing git hooks...")
-    try:
-        install_hook(repo_root)
-        print("  pre-push hook installed")
-    except Exception as e:
-        print_warning(f"pre-push hook issue: {e}")
-    try:
-        install_precommit_hook(repo_root)
-        print("  pre-commit hook installed")
-    except Exception as e:
-        print_warning(f"pre-commit hook issue: {e}")
-    try:
-        install_postcommit_hook(repo_root)
-        print("  post-commit hook installed (catches --no-verify bypass)")
-    except Exception as e:
-        print_warning(f"post-commit hook issue: {e}")
-
-    try:
-        problems = verify_hooks_installed(repo_root)
-        if problems:
-            print_warning(f"Hook verification issues: {', '.join(problems)}")
-        else:
-            print_success("  All git guardrail hooks verified (checksums OK)")
-    except Exception as e:
-        print_warning(f"Hook verification skipped: {e}")
-
-    try:
-        setup_mcp_discovery(repo_root)
-        print("  Agent auto-discovery configured (.cursor/mcp.json, .vscode/mcp.json)")
-    except Exception as e:
-        print_warning(f"MCP discovery setup issue: {e}")
-
-    # 2. GitHub Actions guard
-    print("\n[2/7] Setting up GitHub Actions guard...")
-    try:
-        action_path = setup_github_guard_action(repo_root)
-        if action_path:
-            print(f"  Created {action_path}")
-    except Exception as e:
-        print_warning(f"GitHub Action guard setup issue: {e}")
-
-    # 3. Guardian ignore files
-    print("\n[3/7] Updating guardian ignore files...")
-    try:
-        from .hooks import merge_guardian_ignore_files
-        merge_guardian_ignore_files(repo_root)
-        print_success("  Guardian ignore patterns merged/updated")
-    except Exception as e:
-        print_warning(f"  Ignore file update skipped: {e}")
-
-    # 4. Hardened setup or autostart
-    print("\n[4/7] Configuring persistence...")
-    if mode == "hardened":
-        print("  Setting up hardened environment (requires sudo)...")
-        try:
-            summary = setup_hardened_environment(repo_root, auto_load=daemon)
-            print(summary)
-        except Exception as e:
-            print_error(f"Hardened setup failed: {e}")
-            print_warning("Try running with sudo directly: sudo deadpush init --mode hardened")
-            return 1
-        # Hooks were installed above as user-immutable. Now that privilege
-        # separation (and a cached sudo credential) is in place, re-lock them
-        # root-immutable (schg) so a same-UID agent cannot delete or modify them.
-        try:
-            install_hook(repo_root, system=True)
-            install_precommit_hook(repo_root, system=True)
-            install_postcommit_hook(repo_root, system=True)
-            print_success("  Git hooks locked root-immutable (schg).")
-        except Exception as e:
-            print_warning(f"  Could not lock hooks root-immutable: {e}")
-    else:
-        try:
-            autostart_info = setup_autostart(
-                repo_root, hardened=False, enable_fanotify=not no_fanotify,
-            )
-            if autostart_info:
-                print(autostart_info)
-        except Exception as e:
-            print_warning(f"Autostart helper skipped: {e}")
-
-    # 5. Start daemon if requested
-    if daemon:
-        print("\n[5/7] Starting guardian daemon...")
-        if mode == "hardened":
-            print_success("Hardened guardian already loaded via launchd")
-        else:
-            try:
-                run_guardian(
-                    intervention=True,
-                    daemon=True,
-                    strict=False,
-                    allow_self_protect=allow_self_protect,
-                    enable_fanotify=not no_fanotify,
-                )
-            except SystemExit:
-                pass
-            except Exception as e:
-                print_warning(f"Daemon launch issue: {e}")
-
-    # 6. Health check
-    print("\n[6/7] Running health check...")
-    from .cli import cmd_doctor
-    try:
-        ctx = click.get_current_context()
-        ctx.invoke(cmd_doctor, hardened=(mode == "hardened"))
-    except Exception as e:
-        print_warning(f"Health check failed: {e}")
-
-    # 7. Summary
-    print("\n[7/7] Setup complete!")
-    print_success(f"deadpush ({mode}) initialized for {repo_root.name}")
-    print()
-    print("Next steps:")
-    if daemon:
-        print("  Guardian is running in background. Use 'deadpush status' to check.")
-    else:
-        print("  Start guardian with: deadpush protect --daemon")
-    print("  Configure your AI agent to use: deadpush mcp")
-    print("  T2 sandbox sessions: deadpush run --sandbox -- <agent-cmd>")
-    print("  MCP proxy: deadpush mcp-proxy -- <mcp-server-cmd>")
-    print("  Guarantee tiers: docs/guarantees.md")
-    print("  View dashboard at: http://127.0.0.1:<port>/dashboard")
-
-    return 0
+    ctx = click.get_current_context()
+    ctx.invoke(
+        cmd_protect,
+        repo=None,
+        enable=False,
+        daemon=daemon,
+        hardened=True,
+        allow_self_protect=allow_self_protect,
+        no_configure=False,
+        no_fanotify=no_fanotify,
+        no_root=False,
+    )
 
 if __name__ == "__main__":
     main()
