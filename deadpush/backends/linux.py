@@ -12,7 +12,7 @@ from ctypes import Structure, c_int32, c_uint32, c_uint64, c_uint8, c_uint16
 from pathlib import Path
 from typing import Any, Callable
 
-from .base import EnforcementBackend, logger
+from .base import EnforcementBackend, SandboxCapabilities, logger
 
 # fanotify constants (Linux uapi)
 FAN_CLASS_CONTENT = 0x00000004
@@ -149,6 +149,12 @@ class LinuxEnforcementBackend(EnforcementBackend):
     name = "linux-fanotify"
     tier = "T2-max"
 
+    _CAPABILITIES = SandboxCapabilities(
+        os_confinement=False,
+        write_allowlist=False,
+        content_deny=True,
+    )
+
     def __init__(
         self,
         repo_root: Path,
@@ -163,6 +169,10 @@ class LinuxEnforcementBackend(EnforcementBackend):
         self._on_deny = on_deny
         self._deny_count = 0
         self._allow_count = 0
+
+    @property
+    def capabilities(self) -> SandboxCapabilities:
+        return self._CAPABILITIES
 
     @property
     def is_active(self) -> bool:
@@ -305,10 +315,12 @@ class LinuxEnforcementBackend(EnforcementBackend):
     def describe(self) -> dict:
         d = super().describe()
         d.update({
-            "os_sandbox": self.available(),
             "repo_root": str(self.repo_root),
             "deny_count": self._deny_count,
             "allow_count": self._allow_count,
-            "note": "Content-aware FAN_DENY via enforce_content(); requires CAP_SYS_ADMIN.",
+            "note": (
+                "Content-aware FAN_DENY via enforce_content(); requires CAP_SYS_ADMIN. "
+                "Child process is not jailed — outside-repo writes are not confined."
+            ),
         })
         return d

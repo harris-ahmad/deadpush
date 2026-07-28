@@ -945,7 +945,8 @@ def cmd_run(sandbox, hardened, backend, repo, no_gpc, cmd):
         raise SystemExit(2)
 
     backend_name = info["backend"]["name"]
-    print(f"Tier T2 sandbox — backend: {backend_name}")
+    caps_summary = info.get("capabilities_summary", "unknown")
+    print(f"Tier T2 sandbox — backend: {backend_name} ({caps_summary})")
     if info.get("gpc", {}).get("mandatory") and not no_gpc:
         print(f"  GPC mandatory — socket: {info['gpc']['socket']}")
     if backend_name == "noop":
@@ -953,6 +954,11 @@ def cmd_run(sandbox, hardened, backend, repo, no_gpc, cmd):
             "Explicit --backend noop: gates-only (T2-partial), not OS confinement. "
             "Subprocess has normal filesystem access; enforcement is via git-wrapper, "
             "MCP proxy, and guardian quarantine only."
+        )
+    elif not info.get("capabilities", {}).get("write_allowlist") and info.get("capabilities", {}).get("content_deny"):
+        print_warning(
+            "Backend uses content deny only — child process is not jailed; "
+            "outside-repo writes are not confined."
         )
     elif info["backend"].get("last_error"):
         print_warning(info["backend"]["last_error"])
@@ -1850,8 +1856,8 @@ def cmd_doctor(repo, hardened):
 
         backends = describe_backends(repo_root)
         selected = backends["selected"]
-        os_sandbox = selected.get("os_sandbox", False)
         selected_name = selected.get("name")
+        caps_summary = selected.get("capabilities_summary", "unknown")
         if selected_name is None:
             check(
                 "Selected sandbox backend",
@@ -1862,8 +1868,7 @@ def cmd_doctor(repo, hardened):
             check(
                 "Selected sandbox backend",
                 True,
-                f"{selected_name} ({selected.get('tier')})"
-                + (" — OS syscall confinement" if os_sandbox else " — T2-partial, no OS sandbox"),
+                f"{selected_name} ({selected.get('tier')}) — {caps_summary}",
             )
         if selected_name == "noop":
             print("      → Explicit gates-only. Prefer Seatbelt (macOS) or fanotify (Linux) for real T2.")
@@ -1871,7 +1876,8 @@ def cmd_doctor(repo, hardened):
             mark = "← selected" if b.get("name") == selected_name else (
                 "available" if b.get("available") else "unavailable"
             )
-            print(f"      · {b.get('name')}: {mark}")
+            cap_line = b.get("capabilities_summary", "")
+            print(f"      · {b.get('name')}: {mark}" + (f" ({cap_line})" if cap_line else ""))
 
         load_plugins(reload=True)
         plugin_errs = plugin_load_errors()
