@@ -912,7 +912,8 @@ def cmd_mcp_proxy(config_path, server_name, repo, downstream):
 @main.command("run")
 @click.option("--sandbox", is_flag=True, help="T2: run command in sandbox (Seatbelt on macOS, fanotify on Linux)")
 @click.option("--hardened", is_flag=True, help="Use hardened state paths")
-@click.option("--backend", default=None, type=click.Choice(["seatbelt", "linux", "noop"]),
+@click.option("--backend", default=None,
+              type=click.Choice(["seatbelt", "bubblewrap", "linux-sandbox", "linux", "noop"]),
               help="Force a specific enforcement backend")
 @click.option("--repo", type=click.Path(exists=True, file_okay=False), default=None,
               help="Repo root (default: auto-detect)")
@@ -958,7 +959,7 @@ def cmd_run(sandbox, hardened, backend, repo, no_gpc, cmd):
     elif not info.get("capabilities", {}).get("write_allowlist") and info.get("capabilities", {}).get("content_deny"):
         print_warning(
             "Backend uses content deny only — child process is not jailed; "
-            "outside-repo writes are not confined."
+            "outside-repo writes are not confined. Install bubblewrap for full Linux sandbox."
         )
     if info["backend"].get("last_error"):
         print_warning(info["backend"]["last_error"])
@@ -1871,7 +1872,7 @@ def cmd_doctor(repo, hardened):
                 f"{selected_name} ({selected.get('tier')}) — {caps_summary}",
             )
         if selected_name == "noop":
-            print("      → Explicit gates-only. Prefer Seatbelt (macOS) or fanotify (Linux) for real T2.")
+            print("      → Explicit gates-only. Prefer Seatbelt (macOS) or linux-sandbox (Linux) for real T2.")
         for b in backends["available"]:
             mark = "← selected" if b.get("name") == selected_name else (
                 "available" if b.get("available") else "unavailable"

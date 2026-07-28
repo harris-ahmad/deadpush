@@ -65,6 +65,8 @@ def test_get_backend_noop(temp_repo: Path):
 
 def test_get_backend_no_silent_noop_fallback(temp_repo: Path):
     with patch("deadpush.backends.seatbelt.SeatbeltEnforcementBackend.available", return_value=False), \
+         patch("deadpush.backends.linux_sandbox.LinuxSandboxBackend.available", return_value=False), \
+         patch("deadpush.backends.bubblewrap.BubblewrapEnforcementBackend.available", return_value=False), \
          patch("deadpush.backends.linux.LinuxEnforcementBackend.available", return_value=False):
         with pytest.raises(SandboxUnavailableError, match="noop"):
             get_backend(temp_repo)

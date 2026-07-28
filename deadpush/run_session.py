@@ -110,6 +110,7 @@ def run_sandbox(
             return 2
 
     from .backends.linux import LinuxEnforcementBackend
+    from .backends.linux_sandbox import LinuxSandboxBackend
 
     on_deny = _backend_on_deny(gpc_session)
     try:
@@ -119,7 +120,9 @@ def run_sandbox(
         stop_gpc_session(gpc_session)
         return 2
 
-    if isinstance(backend, LinuxEnforcementBackend):
+    if isinstance(backend, LinuxSandboxBackend):
+        backend.attach_on_deny(on_deny)
+    elif isinstance(backend, LinuxEnforcementBackend):
         backend._on_deny = on_deny
 
     try:
@@ -158,7 +161,9 @@ def run_sandbox(
 
 def describe_backends(repo_root: Path | None = None) -> dict[str, Any]:
     """Report available enforcement backends and the selected default."""
+    from .backends.bubblewrap import BubblewrapEnforcementBackend
     from .backends.linux import LinuxEnforcementBackend
+    from .backends.linux_sandbox import LinuxSandboxBackend
     from .backends.noop import NoopEnforcementBackend
     from .backends.seatbelt import SeatbeltEnforcementBackend
 
@@ -166,6 +171,8 @@ def describe_backends(repo_root: Path | None = None) -> dict[str, Any]:
     repo = config.repo_root.resolve()
     candidates = [
         SeatbeltEnforcementBackend(repo),
+        LinuxSandboxBackend(repo),
+        BubblewrapEnforcementBackend(repo),
         LinuxEnforcementBackend(repo),
         NoopEnforcementBackend(repo),
     ]
