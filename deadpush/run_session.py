@@ -172,12 +172,13 @@ def describe_backends(repo_root: Path | None = None) -> dict[str, Any]:
     try:
         selected: dict[str, Any] = get_backend(repo).describe()
     except SandboxUnavailableError as e:
+        _fallback_caps = SandboxCapabilities()
         selected = {
             "name": None,
             "tier": None,
             "available": False,
-            "os_sandbox": False,
-            "capabilities": SandboxCapabilities().as_dict(),
+            "os_sandbox": _fallback_caps.has_os_enforcement,
+            "capabilities": _fallback_caps.as_dict(),
             "capabilities_summary": "none",
             "error": str(e),
         }
@@ -198,13 +199,14 @@ def describe_session(repo_root: Path | None = None, *, backend_prefer: str | Non
     backend = get_backend(repo, prefer=backend_prefer)
     from .gpc import gpc_socket_path
     caps = backend.capabilities
+    desc = backend.describe()
 
     return {
         "repo_root": str(repo),
-        "backend": backend.describe(),
+        "backend": desc,
         "tier": backend.tier,
         "capabilities": caps.as_dict(),
-        "capabilities_summary": backend.describe()["capabilities_summary"],
+        "capabilities_summary": desc["capabilities_summary"],
         "gpc": {
             "mandatory": True,
             "socket": str(gpc_socket_path(repo, hardened=is_hardened_install(repo))),

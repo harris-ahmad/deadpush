@@ -960,7 +960,7 @@ def cmd_run(sandbox, hardened, backend, repo, no_gpc, cmd):
             "Backend uses content deny only — child process is not jailed; "
             "outside-repo writes are not confined."
         )
-    elif info["backend"].get("last_error"):
+    if info["backend"].get("last_error"):
         print_warning(info["backend"]["last_error"])
     raise SystemExit(run_sandbox(
         list(cmd),
