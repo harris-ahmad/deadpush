@@ -16,15 +16,20 @@ def test_enqueue_dedupes_within_cooldown(temp_repo: Path, monkeypatch):
 
     calls: list[tuple[str, str]] = []
     calls_lock = threading.Lock()
+    done = threading.Event()
 
     def fake_worker(path: Path, event_type: str):
         with calls_lock:
             calls.append((path.as_posix(), event_type))
+        done.set()
 
     monkeypatch.setattr(handler, "_worker_run", fake_worker)
     monkeypatch.setattr(handler, "_get_cooldown", lambda: 10.0)
 
     handler._enqueue(target, "modified")
+    assert done.wait(timeout=2), "first enqueue never processed"
+    # Second enqueue after the first completes must hit post-process cooldown
+    # (not the in-flight dirty-requeue path, which intentionally runs again).
     handler._enqueue(target, "modified")
     handler._shutdown_workers()
 

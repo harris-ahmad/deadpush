@@ -23,11 +23,20 @@ def test_protect_bare_requires_hardened_or_no_root(temp_repo: Path):
     assert "--no-root" in result.output
 
 
-def test_guard_bare_requires_hardened_or_no_root(temp_repo: Path, monkeypatch):
+def test_guard_bare_requires_hardened_or_no_root(temp_repo: Path):
     """Regression: bare `guard` must exit 2 with elevated/sandbox pointer."""
-    monkeypatch.chdir(temp_repo)
+    # Avoid monkeypatch.chdir: prior tests can leave cwd on a deleted tmpdir,
+    # which makes monkeypatch.chdir's os.getcwd() raise FileNotFoundError.
+    try:
+        Path.cwd()
+    except FileNotFoundError:
+        import os
+        os.chdir(Path(__file__).resolve().parents[1])
+
     runner = CliRunner()
-    result = runner.invoke(main, ["guard"], catch_exceptions=False)
+    result = runner.invoke(
+        main, ["guard", "--repo", str(temp_repo)], catch_exceptions=False,
+    )
     assert result.exit_code == 2
     assert "elevated install" in result.output
     assert "run --sandbox" in result.output
