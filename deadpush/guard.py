@@ -421,25 +421,35 @@ class QuarantineManager:
             for attempt in range(4):
                 try:
                     shutil.copy2(path, dest)
-                    self._write_reason(dest, reason, path)
-                    try:
-                        path.unlink()
-                    except OSError as unlink_err:
-                        if unlink_err.errno in retry_errnos:
-                            time.sleep(0.05 * (attempt + 1))
-                            if not path.exists():
-                                return dest
-                            continue
-                        try:
-                            path.write_text("", encoding="utf-8")
-                        except OSError:
-                            pass
-                    return dest
                 except OSError as e:
                     if e.errno in retry_errnos and attempt < 3:
                         time.sleep(0.05 * (attempt + 1))
                         continue
                     break
+
+                try:
+                    self._write_reason(dest, reason, path)
+                except OSError as e:
+                    self.logger.warning(
+                        "Copied %s to %s but failed to write reason file: %s",
+                        path,
+                        dest,
+                        e,
+                    )
+
+                try:
+                    path.unlink()
+                except OSError as unlink_err:
+                    if unlink_err.errno in retry_errnos:
+                        time.sleep(0.05 * (attempt + 1))
+                        if not path.exists():
+                            return dest
+                        continue
+                    try:
+                        path.write_text("", encoding="utf-8")
+                    except OSError:
+                        pass
+                return dest
 
             self.logger.error(f"Failed to quarantine {path}")
             if dest.exists() and not path.exists():
