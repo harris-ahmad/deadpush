@@ -11,7 +11,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from .backends.base import EnforcementBackend, SandboxUnavailableError, get_backend
+from .backends.base import EnforcementBackend, SandboxCapabilities, SandboxUnavailableError, get_backend
 from .config import is_hardened_install, load_config
 from .gpc_session import GpcMandatoryError, GpcSession, apply_gpc_env, start_gpc_session, stop_gpc_session
 
@@ -172,11 +172,14 @@ def describe_backends(repo_root: Path | None = None) -> dict[str, Any]:
     try:
         selected: dict[str, Any] = get_backend(repo).describe()
     except SandboxUnavailableError as e:
+        _fallback_caps = SandboxCapabilities()
         selected = {
             "name": None,
             "tier": None,
             "available": False,
-            "os_sandbox": False,
+            "os_sandbox": _fallback_caps.has_os_enforcement,
+            "capabilities": _fallback_caps.as_dict(),
+            "capabilities_summary": "none",
             "error": str(e),
         }
     return {
@@ -195,11 +198,15 @@ def describe_session(repo_root: Path | None = None, *, backend_prefer: str | Non
     repo = config.repo_root.resolve()
     backend = get_backend(repo, prefer=backend_prefer)
     from .gpc import gpc_socket_path
+    caps = backend.capabilities
+    desc = backend.describe()
 
     return {
         "repo_root": str(repo),
-        "backend": backend.describe(),
+        "backend": desc,
         "tier": backend.tier,
+        "capabilities": caps.as_dict(),
+        "capabilities_summary": desc["capabilities_summary"],
         "gpc": {
             "mandatory": True,
             "socket": str(gpc_socket_path(repo, hardened=is_hardened_install(repo))),

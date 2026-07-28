@@ -8,7 +8,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from .base import EnforcementBackend, logger
+from .base import EnforcementBackend, SandboxCapabilities, logger
 
 # macOS system temp roots agents commonly need for caches/IPC
 _MACOS_TEMP_PREFIXES = (
@@ -163,11 +163,21 @@ class SeatbeltEnforcementBackend(EnforcementBackend):
     name = "seatbelt"
     tier = "T2"
 
+    _CAPABILITIES = SandboxCapabilities(
+        os_confinement=True,
+        write_allowlist=True,
+        content_deny=False,
+    )
+
     def __init__(self, repo_root: Path, *, hardened: bool = False):
         super().__init__(repo_root)
         self.hardened = hardened
         self._profile: Path | None = None
         self._profile_hash: str | None = None
+
+    @property
+    def capabilities(self) -> SandboxCapabilities:
+        return self._CAPABILITIES
 
     def available(self) -> bool:
         if sys.platform != "darwin":
@@ -214,7 +224,6 @@ class SeatbeltEnforcementBackend(EnforcementBackend):
     def describe(self) -> dict:
         d = super().describe()
         d.update({
-            "os_sandbox": True,
             "profile": str(self._profile) if self._profile else None,
             "profile_hash": self._profile_hash,
             "hardened": self.hardened,

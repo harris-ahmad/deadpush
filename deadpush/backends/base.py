@@ -5,10 +5,51 @@ from __future__ import annotations
 import logging
 import sys
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger("deadpush.backends")
+
+
+@dataclass(frozen=True)
+class SandboxCapabilities:
+    """Explicit guarantees for a sandbox enforcement backend.
+
+    * ``os_confinement`` — wrapped child runs under an OS sandbox (Seatbelt, bwrap).
+    * ``write_allowlist`` — child writes limited to approved paths (Seatbelt-style).
+    * ``content_deny`` — pre-write content policy deny (fanotify on repo tree).
+    """
+
+    os_confinement: bool = False
+    write_allowlist: bool = False
+    content_deny: bool = False
+
+    def as_dict(self) -> dict[str, bool]:
+        return {
+            "os_confinement": self.os_confinement,
+            "write_allowlist": self.write_allowlist,
+            "content_deny": self.content_deny,
+        }
+
+    @property
+    def has_os_enforcement(self) -> bool:
+        """True when any OS-level mechanism is active (process jail or content deny)."""
+        return self.os_confinement or self.content_deny
+
+
+def format_capabilities_summary(caps: SandboxCapabilities | dict[str, bool]) -> str:
+    """Human-readable one-line summary for CLI/doctor."""
+    if isinstance(caps, SandboxCapabilities):
+        caps = caps.as_dict()
+    parts: list[str] = []
+    if caps.get("os_confinement"):
+        parts.append("process confinement")
+    if caps.get("write_allowlist"):
+        parts.append("write allowlist")
+    if caps.get("content_deny"):
+        parts.append("content deny")
+    return ", ".join(parts) if parts else "gates only"
 
 
 class SandboxUnavailableError(RuntimeError):
@@ -46,6 +87,11 @@ class EnforcementBackend(ABC):
     def stop(self) -> None:
         """Stop backend monitoring and release resources."""
 
+    @property
+    def capabilities(self) -> SandboxCapabilities:
+        """Capability contract for this backend (override in subclasses)."""
+        return SandboxCapabilities()
+
     def preflight(self, cmd: list[str]) -> tuple[bool, str]:
         """Validate that *cmd* can run under this backend. Returns (ok, reason)."""
         if not cmd:
@@ -56,13 +102,18 @@ class EnforcementBackend(ABC):
 
     def apply_env_markers(self, env: dict[str, str]) -> None:
         """Stamp sandbox metadata into *env* for child processes."""
+        caps = self.capabilities
         env["DEADPUSH_BACKEND"] = self.name
         env["DEADPUSH_TIER"] = self.tier
         env["DEADPUSH_REPO_ROOT"] = str(self.repo_root)
+        env["DEADPUSH_SANDBOX_OS_CONFINEMENT"] = "1" if caps.os_confinement else "0"
+        env["DEADPUSH_SANDBOX_WRITE_ALLOWLIST"] = "1" if caps.write_allowlist else "0"
+        env["DEADPUSH_SANDBOX_CONTENT_DENY"] = "1" if caps.content_deny else "0"
         if self._last_error:
             env["DEADPUSH_BACKEND_WARNING"] = self._last_error
 
     def describe(self) -> dict[str, Any]:
+        caps = self.capabilities
         return {
             "name": self.name,
             "tier": self.tier,
@@ -70,6 +121,10 @@ class EnforcementBackend(ABC):
             "started": self._started,
             "repo_root": str(self.repo_root),
             "last_error": self._last_error,
+            "capabilities": caps.as_dict(),
+            "capabilities_summary": format_capabilities_summary(caps),
+            # Backward-compatible alias: any OS-level enforcement mechanism.
+            "os_sandbox": caps.has_os_enforcement,
         }
 
 

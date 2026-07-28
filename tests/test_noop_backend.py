@@ -12,7 +12,8 @@ def test_noop_backend_describe(temp_repo: Path):
     info = backend.describe()
     assert info["name"] == "noop"
     assert info["tier"] == "T2-partial"
-    assert info["os_sandbox"] is False
+    assert info["capabilities"]["os_confinement"] is False
+    assert info["capabilities_summary"] == "gates only"
     assert "git-wrapper" in info["gates"]
 
 

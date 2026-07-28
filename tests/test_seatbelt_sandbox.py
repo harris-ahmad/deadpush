@@ -68,7 +68,8 @@ def test_seatbelt_backend_wrap(temp_repo: Path):
     assert wrapped[0] == "sandbox-exec"
     assert "-f" in wrapped
     info = backend.describe()
-    assert info["os_sandbox"] is True
+    assert info["capabilities"]["os_confinement"] is True
+    assert info["capabilities"]["write_allowlist"] is True
     assert info["profile_hash"]
 
 

@@ -17,6 +17,12 @@ def test_describe_session_explicit_noop(temp_repo: Path):
     info = describe_session(temp_repo, backend_prefer="noop")
     assert info["tier"] == "T2-partial"
     assert info["backend"]["name"] == "noop"
+    assert info["capabilities"] == {
+        "os_confinement": False,
+        "write_allowlist": False,
+        "content_deny": False,
+    }
+    assert info["capabilities_summary"] == "gates only"
     assert info["repo_root"] == str(temp_repo.resolve())
     assert info["gpc"]["mandatory"] is True
     assert "gpc-mandatory" in info["features"]
@@ -30,6 +36,8 @@ def test_describe_session_default_or_unavailable(temp_repo: Path):
         return
     assert info["tier"] in ("T2", "T2-max")
     assert info["backend"]["name"] != "noop"
+    assert "capabilities" in info
+    assert "capabilities_summary" in info
 
 
 def test_prepare_sandbox_env(temp_repo: Path):

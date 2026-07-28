@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from .base import EnforcementBackend, logger
+from .base import EnforcementBackend, SandboxCapabilities, logger
 
 # Re-export module logger alias for tests
 __all__ = ["NoopEnforcementBackend"]
@@ -26,8 +26,14 @@ class NoopEnforcementBackend(EnforcementBackend):
     name = "noop"
     tier = "T2-partial"
 
+    _CAPABILITIES = SandboxCapabilities()
+
     def available(self) -> bool:
         return True
+
+    @property
+    def capabilities(self) -> SandboxCapabilities:
+        return self._CAPABILITIES
 
     def preflight(self, cmd: list[str]) -> tuple[bool, str]:
         ok, reason = super().preflight(cmd)
@@ -62,7 +68,6 @@ class NoopEnforcementBackend(EnforcementBackend):
     def describe(self) -> dict:
         d = super().describe()
         d.update({
-            "os_sandbox": False,
             "gates": ["git-wrapper", "mcp-proxy", "guardian-quarantine"],
             "note": (
                 "No syscall-level confinement. Agent subprocess has normal filesystem "
