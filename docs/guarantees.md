@@ -145,11 +145,11 @@ Bypass:     push to unprotected branch; disable branch protection (requires admi
 ### G-12: Guardian Push Channel delivers incidents
 
 ```
-Property:   connected GPC clients receive INCIDENT/LOCKDOWN messages when guardian blocks a write
-Mechanism:  Unix domain socket at ~/.deadpush/gpc.<repo-id>.sock
-Proof:      tests/test_gpc.py
+Property:   connected GPC clients receive INCIDENT/LOCKDOWN messages when guardian blocks a write; offline clients receive them on reconnect after ACK-drained outbox replay
+Mechanism:  Unix domain socket at ~/.deadpush/gpc.<repo-id>.sock plus `.deadpush/gpc.outbox.jsonl`
+Proof:      tests/test_gpc.py; tests/test_gpc_outbox.py
 Tier:       T0 (receive-only); T2 (mandatory session integration)
-Bypass:     client not subscribed to GPC socket
+Bypass:     client never connects and outbox fills (500 pending cap); ACK never sent
 ```
 
 ### G-13: Tamper-evident audit trail

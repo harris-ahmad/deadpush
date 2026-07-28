@@ -23,6 +23,7 @@ from typing import Any, Callable
 
 from .config import is_hardened_install, repo_id
 from . import state as _state
+from .gpc_outbox import DURABLE_TYPES, GpcOutbox
 
 logger = logging.getLogger("deadpush.gpc")
 
@@ -124,6 +125,20 @@ class GpcServer:
         self._thread: threading.Thread | None = None
         self._running = False
         self._override_log = self.repo_root / ".deadpush" / "gpc_overrides.jsonl"
+        self._outbox = GpcOutbox(self.repo_root)
+
+    @property
+    def outbox(self) -> GpcOutbox:
+        return self._outbox
+
+    def describe(self) -> dict:
+        with self._lock:
+            return {
+                "socket": str(self.socket_path),
+                "clients": len(self._clients),
+                "running": self._running,
+                "outbox": self._outbox.describe(),
+            }
 
     @property
     def client_count(self) -> int:
@@ -193,6 +208,8 @@ class GpcServer:
     def broadcast(self, msg: GpcMessage) -> int:
         """Send *msg* to all connected clients. Returns delivery count."""
         msg = self._prepare(msg)
+        if msg.type in DURABLE_TYPES:
+            self._outbox.append(msg)
         line = msg.to_line()
         payload = line.encode("utf-8")
         delivered = 0
@@ -211,6 +228,25 @@ class GpcServer:
                     pass
                 self._clients.pop(cid, None)
         return delivered
+
+    def _send_to_client(self, state: _ClientState, msg: GpcMessage) -> bool:
+        try:
+            state.conn.sendall(msg.to_line().encode("utf-8"))
+            return True
+        except OSError:
+            return False
+
+    def _drain_outbox_to_client(self, state: _ClientState) -> int:
+        pending = self._outbox.list_pending()
+        if not pending:
+            return 0
+        sent = 0
+        for msg in pending:
+            if self._send_to_client(state, msg):
+                sent += 1
+        if sent:
+            self._outbox.mark_drained(sent)
+        return sent
 
     def emit_welcome(self) -> None:
         self.broadcast(GpcMessage(
@@ -276,6 +312,7 @@ class GpcServer:
                     name="gpc-client-reader",
                 ).start()
                 self.emit_welcome()
+                self._drain_outbox_to_client(state)
             except socket.timeout:
                 self._prune_stale_clients()
                 continue
@@ -335,6 +372,8 @@ class GpcServer:
 
         if msg.type == "ACK" and msg.message_id:
             state.acks.add(msg.message_id)
+            ack_for = str((msg.payload or {}).get("ack_for") or msg.message_id)
+            self._outbox.ack(ack_for)
         elif msg.type == "HEARTBEAT":
             pass
         elif msg.type == "REQUEST_OVERRIDE":
