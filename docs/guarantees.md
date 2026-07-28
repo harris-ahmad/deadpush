@@ -126,10 +126,10 @@ Bypass:     not launched via deadpush run; Cursor GUI editor (outside wrapped su
 
 ```
 Property:   write syscalls to repo paths denied before completion when fanotify backend active
-Mechanism:  LinuxEnforcementBackend with fanotify FAN_DENY
+Mechanism:  LinuxEnforcementBackend with fanotify FAN_DENY (also attempted by always-on guardian)
 Proof:      tests/test_fanotify_deny.py (decide_fanotify_write + ubuntu CI integration)
 Tier:       T2-max (Linux)
-Bypass:     writes outside watched mount; CAP_SYS_ADMIN adversary
+Bypass:     soft daemon without CAP_SYS_ADMIN (falls back to watchdog/H-04); writes outside watched mount; CAP_SYS_ADMIN adversary
 ```
 
 ### G-11: Server-side ship gate
@@ -173,7 +173,7 @@ These are best-effort detections. Review diffs before pushing.
 | H-01 | All obfuscated dangerous code detected | Pattern matching is incomplete |
 | H-02 | Agent reads feedback and self-corrects | Depends on LLM behavior |
 | H-03 | Agent voluntarily uses deadpush MCP tools | MCP is cooperative in T0 |
-| H-04 | Watchdog quarantine has zero race window | Post-write reactive on T0/T1 |
+| H-04 | Dangerous content never briefly exists on disk at the live path | T0/T1 (and T2 without fanotify/ES) are **post-write**: the watchdog waits briefly for file stability (`STABILITY_SECONDS` ≈ 100ms; atomic editor renames skip the wait) then quarantines via rename-first. Typical window is tens–hundreds of ms after write completion — not zero. Pre-write deny exists only under Linux T2-max fanotify (needs `CAP_SYS_ADMIN`; soft `protect --daemon` is usually watchdog-only) or macOS Endpoint Security (not in the pip package). Seatbelt (T2) confines sandboxed subprocesses but does **not** block IDE-native in-repo writes. |
 
 ---
 

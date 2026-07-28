@@ -385,6 +385,12 @@ class QuarantineManager:
         )
 
     def quarantine(self, path: Path, reason: str) -> Path:
+        """Move a dangerous file out of the live tree as quickly as possible.
+
+        Prefer same-filesystem ``rename`` so the live path disappears immediately
+        (shrinks the H-04 post-decision window). Fall back to copy+unlink when
+        rename is unavailable (cross-device, busy handles, etc.).
+        """
         with self._lock:
             if not path.exists():
                 return path
@@ -393,38 +399,62 @@ class QuarantineManager:
             dest = self._unique_dest(path.name, timestamp)
             retry_errnos = {errno.EBUSY, errno.EACCES, errno.EPERM}
 
+            # Fast path: atomic rename removes bad content from the live path
+            # in one syscall (no copy-then-unlink race).
+            try:
+                path.rename(dest)
+            except OSError:
+                pass
+            else:
+                # Live path is already gone — never fall through to copy+unlink.
+                try:
+                    self._write_reason(dest, reason, path)
+                except OSError as e:
+                    self.logger.warning(
+                        "Quarantined %s to %s but failed to write reason file: %s",
+                        path,
+                        dest,
+                        e,
+                    )
+                return dest
+
             for attempt in range(4):
                 try:
                     shutil.copy2(path, dest)
-                    self._write_reason(dest, reason, path)
-                    try:
-                        path.unlink()
-                    except OSError as unlink_err:
-                        if unlink_err.errno in retry_errnos:
-                            time.sleep(0.05 * (attempt + 1))
-                            if not path.exists():
-                                return dest
-                            continue
-                        try:
-                            path.write_text("", encoding="utf-8")
-                        except OSError:
-                            pass
-                    return dest
                 except OSError as e:
                     if e.errno in retry_errnos and attempt < 3:
                         time.sleep(0.05 * (attempt + 1))
                         continue
                     break
 
-            try:
-                path.rename(dest)
-                self._write_reason(dest, reason, path)
+                try:
+                    self._write_reason(dest, reason, path)
+                except OSError as e:
+                    self.logger.warning(
+                        "Copied %s to %s but failed to write reason file: %s",
+                        path,
+                        dest,
+                        e,
+                    )
+
+                try:
+                    path.unlink()
+                except OSError as unlink_err:
+                    if unlink_err.errno in retry_errnos:
+                        time.sleep(0.05 * (attempt + 1))
+                        if not path.exists():
+                            return dest
+                        continue
+                    try:
+                        path.write_text("", encoding="utf-8")
+                    except OSError:
+                        pass
                 return dest
-            except Exception as e:
-                self.logger.error(f"Failed to quarantine {path}: {e}")
-                if dest.exists() and not path.exists():
-                    return dest
-                return path
+
+            self.logger.error(f"Failed to quarantine {path}")
+            if dest.exists() and not path.exists():
+                return dest
+            return path
 
     def list_quarantined(self):
         """Return list of dicts with info about quarantined files (newest first)."""
@@ -1973,7 +2003,12 @@ class GuardianHandler(FileSystemEventHandler or object):
     # ------------------------------------------------------------------
     # Main evaluation pipeline (called on every file create/modify)
     # ------------------------------------------------------------------
-    STABILITY_SECONDS = 0.25
+    # H-04: post-write quarantine always has a race. Keep the stability wait
+    # short so finished writes are evaluated quickly; editors that finish via
+    # atomic rename are handled immediately (event_type == "moved").
+    STABILITY_SECONDS = 0.10
+    STABILITY_POLL = 0.02
+    FAST_STABLE_MAX_BYTES = 65536
 
     def _enqueue(self, path: Path, event_type: str):
         try:
@@ -1992,17 +2027,44 @@ class GuardianHandler(FileSystemEventHandler or object):
         except Exception as e:
             self.logger.debug(f"Enqueue error on {path}: {e}")
 
+    def _stability_required(self, path: Path, event_type: str) -> float:
+        """How long size+mtime must stay unchanged before scanning."""
+        if event_type == "moved":
+            return 0.0
+        try:
+            if path.stat().st_size <= self.FAST_STABLE_MAX_BYTES:
+                return min(self.STABILITY_SECONDS, 0.05)
+        except OSError:
+            pass
+        return self.STABILITY_SECONDS
+
     def _worker_run(self, path: Path, event_type: str):
         try:
-            if self._is_stable(path):
+            if self._is_stable(path, required=self._stability_required(path, event_type)):
                 self._process_event(path, event_type)
         except Exception as e:
             self.logger.debug(f"Worker error on {path}: {e}")
 
-    def _is_stable(self, path: Path, timeout: float = 1.0) -> bool:
-        """Return True when size+mtime stay unchanged for STABILITY_SECONDS."""
+    def _is_stable(
+        self,
+        path: Path,
+        timeout: float = 1.0,
+        *,
+        required: float | None = None,
+    ) -> bool:
+        """Return True when size+mtime stay unchanged for ``required`` seconds.
+
+        The first observation of a (size, mtime) pair starts the clock; later
+        polls with the same key do not reset it. A changing key restarts the
+        wait (file still being written). Returns False if the file never stays
+        stable for ``required`` seconds before ``timeout`` expires.
+        """
+        need = self.STABILITY_SECONDS if required is None else max(0.0, float(required))
+        if need <= 0:
+            return path.exists()
         deadline = time.time() + timeout
-        prev: tuple[tuple[int, int], float] | None = None
+        stable_key: tuple[int, int] | None = None
+        stable_since: float | None = None
         while time.time() < deadline:
             try:
                 st = path.stat()
@@ -2010,11 +2072,14 @@ class GuardianHandler(FileSystemEventHandler or object):
             except OSError:
                 return False
             now = time.time()
-            if prev is not None and key == prev[0] and (now - prev[1]) >= self.STABILITY_SECONDS:
-                return True
-            prev = (key, now)
-            time.sleep(0.05)
-        return prev is not None
+            if key == stable_key and stable_since is not None:
+                if (now - stable_since) >= need:
+                    return True
+            else:
+                stable_key = key
+                stable_since = now
+            time.sleep(self.STABILITY_POLL)
+        return False
 
     def _shutdown_workers(self) -> None:
         try:
@@ -3122,7 +3187,13 @@ def _write_privileged_file(path: Path, content: str, sudo_fn=None) -> None:
         os.unlink(tmp)
 
 
-def setup_autostart(repo_root: Path, hardened: bool = False, _sudo=None) -> str:
+def setup_autostart(
+    repo_root: Path,
+    hardened: bool = False,
+    _sudo=None,
+    *,
+    enable_fanotify: bool = True,
+) -> str:
     """Generate OS-specific auto-start configuration for the guardian daemon.
 
     This helps fulfill "survive across sessions/reboots with minimal user intervention".
@@ -3130,6 +3201,9 @@ def setup_autostart(repo_root: Path, hardened: bool = False, _sudo=None) -> str:
     - On Linux: writes ~/.config/systemd/user/deadpush-guardian.<repoid>.service
     - On macOS: writes ~/Library/LaunchAgents/com.deadpush.guardian.<repoid>.plist
     - In hardened mode: writes to system paths for the _deadpush user.
+
+    ``enable_fanotify`` is honored in the generated unit/plist (``--no-fanotify``
+    when False). Soft daemons still need CAP_SYS_ADMIN for fanotify to activate.
 
     Returns a string with the file path + exact commands the user should run to enable it.
     Safe to call multiple times (idempotent overwrite).
@@ -3142,6 +3216,8 @@ def setup_autostart(repo_root: Path, hardened: bool = False, _sudo=None) -> str:
     else:
         exe = _sys.executable
     rid = _repo_id(str(repo_root))
+    fanotify_cli = "" if enable_fanotify else " --no-fanotify"
+    fanotify_plist = "" if enable_fanotify else "\n        <string>--no-fanotify</string>"
 
     if _sys.platform.startswith("linux"):
         unit_path = _scoped_systemd_unit_path(repo_root, hardened)
@@ -3155,7 +3231,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart={exe} -m deadpush_bootstrap guard --daemon{' --hardened' if hardened else ''}
+ExecStart={exe} -m deadpush_bootstrap guard --daemon{' --hardened' if hardened else ''}{fanotify_cli}
 Restart=always
 RestartSec=5
 WorkingDirectory={repo_root}
@@ -3210,7 +3286,7 @@ Useful commands:
         <string>-m</string>
         <string>deadpush_bootstrap</string>
         <string>guard</string>
-        <string>--daemon</string>{hardened_args}
+        <string>--daemon</string>{hardened_args}{fanotify_plist}
     </array>
     <key>WorkingDirectory</key>
     <string>{repo_root}</string>{user_name}

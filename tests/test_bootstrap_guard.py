@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import errno
 import json
+import logging
 import sys
 from pathlib import Path
 from unittest.mock import patch
@@ -111,7 +112,7 @@ class TestDebrisBootstrapSkip:
 
 
 class TestQuarantineHardening:
-    def test_quarantine_copies_then_unlinks(self, temp_repo: Path):
+    def test_quarantine_rename_first_removes_live_path(self, temp_repo: Path):
         target = temp_repo / "evil.py"
         target.write_text("eval('bad')\n")
         qm = QuarantineManager(temp_repo)
@@ -138,12 +139,33 @@ class TestQuarantineHardening:
                 raise OSError(errno.EPERM, "Operation not permitted")
             return real_unlink(self, missing_ok=missing_ok)
 
-        with patch.object(Path, "unlink", flaky_unlink):
-            dest = qm.quarantine(target, "retry test")
+        # Force the copy+unlink fallback (rename-first is the common path).
+        with patch.object(Path, "rename", side_effect=OSError(errno.EXDEV, "cross-device")):
+            with patch.object(Path, "unlink", flaky_unlink):
+                dest = qm.quarantine(target, "retry test")
 
         assert calls["n"] == 1
         assert not target.exists()
         assert dest.exists()
+
+    def test_quarantine_copy_fallback_unlinks_when_reason_write_fails(self, temp_repo: Path, caplog):
+        target = temp_repo / "copy_evil.py"
+        target.write_text("eval('bad')\n", encoding="utf-8")
+        qm = QuarantineManager(temp_repo)
+
+        def boom(_dest, _reason, _original):
+            raise OSError(errno.ENOSPC, "No space left on device")
+
+        with caplog.at_level(logging.WARNING):
+            with patch.object(Path, "rename", side_effect=OSError(errno.EXDEV, "cross-device")):
+                with patch.object(qm, "_write_reason", side_effect=boom):
+                    dest = qm.quarantine(target, "disk full reason")
+
+        assert not target.exists()
+        assert dest.exists()
+        assert dest.read_text(encoding="utf-8") == "eval('bad')\n"
+        assert not any("Failed to quarantine" in r.message for r in caplog.records)
+        assert any("failed to write reason file" in r.message.lower() for r in caplog.records)
 
     def test_quarantine_missing_source_is_noop(self, temp_repo: Path):
         missing = temp_repo / "gone.py"
