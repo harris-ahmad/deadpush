@@ -403,10 +403,20 @@ class QuarantineManager:
             # in one syscall (no copy-then-unlink race).
             try:
                 path.rename(dest)
-                self._write_reason(dest, reason, path)
-                return dest
             except OSError:
                 pass
+            else:
+                # Live path is already gone — never fall through to copy+unlink.
+                try:
+                    self._write_reason(dest, reason, path)
+                except OSError as e:
+                    self.logger.warning(
+                        "Quarantined %s to %s but failed to write reason file: %s",
+                        path,
+                        dest,
+                        e,
+                    )
+                return dest
 
             for attempt in range(4):
                 try:
@@ -2036,7 +2046,8 @@ class GuardianHandler(FileSystemEventHandler or object):
 
         The first observation of a (size, mtime) pair starts the clock; later
         polls with the same key do not reset it. A changing key restarts the
-        wait (file still being written).
+        wait (file still being written). Returns False if the file never stays
+        stable for ``required`` seconds before ``timeout`` expires.
         """
         need = self.STABILITY_SECONDS if required is None else max(0.0, float(required))
         if need <= 0:
@@ -2058,7 +2069,7 @@ class GuardianHandler(FileSystemEventHandler or object):
                 stable_key = key
                 stable_since = now
             time.sleep(self.STABILITY_POLL)
-        return stable_key is not None
+        return False
 
     def _shutdown_workers(self) -> None:
         try:

@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import errno
+import logging
 import sys
 import time
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -76,6 +79,39 @@ def test_quarantine_rename_first_clears_live_path_immediately(temp_repo: Path):
     dest = qm.quarantine(target, "h04")
     assert not target.exists()
     assert dest.read_text(encoding="utf-8") == payload
+
+
+def test_quarantine_reason_write_failure_does_not_claim_failed(temp_repo: Path, caplog):
+    target = temp_repo / "evil2.py"
+    target.write_text("eval('x')\n", encoding="utf-8")
+    qm = QuarantineManager(temp_repo)
+
+    def boom(_dest, _reason, _original):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    with caplog.at_level(logging.WARNING):
+        with patch.object(qm, "_write_reason", side_effect=boom):
+            dest = qm.quarantine(target, "disk full reason")
+
+    assert not target.exists()
+    assert dest.exists()
+    assert not any("Failed to quarantine" in r.message for r in caplog.records)
+    assert any("failed to write reason file" in r.message.lower() for r in caplog.records)
+
+
+def test_is_stable_false_when_file_keeps_changing(temp_repo: Path, monkeypatch):
+    handler = GuardianHandler(Config(repo_root=temp_repo), intervention=False, daemon=False)
+    target = temp_repo / "growing.bin"
+    target.write_bytes(b"x")
+
+    original_sleep = time.sleep
+
+    def bump_then_sleep(dt):
+        target.write_bytes(target.read_bytes() + b"y")
+        original_sleep(min(dt, 0.005))
+
+    monkeypatch.setattr(time, "sleep", bump_then_sleep)
+    assert handler._is_stable(target, timeout=0.08, required=0.05) is False
 
 
 @pytest.mark.skipif(
