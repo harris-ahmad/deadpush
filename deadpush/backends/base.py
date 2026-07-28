@@ -11,6 +11,14 @@ from typing import Any
 logger = logging.getLogger("deadpush.backends")
 
 
+class SandboxUnavailableError(RuntimeError):
+    """Raised when ``run --sandbox`` needs OS confinement but none is available.
+
+    Explicit ``--backend noop`` opts into gates-only (T2-partial) and must not
+    raise this error. Silent fallback to noop is intentionally not supported.
+    """
+
+
 class EnforcementBackend(ABC):
     """Platform-specific sandbox wrapper for agent subprocesses."""
 
@@ -66,37 +74,50 @@ class EnforcementBackend(ABC):
 
 
 def get_backend(repo_root: Path, *, prefer: str | None = None) -> EnforcementBackend:
-    """Select the best available backend for the current platform."""
+    """Select a confining sandbox backend for the current platform.
+
+    Returns ``NoopEnforcementBackend`` only when ``prefer="noop"`` (explicit
+    gates-only opt-in). Otherwise raises ``SandboxUnavailableError`` when no
+    OS confinement backend is available — never silently falls back to noop.
+    """
     from .linux import LinuxEnforcementBackend
     from .noop import NoopEnforcementBackend
     from .seatbelt import SeatbeltEnforcementBackend
+
+    if prefer == "noop":
+        return NoopEnforcementBackend(repo_root)
 
     candidates: list[EnforcementBackend] = []
     if prefer == "seatbelt":
         candidates = [SeatbeltEnforcementBackend(repo_root)]
     elif prefer == "linux":
         candidates = [LinuxEnforcementBackend(repo_root)]
-    elif prefer == "noop":
-        candidates = [NoopEnforcementBackend(repo_root)]
+    elif prefer is not None:
+        raise SandboxUnavailableError(
+            f"Unknown sandbox backend {prefer!r}. "
+            "Choose seatbelt, linux, or noop."
+        )
+    elif sys.platform == "darwin":
+        candidates = [SeatbeltEnforcementBackend(repo_root)]
+    elif sys.platform.startswith("linux"):
+        candidates = [LinuxEnforcementBackend(repo_root)]
     else:
-        if sys.platform == "darwin":
-            candidates = [SeatbeltEnforcementBackend(repo_root), NoopEnforcementBackend(repo_root)]
-        elif sys.platform.startswith("linux"):
-            candidates = [LinuxEnforcementBackend(repo_root), NoopEnforcementBackend(repo_root)]
-        else:
-            candidates = [NoopEnforcementBackend(repo_root)]
+        raise SandboxUnavailableError(
+            f"No OS sandbox backend for platform {sys.platform!r}. "
+            "Pass --backend noop for gates-only (not a real sandbox)."
+        )
 
     for backend in candidates:
         if backend.available():
-            if prefer and backend.name != prefer and prefer != "noop":
-                logger.warning(
-                    "Preferred backend %r unavailable; using %r",
-                    prefer,
-                    backend.name,
-                )
             return backend
 
-    fallback = NoopEnforcementBackend(repo_root)
-    fallback._last_error = "no platform backend available; using git/MCP gates only"
-    logger.warning(fallback._last_error)
-    return fallback
+    if prefer:
+        raise SandboxUnavailableError(
+            f"Requested sandbox backend {prefer!r} is unavailable. "
+            "Pass --backend noop for gates-only (not a real sandbox)."
+        )
+    raise SandboxUnavailableError(
+        "No OS sandbox backend available on this host. "
+        "Need Seatbelt (macOS sandbox-exec) or Linux fanotify with CAP_SYS_ADMIN. "
+        "Pass --backend noop for gates-only (not a real sandbox)."
+    )

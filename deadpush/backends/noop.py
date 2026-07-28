@@ -11,14 +11,16 @@ __all__ = ["NoopEnforcementBackend"]
 
 
 class NoopEnforcementBackend(EnforcementBackend):
-    """Deliberate fallback when OS-level sandboxing is unavailable.
+    """Explicit gates-only backend (``--backend noop``).
 
-    T2 session semantics still apply via:
+    Not selected automatically. Use when OS confinement is unavailable and the
+    caller opts into T2-partial semantics:
+
     - ``deadpush-git`` on PATH (commit/push guardrails)
     - ``DEADPUSH_SANDBOX`` env marker
     - Guardian watchdog quarantine for non-wrapped writes
 
-    This is not a no-op for repo integrity — only for syscall-level confinement.
+    This is not OS syscall confinement — only an intentional escape hatch.
     """
 
     name = "noop"

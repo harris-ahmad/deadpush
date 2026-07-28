@@ -929,6 +929,7 @@ def cmd_run(sandbox, hardened, backend, repo, no_gpc, cmd):
 
         deadpush run --sandbox -- python my_agent_script.py
     """
+    from .backends.base import SandboxUnavailableError
     from .run_session import describe_session, run_sandbox
 
     repo_root = Path(repo).resolve() if repo else None
@@ -937,14 +938,19 @@ def cmd_run(sandbox, hardened, backend, repo, no_gpc, cmd):
         import subprocess
         raise SystemExit(subprocess.run(list(cmd)).returncode)
 
-    info = describe_session(repo_root, backend_prefer=backend)
+    try:
+        info = describe_session(repo_root, backend_prefer=backend)
+    except SandboxUnavailableError as e:
+        print_error(str(e))
+        raise SystemExit(2)
+
     backend_name = info["backend"]["name"]
     print(f"Tier T2 sandbox — backend: {backend_name}")
     if info.get("gpc", {}).get("mandatory") and not no_gpc:
         print(f"  GPC mandatory — socket: {info['gpc']['socket']}")
     if backend_name == "noop":
         print_warning(
-            "OS sandbox unavailable — using T2-partial (noop). "
+            "Explicit --backend noop: gates-only (T2-partial), not OS confinement. "
             "Subprocess has normal filesystem access; enforcement is via git-wrapper, "
             "MCP proxy, and guardian quarantine only."
         )
@@ -957,7 +963,6 @@ def cmd_run(sandbox, hardened, backend, repo, no_gpc, cmd):
         backend_prefer=backend,
         require_gpc=not no_gpc,
     ))
-
 
 @main.command("git-wrapper", context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
 @click.argument("args", nargs=-1, type=click.UNPROCESSED)
@@ -1846,16 +1851,24 @@ def cmd_doctor(repo, hardened):
         backends = describe_backends(repo_root)
         selected = backends["selected"]
         os_sandbox = selected.get("os_sandbox", False)
-        check(
-            "Selected sandbox backend",
-            True,
-            f"{selected.get('name')} ({selected.get('tier')})"
-            + (" — OS syscall confinement" if os_sandbox else " — T2-partial, no OS sandbox"),
-        )
-        if selected.get("name") == "noop":
-            print("      → Run on macOS (Seatbelt) or Linux 5.13+ (fanotify) for full T2.")
+        selected_name = selected.get("name")
+        if selected_name is None:
+            check(
+                "Selected sandbox backend",
+                False,
+                selected.get("error") or "no confining backend available",
+            )
+        else:
+            check(
+                "Selected sandbox backend",
+                True,
+                f"{selected_name} ({selected.get('tier')})"
+                + (" — OS syscall confinement" if os_sandbox else " — T2-partial, no OS sandbox"),
+            )
+        if selected_name == "noop":
+            print("      → Explicit gates-only. Prefer Seatbelt (macOS) or fanotify (Linux) for real T2.")
         for b in backends["available"]:
-            mark = "← selected" if b.get("name") == selected.get("name") else (
+            mark = "← selected" if b.get("name") == selected_name else (
                 "available" if b.get("available") else "unavailable"
             )
             print(f"      · {b.get('name')}: {mark}")
