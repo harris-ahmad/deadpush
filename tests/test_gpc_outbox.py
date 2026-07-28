@@ -112,3 +112,35 @@ def test_server_describe_includes_outbox(temp_repo: Path):
     d = server.describe()
     assert d["outbox"]["pending"] == 1
     assert d["outbox"]["appended"] == 1
+
+
+def test_broadcast_then_drain_does_not_duplicate_on_same_connection(temp_repo: Path):
+    """Register → live broadcast → drain must not double-send the same message_id."""
+    from deadpush.gpc import _ClientState
+
+    server = GpcServer(temp_repo, hardened=False)
+    received: list[str] = []
+
+    class _RecordingConn:
+        def sendall(self, data: bytes) -> None:
+            line = data.decode("utf-8").strip().splitlines()[-1]
+            import json
+            payload = json.loads(line)
+            received.append(payload["message_id"])
+
+    state = _ClientState(conn=_RecordingConn(), connected_at=0.0, last_heartbeat=0.0)  # type: ignore[arg-type]
+    server._clients = {1: state}
+
+    mid = "inc-race-1"
+    server.broadcast(GpcMessage(
+        type="INCIDENT",
+        message_id=mid,
+        payload={"category": "security", "description": "during connect"},
+    ))
+    assert received.count(mid) == 1
+
+    # Simulate accept-loop outbox drain after the live broadcast.
+    drained = server._drain_outbox_to_client(state)
+    assert drained == 0  # skipped as duplicate
+    assert received.count(mid) == 1
+    assert mid in state.delivered_ids
