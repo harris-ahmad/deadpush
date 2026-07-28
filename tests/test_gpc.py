@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 
 import pytest
@@ -136,23 +137,40 @@ def test_gpc_protocol_version():
 
 
 def test_gpc_proxy_block_rebroadcasts_incident(temp_repo: Path):
+    import time
+
     received: list[str] = []
+    got_incident = threading.Event()
 
     def on_msg(msg):
         received.append(msg.type)
+        if msg.type == "INCIDENT":
+            got_incident.set()
 
     server = GpcServer(temp_repo, hardened=False)
     server.start()
+    listener = GpcClient(temp_repo, on_message=on_msg)
+    reporter = GpcClient(temp_repo)
     try:
-        import time
-        time.sleep(0.1)
-        listener = GpcClient(temp_repo, on_message=on_msg)
+        for _ in range(50):
+            if server.socket_path.exists():
+                break
+            time.sleep(0.02)
         listener.connect_and_listen()
-        time.sleep(0.2)
-        reporter = GpcClient(temp_repo)
+        deadline = time.time() + 5.0
+        while time.time() < deadline and server.client_count < 1:
+            time.sleep(0.05)
+        # Persistent reporter connection avoids short-lived connect/send/close races
+        # on Linux CI (PROXY_BLOCK must be read before the socket is torn down).
+        reporter.connect_and_listen()
+        deadline = time.time() + 5.0
+        while time.time() < deadline and server.client_count < 2:
+            time.sleep(0.05)
         assert reporter.send_proxy_block("run_terminal_cmd", "rm -rf /", file="_shell_")
-        time.sleep(0.3)
+        assert got_incident.wait(5.0), f"listener never got INCIDENT; got {received!r}"
         assert "INCIDENT" in received
     finally:
+        listener.stop()
+        reporter.stop()
         server.stop()
 

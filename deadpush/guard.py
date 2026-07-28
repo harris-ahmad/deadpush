@@ -1184,6 +1184,7 @@ class GuardianControlHandler(BaseHTTPRequestHandler):
                     "strict_mode": handler.strict_mode,
                     "fanotify": handler.fanotify_status(),
                     "pipeline": handler.pipeline_status(),
+                    "gpc": handler.gpc_status(),
                 }
                 self._send_json(data)
             elif path == "/safety-score":
@@ -1466,6 +1467,11 @@ class GuardianHandler(FileSystemEventHandler or object):
 
     def pipeline_status(self) -> dict:
         return self._pipeline.describe()
+
+    def gpc_status(self) -> dict | None:
+        if self.gpc is None:
+            return None
+        return self.gpc.describe()
 
     def _start_fanotify(self) -> None:
         if not self.enable_fanotify or self._fanotify_backend is not None:
