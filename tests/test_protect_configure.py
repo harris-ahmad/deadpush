@@ -13,6 +13,27 @@ from deadpush.cli import main
 from deadpush.configure import PROXY_MARKER
 
 
+def test_protect_bare_requires_hardened_or_no_root(temp_repo: Path):
+    """Regression: bare `protect` must exit 2 with elevated/sandbox pointer."""
+    runner = CliRunner()
+    result = runner.invoke(main, ["protect", "--repo", str(temp_repo)], catch_exceptions=False)
+    assert result.exit_code == 2
+    assert "elevated install" in result.output
+    assert "run --sandbox" in result.output
+    assert "--no-root" in result.output
+
+
+def test_guard_bare_requires_hardened_or_no_root(temp_repo: Path, monkeypatch):
+    """Regression: bare `guard` must exit 2 with elevated/sandbox pointer."""
+    monkeypatch.chdir(temp_repo)
+    runner = CliRunner()
+    result = runner.invoke(main, ["guard"], catch_exceptions=False)
+    assert result.exit_code == 2
+    assert "elevated install" in result.output
+    assert "run --sandbox" in result.output
+    assert "--no-root" in result.output
+
+
 def test_protect_calls_configure_all_by_default(temp_repo: Path):
     cursor_dir = temp_repo / ".cursor"
     cursor_dir.mkdir()

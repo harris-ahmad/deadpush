@@ -309,9 +309,18 @@ def main() -> None:
         print(f"[protect] exit={protect_res.returncode}")
         print((protect_res.stdout or "")[-800:])
         print((protect_res.stderr or "")[-400:])
+        # Abort before doctor/daemon/hooks cascade into secondary noise.
+        if not args.no_root:
+            print(
+                "\nERROR: protect requires --hardened (elevated) or --no-root (CI/dev).\n"
+                "  Re-run with:  python scripts/full_e2e_test.py --no-root ..."
+            )
+        else:
+            print("\nERROR: protect failed; aborting before secondary steps.")
+        sys.exit(1)
 
     print("\n=== 2. deadpush doctor ===")
-    # doctor checks the default (soft) guardian unless --hardened is given.
+    # doctor checks the same-UID (--no-root) guardian state unless --hardened is given.
     doc = deadpush_cmd("doctor", repo=repo)
     results["doctor"] = doc.returncode == 0
     print(doc.stdout[-800:] if doc.stdout else "")
