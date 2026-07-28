@@ -197,8 +197,8 @@ class LinuxEnforcementBackend(EnforcementBackend):
         self.repo_root = repo_root.resolve()
         if not self.available():
             self._last_error = "fanotify unavailable (needs Linux 5.13+ and CAP_SYS_ADMIN)"
-            logger.warning(self._last_error)
-            return
+            logger.error(self._last_error)
+            raise RuntimeError(self._last_error)
         if self._running:
             return
         self._running = True

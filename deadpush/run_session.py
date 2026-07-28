@@ -11,7 +11,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from .backends.base import EnforcementBackend, get_backend
+from .backends.base import EnforcementBackend, SandboxUnavailableError, get_backend
 from .config import is_hardened_install, load_config
 from .gpc_session import GpcMandatoryError, GpcSession, apply_gpc_env, start_gpc_session, stop_gpc_session
 
@@ -112,23 +112,23 @@ def run_sandbox(
     from .backends.linux import LinuxEnforcementBackend
 
     on_deny = _backend_on_deny(gpc_session)
-    backend = get_backend(repo, prefer=backend_prefer)
+    try:
+        backend = get_backend(repo, prefer=backend_prefer)
+    except SandboxUnavailableError as e:
+        logger.error("%s", e)
+        return 2
+
     if isinstance(backend, LinuxEnforcementBackend):
         backend._on_deny = on_deny
 
     try:
         backend.start(repo)
     except RuntimeError as e:
-        logger.error("Backend start failed: %s", e)
-        if backend_prefer == "seatbelt":
-            raise
-        from .backends.noop import NoopEnforcementBackend
-        logger.warning(
-            "Falling back to T2-partial (noop): OS sandbox unavailable — "
-            "git/MCP/guardian gates only, not syscall confinement"
-        )
-        backend = NoopEnforcementBackend(repo)
-        backend.start(repo)
+        # Fail loud: never soft-fallback to noop. Explicit --backend noop is
+        # the only gates-only path, and it is selected before start().
+        logger.error("Sandbox backend %r failed to start: %s", backend.name, e)
+        stop_gpc_session(gpc_session)
+        return 2
 
     env = prepare_sandbox_env(
         repo, hardened=use_hardened, backend=backend, gpc_session=gpc_session,
@@ -139,6 +139,10 @@ def run_sandbox(
         wrapped = backend.wrap_command(cmd, repo_root=repo, env=env)
     except (ValueError, RuntimeError) as e:
         logger.error("Cannot wrap command: %s", e)
+        backend.stop()
+        stop_gpc_session(gpc_session)
+        if bindir:
+            shutil.rmtree(bindir, ignore_errors=True)
         return 2
 
     try:
@@ -164,15 +168,28 @@ def describe_backends(repo_root: Path | None = None) -> dict[str, Any]:
         LinuxEnforcementBackend(repo),
         NoopEnforcementBackend(repo),
     ]
-    selected = get_backend(repo)
+    try:
+        selected: dict[str, Any] = get_backend(repo).describe()
+    except SandboxUnavailableError as e:
+        selected = {
+            "name": None,
+            "tier": None,
+            "available": False,
+            "os_sandbox": False,
+            "error": str(e),
+        }
     return {
-        "selected": selected.describe(),
+        "selected": selected,
         "available": [b.describe() for b in candidates],
     }
 
 
 def describe_session(repo_root: Path | None = None, *, backend_prefer: str | None = None) -> dict[str, Any]:
-    """Return metadata about what a sandbox session would use."""
+    """Return metadata about what a sandbox session would use.
+
+    Raises ``SandboxUnavailableError`` when no confining backend is available
+    and ``backend_prefer`` is not ``\"noop\"``.
+    """
     config = load_config(explicit_root=repo_root)
     repo = config.repo_root.resolve()
     backend = get_backend(repo, prefer=backend_prefer)
