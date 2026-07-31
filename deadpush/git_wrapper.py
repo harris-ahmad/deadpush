@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 
 from .git_escape import detect_git_config_escape
+from .staged_git import classify_destructive_git, stage_and_deny
 
 
 def find_real_git() -> str:
@@ -38,6 +39,11 @@ def main(argv: list[str] | None = None) -> int:
     if escape and in_sandbox:
         print(f"deadpush: git blocked in sandbox session: {escape}", file=sys.stderr)
         return 1
+
+    if os.environ.get("DEADPUSH_ALLOW_DESTRUCTIVE_GIT") != "1":
+        hit = classify_destructive_git(args)
+        if hit is not None:
+            return stage_and_deny(repo, hit)
 
     subcmd = args[0] if args else ""
     no_verify = "--no-verify" in args or "-n" in args

@@ -74,8 +74,8 @@ Primary result for the paper: **B4 ≈ B3 on block rate, ≫ B3 on work preserve
 ## 8. Implementation order (thesis-gated)
 
 1. Journal store (changed-file originals + hashes) — **done** (`deadpush/journal.py`)
-2. Save points (create / list / restore; validation stub: “no quarantined secrets in tree”) — **in progress on `feat/save-points`** (`deadpush/savepoints.py`)
-3. Staged git intercept for `reset --hard` / force-push (wrapper path first)
+2. Save points (create / list / restore; validation stub: “no quarantined secrets in tree”) — **done** (`deadpush/savepoints.py`)
+3. Staged git intercept for `reset --hard` / force-push (wrapper path first) — **in progress on `feat/staged-git-intercept`** (`deadpush/staged_git.py` + git wrapper)
 4. Eval harness producing CSV + plots for §6–7
 5. Only then: richer GPC event types for staged recovery
 
