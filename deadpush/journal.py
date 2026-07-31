@@ -386,6 +386,20 @@ class JournalStore:
                     pass
         return target
 
+    def store_bytes(self, data: bytes) -> str:
+        """Write *data* into the content-addressed blob store; return sha256 hex."""
+        digest = hashlib.sha256(data).hexdigest()
+        with self._lock:
+            self._write_blob(digest, data)
+        return digest
+
+    def load_bytes(self, digest: str) -> bytes:
+        """Read a blob by sha256 hex digest."""
+        blob = self.blobs_dir / digest
+        if not blob.is_file():
+            raise FileNotFoundError(f"missing journal blob {digest}")
+        return blob.read_bytes()
+
     def _write_blob(self, digest: str, data: bytes) -> Path:
         dest = self.blobs_dir / digest
         if dest.exists():

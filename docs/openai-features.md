@@ -7,9 +7,14 @@ not lose them while building Phase 1–4.
 
 **Phase 1 landed:** write-ahead journal store in `deadpush/journal.py`
 (content-addressed blobs, first-wins preimages per epoch, restore/restore_all).
-Save points and staged git intercept come next and will *call* this store —
-guardians must capture **before** mutation (session seed / pre-risk snapshot),
-because post-write watchdog alone sees the already-changed bytes.
+
+**Phase 2 landed:** validated save points in `deadpush/savepoints.py`
+(create / list / restore / latest_validated; secret-tree validation stub;
+seeds a fresh journal epoch from the snapshot so mutations after a save
+point have a WAL baseline).
+
+Next: staged git intercept for `reset --hard` / force-push (wrapper path),
+calling save-point create before risk and restore on deny.
 
 ---
 
