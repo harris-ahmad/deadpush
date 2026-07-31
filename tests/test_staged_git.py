@@ -2,12 +2,23 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 
 from deadpush.git_wrapper import main
 from deadpush.savepoints import SavePointStore
 from deadpush.staged_git import classify_destructive_git
+
+
+def _chdir(path: Path) -> None:
+    # Avoid monkeypatch.chdir: prior tests can leave cwd on a deleted tmpdir,
+    # which makes monkeypatch.chdir's os.getcwd() raise FileNotFoundError.
+    try:
+        Path.cwd()
+    except FileNotFoundError:
+        os.chdir(Path(__file__).resolve().parents[1])
+    os.chdir(path)
 
 
 def test_classify_reset_hard():
@@ -71,7 +82,7 @@ def test_wrapper_denies_reset_hard_and_creates_savepoint(temp_repo: Path, monkey
 
     monkeypatch.setenv("DEADPUSH_REPO_ROOT", str(temp_repo))
     monkeypatch.delenv("DEADPUSH_ALLOW_DESTRUCTIVE_GIT", raising=False)
-    monkeypatch.chdir(temp_repo)
+    _chdir(temp_repo)
 
     code = main(["reset", "--hard", "HEAD~1"])
     assert code == 1
@@ -95,7 +106,7 @@ def test_wrapper_denies_force_push_and_creates_savepoint(temp_repo: Path, monkey
     (temp_repo / "f.txt").write_text("x\n", encoding="utf-8")
     monkeypatch.setenv("DEADPUSH_REPO_ROOT", str(temp_repo))
     monkeypatch.delenv("DEADPUSH_ALLOW_DESTRUCTIVE_GIT", raising=False)
-    monkeypatch.chdir(temp_repo)
+    _chdir(temp_repo)
 
     code = main(["push", "--force", "origin", "HEAD"])
     assert code == 1
@@ -108,7 +119,7 @@ def test_wrapper_escape_hatch_allows_reset_soft_path(temp_repo: Path, monkeypatc
     """With allow env set, destructive classifier is skipped (status still works)."""
     monkeypatch.setenv("DEADPUSH_REPO_ROOT", str(temp_repo))
     monkeypatch.setenv("DEADPUSH_ALLOW_DESTRUCTIVE_GIT", "1")
-    monkeypatch.chdir(temp_repo)
+    _chdir(temp_repo)
     code = main(["status", "--porcelain"])
     assert code == 0
     assert SavePointStore(temp_repo).list() == []
