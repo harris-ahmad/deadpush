@@ -178,10 +178,11 @@ def scenario_hook_wipe(baseline: Baseline, repo: Path) -> ScenarioResult:
     sample.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     sample.chmod(0o755)
 
-    t0 = time.perf_counter()
     # Baselines do not yet intercept hook wipe; model as direct FS delete.
-    # B4 still checkpoints so recoverability can be measured later.
+    # Checkpoint before the timer so B4 save-point create is not in overhead_ms.
     sp_id = baseline.checkpoint(repo, label="pre-hook-wipe")
+
+    t0 = time.perf_counter()
     for child in hooks_dir.iterdir():
         if child.is_file():
             child.unlink()
