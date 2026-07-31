@@ -438,6 +438,9 @@ class GpcServer:
                     line, buf = buf.split(b"\n", 1)
                     if line.strip():
                         self._handle_client_message(line.decode("utf-8", errors="replace"), state)
+            # Peer closed — flush a final complete line if present.
+            if buf.strip():
+                self._handle_client_message(buf.decode("utf-8", errors="replace"), state)
         except OSError:
             pass
         finally:
@@ -648,18 +651,17 @@ class GpcClient:
                         if keep_open:
                             self._conn = s
                         else:
-                            s.sendall(data)
-                            try:
-                                s.shutdown(socket.SHUT_RDWR)
-                            except OSError:
-                                pass
-                            s.close()
+                            # One-shot: wait for WELCOME so the server reader is
+                            # running, then SHUT_WR (not RDWR) so Linux delivers
+                            # the line before FIN. No fixed sleep; typically <few ms.
+                            if not self._oneshot_send(s, data):
+                                raise OSError("GPC one-shot send failed")
                             return True
                     assert self._conn is not None
                     self._conn.sendall(data)
                     if not keep_open:
                         try:
-                            self._conn.shutdown(socket.SHUT_RDWR)
+                            self._conn.shutdown(socket.SHUT_WR)
                         except OSError:
                             pass
                         self._conn.close()
@@ -676,6 +678,48 @@ class GpcClient:
                         self._conn = None
                 time.sleep(0.05 * (attempt + 1))
         return False
+
+    @staticmethod
+    def _oneshot_send(sock: socket.socket, data: bytes, *, ready_timeout: float = 0.5) -> bool:
+        """Send *data* on a fresh connection after the server WELCOME handshake.
+
+        Synchronizes on WELCOME (event-driven, not a fixed sleep) so the server
+        accept path has started its reader, then half-closes with SHUT_WR so the
+        payload is not discarded on Linux.
+        """
+        sock.settimeout(ready_timeout)
+        buf = b""
+        welcomed = False
+        deadline = time.time() + ready_timeout
+        while time.time() < deadline and not welcomed:
+            try:
+                chunk = sock.recv(4096)
+            except socket.timeout:
+                continue
+            if not chunk:
+                return False
+            buf += chunk
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                if b'"type":"WELCOME"' in line or b'"type": "WELCOME"' in line:
+                    welcomed = True
+                    break
+        if not welcomed:
+            try:
+                sock.close()
+            except OSError:
+                pass
+            return False
+        sock.sendall(data)
+        try:
+            sock.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
+        try:
+            sock.close()
+        except OSError:
+            pass
+        return True
 
     def _listen_loop(self) -> None:
         while self._running:

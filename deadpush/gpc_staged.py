@@ -31,8 +31,8 @@ def emit_staged_recovery_events(
 
     Requires ``DEADPUSH_GPC_SOCKET`` pointing at an existing socket. Uses a
     one-shot send (no listen thread, no fixed sleep) so the deny path stays
-    latency-sensitive; the server accept loop starts readers before welcome
-    so short-lived REPORT_STAGED deliveries are reliable.
+    latency-sensitive. The client waits for server WELCOME then SHUT_WR so
+    short-lived REPORT_STAGED deliveries are reliable on Linux.
     """
     socket_env = os.environ.get("DEADPUSH_GPC_SOCKET", "").strip()
     if not socket_env:

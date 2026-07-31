@@ -136,7 +136,7 @@ def test_emit_staged_recovery_events_via_env_socket(temp_repo: Path, monkeypatch
         )
         emit_ms = (time.perf_counter() - t0) * 1000.0
         assert ok is True
-        assert emit_ms < 100.0, f"emit took {emit_ms:.1f}ms (want <100ms one-shot)"
+        assert emit_ms < 50.0, f"emit took {emit_ms:.1f}ms (want <50ms one-shot)"
         assert got.wait(5.0)
     finally:
         listener.stop()
