@@ -62,7 +62,23 @@ def run_eval_matrix(
     os_confined: bool = False,
     backend_prefer: str | None = None,
 ) -> list[ScenarioResult]:
-    scen_ids = scenarios or list(SCENARIOS.keys())
+    results, _ = run_eval_matrix_with_meta(
+        scenarios=scenarios,
+        baselines=baselines,
+        os_confined=os_confined,
+        backend_prefer=backend_prefer,
+    )
+    return results
+
+
+def run_eval_matrix_with_meta(
+    *,
+    scenarios: list[str] | None = None,
+    baselines: list[str] | None = None,
+    os_confined: bool = False,
+    backend_prefer: str | None = None,
+) -> tuple[list[ScenarioResult], str | None]:
+    """Run the matrix; return results plus the OS backend name from preflight (if any)."""
     if baselines is None:
         if os_confined:
             base_ids = ["B0", "B4", "B4-os"]
@@ -75,9 +91,12 @@ def run_eval_matrix(
             ]
         else:
             base_ids = ["B0", "B1", "B2", "B3", "B4", "B4-ablation"]
+            scen_ids = scenarios or list(SCENARIOS.keys())
     else:
         base_ids = baselines
+        scen_ids = scenarios or list(SCENARIOS.keys())
 
+    os_backend_name: str | None = None
     if os_confined:
         from deadpush.eval.os_sandbox import select_eval_os_backend
 
@@ -86,7 +105,9 @@ def run_eval_matrix(
             probe_repo = Path(td) / "repo"
             probe_repo.mkdir()
             _init_repo(probe_repo)
-            select_eval_os_backend(probe_repo, prefer=backend_prefer)
+            os_backend_name = select_eval_os_backend(
+                probe_repo, prefer=backend_prefer
+            ).name
         if "B4-os" not in base_ids:
             base_ids = [*base_ids, "B4-os"]
 
@@ -112,7 +133,7 @@ def run_eval_matrix(
         baseline = active[bid]
         for sid in scen_ids:
             results.append(run_one(sid, baseline))
-    return results
+    return results, os_backend_name
 
 
 def write_csv(results: list[ScenarioResult], path: Path) -> Path:

@@ -86,21 +86,21 @@ def run_under_os_sandbox(
 
     repo = repo_root.resolve()
     backend = select_eval_os_backend(repo, prefer=prefer)
-    backend.start(repo)
-    env = dict(os.environ)
-    env["DEADPUSH_REPO_ROOT"] = str(repo)
-    env["DEADPUSH_SANDBOX"] = "1"
-    env.pop("DEADPUSH_ALLOW_DESTRUCTIVE_GIT", None)
-    # Child cwd is the temp eval repo; ensure ``import deadpush`` still works.
-    pkg_root = str(Path(deadpush.__file__).resolve().parent.parent)
-    prev_pp = env.get("PYTHONPATH", "")
-    env["PYTHONPATH"] = (
-        pkg_root if not prev_pp else f"{pkg_root}{os.pathsep}{prev_pp}"
-    )
-    backend.apply_env_markers(env)
-    if extra_env:
-        env.update(extra_env)
     try:
+        backend.start(repo)
+        env = dict(os.environ)
+        env["DEADPUSH_REPO_ROOT"] = str(repo)
+        env["DEADPUSH_SANDBOX"] = "1"
+        env.pop("DEADPUSH_ALLOW_DESTRUCTIVE_GIT", None)
+        # Child cwd is the temp eval repo; ensure ``import deadpush`` still works.
+        pkg_root = str(Path(deadpush.__file__).resolve().parent.parent)
+        prev_pp = env.get("PYTHONPATH", "")
+        env["PYTHONPATH"] = (
+            pkg_root if not prev_pp else f"{pkg_root}{os.pathsep}{prev_pp}"
+        )
+        backend.apply_env_markers(env)
+        if extra_env:
+            env.update(extra_env)
         wrapped = backend.wrap_command(cmd, repo_root=repo, env=env)
         return subprocess.run(wrapped, cwd=repo, env=env, capture_output=True)
     finally:

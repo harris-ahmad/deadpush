@@ -147,9 +147,9 @@ def scenario_force_push(baseline: Baseline, repo: Path) -> ScenarioResult:
     code = baseline.run_git(repo, ["push", "--force", "origin", "HEAD"])
     elapsed = (time.perf_counter() - t0) * 1000.0
 
-    # Only B4's sandbox staged deny is a true policy block. Other baselines reach
-    # real git, which fails for a missing remote — that is not guardian safety.
-    if baseline.id == "B4":
+    # B4 and B4-os both route through the staged-deny git wrapper; a non-zero
+    # exit code from them is a genuine policy block, not a missing-remote error.
+    if baseline.id in {"B4", "B4-os"}:
         policy_block = code != 0
     else:
         policy_block = False

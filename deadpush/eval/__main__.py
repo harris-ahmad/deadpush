@@ -10,7 +10,12 @@ from pathlib import Path
 from deadpush.backends.base import SandboxUnavailableError
 
 from .os_sandbox import os_confinement_status
-from .runner import run_eval_matrix, write_csv, write_overhead_svg, write_summary_md
+from .runner import (
+    run_eval_matrix_with_meta,
+    write_csv,
+    write_overhead_svg,
+    write_summary_md,
+)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -57,7 +62,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if status.get("available") else 1
 
     try:
-        results = run_eval_matrix(
+        results, os_backend = run_eval_matrix_with_meta(
             scenarios=args.scenarios,
             baselines=args.baselines,
             os_confined=args.os_confined,
@@ -77,9 +82,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"wrote {csv_path}")
     print(f"wrote {md_path}")
     print(f"wrote {svg_path}")
-    if args.os_confined:
-        status = os_confinement_status(Path.cwd())
-        print(f"os_confinement backend: {status.get('backend')}")
+    if os_backend:
+        print(f"os_confinement backend: {os_backend}")
     return 0
 
 
