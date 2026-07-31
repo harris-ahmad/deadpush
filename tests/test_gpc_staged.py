@@ -74,14 +74,12 @@ def test_report_staged_rebroadcasts_to_subscriber(temp_repo: Path):
             ready.set()
 
     listener = GpcClient(temp_repo, on_message=on_msg)
-    reporter = GpcClient(temp_repo)
     try:
         _wait_socket(server)
         listener.connect_and_listen()
         _wait_clients(server, 1)
-        # Persistent reporter avoids short-lived connect/send/close races.
-        reporter.connect_and_listen()
-        _wait_clients(server, 2)
+        # One-shot reporter — accept loop starts readers before welcome.
+        reporter = GpcClient(temp_repo, auto_ack=False)
         assert reporter.send_report_staged(
             kind="force_push",
             reason="force push blocked",
@@ -94,7 +92,6 @@ def test_report_staged_rebroadcasts_to_subscriber(temp_repo: Path):
         assert "STAGED_DENY" in got
     finally:
         listener.stop()
-        reporter.stop()
         server.stop()
 
 
@@ -110,7 +107,7 @@ def test_emit_skips_fast_without_socket(temp_repo: Path, monkeypatch):
     )
     elapsed = time.perf_counter() - t0
     assert ok is False
-    assert elapsed < 0.2
+    assert elapsed < 0.05
 
 
 def test_emit_staged_recovery_events_via_env_socket(temp_repo: Path, monkeypatch):
@@ -128,11 +125,7 @@ def test_emit_staged_recovery_events_via_env_socket(temp_repo: Path, monkeypatch
         listener.connect_and_listen()
         _wait_clients(server, 1)
         monkeypatch.setenv("DEADPUSH_GPC_SOCKET", str(server.socket_path))
-        monkeypatch.setenv("DEADPUSH_SANDBOX", "1")
-        # Keep a second client connected so REPORT_STAGED is read reliably.
-        reporter = GpcClient(temp_repo)
-        reporter.connect_and_listen()
-        _wait_clients(server, 2)
+        t0 = time.perf_counter()
         ok = emit_staged_recovery_events(
             temp_repo,
             kind="reset_hard",
@@ -141,16 +134,17 @@ def test_emit_staged_recovery_events_via_env_socket(temp_repo: Path, monkeypatch
             label="pre-reset-hard",
             alternatives=["soft"],
         )
+        emit_ms = (time.perf_counter() - t0) * 1000.0
         assert ok is True
+        assert emit_ms < 100.0, f"emit took {emit_ms:.1f}ms (want <100ms one-shot)"
         assert got.wait(5.0)
-        reporter.stop()
     finally:
         listener.stop()
         server.stop()
 
 
 def test_emit_does_not_ack_drain_outbox(temp_repo: Path, monkeypatch):
-    """Reporter must not ACK durable STAGED_* events (outbox for reconnecting relays)."""
+    """One-shot reporter must not ACK durable STAGED_* events."""
     from deadpush.gpc_outbox import GpcOutbox
 
     server = GpcServer(temp_repo, hardened=False)
@@ -166,13 +160,10 @@ def test_emit_does_not_ack_drain_outbox(temp_repo: Path, monkeypatch):
             label="pre-reset-hard",
         )
         assert ok is True
-        # Allow server to process REPORT_STAGED and append durable broadcasts.
         deadline = time.time() + 2.0
         pending_types: set[str] = set()
         while time.time() < deadline:
             outbox = GpcOutbox(temp_repo)
-            info = outbox.describe()
-            # describe doesn't list types — read pending via private path for assertion
             with outbox._lock:
                 rows = outbox._read_pending_unlocked()
             pending_types = {r.get("type", "") for r in rows}
@@ -198,13 +189,10 @@ def test_stage_and_deny_emits_gpc_when_socket_set(temp_repo: Path, monkeypatch):
             done.set()
 
     listener = GpcClient(temp_repo, on_message=on_msg)
-    reporter = GpcClient(temp_repo)
     try:
         _wait_socket(server)
         listener.connect_and_listen()
         _wait_clients(server, 1)
-        reporter.connect_and_listen()
-        _wait_clients(server, 2)
         monkeypatch.setenv("DEADPUSH_GPC_SOCKET", str(server.socket_path))
         monkeypatch.setenv("DEADPUSH_SANDBOX", "1")
         hit = DestructiveGit(kind="reset_hard", reason="wipe", label="pre-reset-hard")
@@ -218,5 +206,4 @@ def test_stage_and_deny_emits_gpc_when_socket_set(temp_repo: Path, monkeypatch):
         assert sp["lifecycle"] == GPC_LIFECYCLE_OBSERVED
     finally:
         listener.stop()
-        reporter.stop()
         server.stop()

@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import logging
 import os
-import time
 from pathlib import Path
 from typing import Sequence
 
@@ -30,8 +29,10 @@ def emit_staged_recovery_events(
     Returns True if a REPORT_STAGED (or equivalent) was sent. Failures are
     swallowed — staged deny must still work with stderr-only feedback.
 
-    Requires ``DEADPUSH_GPC_SOCKET`` pointing at an existing socket. Sandbox
-    without a socket must not stall the deny path.
+    Requires ``DEADPUSH_GPC_SOCKET`` pointing at an existing socket. Uses a
+    one-shot send (no listen thread, no fixed sleep) so the deny path stays
+    latency-sensitive; the server accept loop starts readers before welcome
+    so short-lived REPORT_STAGED deliveries are reliable.
     """
     socket_env = os.environ.get("DEADPUSH_GPC_SOCKET", "").strip()
     if not socket_env:
@@ -41,23 +42,18 @@ def emit_staged_recovery_events(
         logger.debug("GPC staged emit skipped: socket missing %s", socket_path)
         return False
 
-    client = None
     try:
         from .config import is_hardened_install
         from .gpc import GpcClient
 
-        # Reporter only — must not auto-ACK re-broadcast durable events or it
-        # would drain the shared outbox before a reconnecting relay can replay.
+        # One-shot reporter: no connect_and_listen (avoids auto-ACK draining the
+        # durable outbox and avoids a mandatory sleep on the deny path).
         client = GpcClient(
             repo_root,
             hardened=is_hardened_install(repo_root),
             auto_ack=False,
         )
         client.socket_path = socket_path
-        # Persistent connection avoids short-lived connect/send/close races
-        # (same pattern as MCP PROXY_BLOCK tests / Linux CI).
-        client.connect_and_listen()
-        time.sleep(0.05)
         return client.send_report_staged(
             kind=kind,
             reason=reason,
@@ -70,9 +66,3 @@ def emit_staged_recovery_events(
     except Exception as e:  # noqa: BLE001 — never fail the deny path
         logger.debug("GPC staged emit skipped: %s", e)
         return False
-    finally:
-        if client is not None:
-            try:
-                client.stop()
-            except Exception:
-                pass

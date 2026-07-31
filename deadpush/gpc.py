@@ -393,6 +393,8 @@ class GpcServer:
                 state = _ClientState(conn=conn, connected_at=now, last_heartbeat=now)
                 with self._lock:
                     self._clients[id(conn)] = state
+                # Start the reader before welcome/drain so a one-shot client can
+                # deliver REPORT_STAGED / PROXY_BLOCK without waiting on us.
                 threading.Thread(
                     target=self._client_reader,
                     args=(conn, state),
