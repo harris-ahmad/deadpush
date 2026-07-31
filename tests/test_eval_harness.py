@@ -58,6 +58,7 @@ def test_all_scenario_ids_registered():
         "hook_wipe",
         "mass_edit",
         "benign_commit",
+        "outside_repo_write",
     }
     assert expected <= set(SCENARIOS)
 

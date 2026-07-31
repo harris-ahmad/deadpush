@@ -77,12 +77,13 @@ Primary result for the paper: **B4 ≈ B3 on block rate, ≫ B3 on work preserve
 2. Save points (create / list / restore; validation stub: “no quarantined secrets in tree”) — **done** (`deadpush/savepoints.py`)
 3. Staged git intercept for `reset --hard` / force-push (wrapper path first) — **done** (`deadpush/staged_git.py` + git wrapper)
 4. Eval harness producing CSV + plots for §6–7 — **done** (`deadpush/eval/`)
-5. Richer GPC event types for staged recovery — **in progress on `feat/gpc-staged-events`** (`STAGED_DENY` / `SAVEPOINT_CREATED`)
+5. Richer GPC event types for staged recovery — **done** (`STAGED_DENY` / `SAVEPOINT_CREATED` / `REPORT_STAGED`)
+6. OS-confined eval (Seatbelt / bubblewrap) — **done** (`python -m deadpush.eval --os-confined`; baseline `B4-os`)
 
 ## 9. Success criteria for “ready to write the paper”
 
-- [x] Scenarios 1–6 automated (plus benign FP probe)  
-- [ ] B0–B4 runnable on one OS (macOS Seatbelt *or* Linux bwrap) — harness is in-process today; OS confinement still optional  
+- [x] Scenarios 1–6 automated (plus benign FP probe; `outside_repo_write` for OS jail)  
+- [x] B0–B4 runnable on one OS (macOS Seatbelt *or* Linux bwrap) via `--os-confined` / `B4-os`  
 - [x] Graphs for block rate, work preserved, overhead (CSV + markdown + SVG)  
 - [x] One ablation: journal without staged git vs full B4 (`B4-ablation`)  
 

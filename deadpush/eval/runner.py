@@ -32,7 +32,26 @@ def run_one(scenario_id: str, baseline: Baseline) -> ScenarioResult:
         repo = Path(td) / "repo"
         repo.mkdir()
         _init_repo(repo)
-        baseline.setup(repo)
+        try:
+            baseline.setup(repo)
+        except Exception as e:
+            from deadpush.backends.base import SandboxUnavailableError
+
+            if isinstance(e, SandboxUnavailableError):
+                return ScenarioResult(
+                    scenario=scenario_id,
+                    baseline=baseline.id,
+                    blocked=False,
+                    lasting_damage=False,
+                    useful_total=0,
+                    useful_preserved=0,
+                    false_positive=False,
+                    time_to_safe_ms=0.0,
+                    time_to_recover_ms=0.0,
+                    overhead_ms=0.0,
+                    notes=f"skipped: {e}",
+                )
+            raise
         return fn(baseline, repo)
 
 
@@ -40,9 +59,37 @@ def run_eval_matrix(
     *,
     scenarios: list[str] | None = None,
     baselines: list[str] | None = None,
+    os_confined: bool = False,
+    backend_prefer: str | None = None,
 ) -> list[ScenarioResult]:
     scen_ids = scenarios or list(SCENARIOS.keys())
-    base_ids = baselines or ["B0", "B1", "B2", "B3", "B4", "B4-ablation"]
+    if baselines is None:
+        if os_confined:
+            base_ids = ["B0", "B4", "B4-os"]
+            scen_ids = scenarios or [
+                "destructive_git",
+                "force_push",
+                "outside_repo_write",
+                "benign_commit",
+                "secret_write",
+            ]
+        else:
+            base_ids = ["B0", "B1", "B2", "B3", "B4", "B4-ablation"]
+    else:
+        base_ids = baselines
+
+    if os_confined:
+        from deadpush.eval.os_sandbox import select_eval_os_backend
+
+        # Fail loud before the matrix if this host cannot confine.
+        with tempfile.TemporaryDirectory(prefix="deadpush-eval-os-preflight-") as td:
+            probe_repo = Path(td) / "repo"
+            probe_repo.mkdir()
+            _init_repo(probe_repo)
+            select_eval_os_backend(probe_repo, prefer=backend_prefer)
+        if "B4-os" not in base_ids:
+            base_ids = [*base_ids, "B4-os"]
+
     unknown_s = [s for s in scen_ids if s not in SCENARIOS]
     if unknown_s:
         raise KeyError(
@@ -53,9 +100,16 @@ def run_eval_matrix(
         raise KeyError(
             f"unknown baseline(s) {unknown_b}; choose from {sorted(ALL_BASELINES)}"
         )
+
+    from deadpush.eval.baselines import B4OS
+
+    active: dict[str, Baseline] = dict(ALL_BASELINES)
+    if os_confined and backend_prefer:
+        active["B4-os"] = B4OS(prefer=backend_prefer)
+
     results: list[ScenarioResult] = []
     for bid in base_ids:
-        baseline = ALL_BASELINES[bid]
+        baseline = active[bid]
         for sid in scen_ids:
             results.append(run_one(sid, baseline))
     return results
@@ -102,7 +156,14 @@ def write_summary_md(results: list[ScenarioResult], path: Path) -> Path:
         "| Baseline | mean block_rate (dangerous) | mean work_preserved | mean overhead_ms | FP count |",
         "|----------|-----------------------------|---------------------|------------------|----------|",
     ]
-    dangerous = {"secret_write", "scratch_pollution", "destructive_git", "force_push", "hook_wipe"}
+    dangerous = {
+        "secret_write",
+        "scratch_pollution",
+        "destructive_git",
+        "force_push",
+        "hook_wipe",
+        "outside_repo_write",
+    }
     for bid in sorted(by_base):
         rows = by_base[bid]
         dang = [r for r in rows if r.scenario in dangerous]
