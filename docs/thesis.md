@@ -32,10 +32,10 @@ GPC/GCP remains a **delivery channel** for staged events, not the primary claim.
 | FS watch + quarantine + feedback | Safety baseline | Yes |
 | Sandbox / hardened install | Confinement / integrity | Yes (partial Linux) |
 | GPC events | Notify agent of blocks | Yes (agents rarely speak it) |
-| **File journal** (pre-mutation originals) | Recoverability | **No — build** |
-| **Save points** (validated milestones) | How far to roll back | **No — build** |
-| **Staged intercept** of high-risk git cmds | Don’t hard-kill | Partial (wrapper/hooks) — **extend** |
-| Eval harness (scenarios + metrics) | Graphs for the paper | **No — build** |
+| **File journal** (pre-mutation originals) | Recoverability | **Yes** (`deadpush/journal.py`) |
+| **Save points** (validated milestones) | How far to roll back | **Yes** (`deadpush/savepoints.py`) |
+| **Staged intercept** of high-risk git cmds | Don’t hard-kill | **Yes** (wrapper path) |
+| Eval harness (scenarios + metrics) | Graphs for the paper | **In progress** (`deadpush/eval/`) |
 
 ## 5. Threat / scenario suite
 
@@ -75,16 +75,16 @@ Primary result for the paper: **B4 ≈ B3 on block rate, ≫ B3 on work preserve
 
 1. Journal store (changed-file originals + hashes) — **done** (`deadpush/journal.py`)
 2. Save points (create / list / restore; validation stub: “no quarantined secrets in tree”) — **done** (`deadpush/savepoints.py`)
-3. Staged git intercept for `reset --hard` / force-push (wrapper path first) — **in progress on `feat/staged-git-intercept`** (`deadpush/staged_git.py` + git wrapper)
-4. Eval harness producing CSV + plots for §6–7
+3. Staged git intercept for `reset --hard` / force-push (wrapper path first) — **done** (`deadpush/staged_git.py` + git wrapper)
+4. Eval harness producing CSV + plots for §6–7 — **in progress on `feat/eval-harness`** (`deadpush/eval/`)
 5. Only then: richer GPC event types for staged recovery
 
 ## 9. Success criteria for “ready to write the paper”
 
-- [ ] Scenarios 1–6 automated  
-- [ ] B0–B4 runnable on one OS (macOS Seatbelt *or* Linux bwrap)  
-- [ ] Graphs for block rate, work preserved, overhead  
-- [ ] One ablation: journal without staged git vs full B4  
+- [x] Scenarios 1–6 automated (plus benign FP probe)  
+- [ ] B0–B4 runnable on one OS (macOS Seatbelt *or* Linux bwrap) — harness is in-process today; OS confinement still optional  
+- [x] Graphs for block rate, work preserved, overhead (CSV + markdown + SVG)  
+- [x] One ablation: journal without staged git vs full B4 (`B4-ablation`)  
 
 ## 10. One-line contribution statement (abstract seed)
 
