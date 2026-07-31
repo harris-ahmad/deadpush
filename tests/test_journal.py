@@ -110,6 +110,24 @@ def test_begin_epoch_allows_new_preimage(temp_repo: Path):
     assert target.read_text(encoding="utf-8") == "b\n"
 
 
+def test_begin_epoch_seeded_uses_blob_not_disk(temp_repo: Path):
+    target = temp_repo / "seeded.txt"
+    target.write_text("snapshot\n", encoding="utf-8")
+    journal = JournalStore(temp_repo)
+    digest = journal.store_bytes(b"snapshot\n")
+    # Live disk diverges before seeding — first-wins must still be snapshot bytes.
+    target.write_text("live-race\n", encoding="utf-8")
+    epoch = journal.begin_epoch_seeded({"seeded.txt": digest})
+    assert journal.epoch == epoch
+    target.write_text("later\n", encoding="utf-8")
+    # Concurrent-style capture after seed is first-wins idempotent on snapshot.
+    entry = journal.capture(target)
+    assert entry is not None
+    assert entry.sha256 == digest
+    journal.restore("seeded.txt")
+    assert target.read_text(encoding="utf-8") == "snapshot\n"
+
+
 def test_persists_across_instances(temp_repo: Path):
     target = temp_repo / "p.txt"
     target.write_text("persist\n", encoding="utf-8")

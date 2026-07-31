@@ -19,7 +19,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-from .journal import JournalStore, _is_journal_internal
+from .journal import JournalStore, is_journal_internal
 
 logger = logging.getLogger("deadpush.savepoints")
 
@@ -89,6 +89,7 @@ class SavePoint:
 class RestoreResult:
     savepoint_id: str
     restored: tuple[str, ...]
+    removed: tuple[str, ...] = ()
     missing_blobs: tuple[str, ...] = ()
 
 
@@ -113,7 +114,7 @@ class SavePointStore:
         file_map: dict[str, str] = {}
         for path in paths if paths is not None else iter_snapshot_files(self.repo_root):
             rel = self.journal.rel_of(path)
-            if rel is None or _is_journal_internal(rel):
+            if rel is None or is_journal_internal(rel):
                 continue
             if not path.is_file():
                 continue
@@ -132,11 +133,9 @@ class SavePointStore:
         sp_id = uuid.uuid4().hex[:12]
         epoch = ""
         if seed_journal:
-            epoch = self.journal.begin_epoch()
-            # Seed first-wins preimages from the snapshot paths so later
-            # mutations can roll back toward this save point via the journal.
-            for rel in sorted(file_map):
-                self.journal.capture(self.repo_root / rel)
+            # Atomic with seeding: snapshot digests become first-wins, not a
+            # racy re-read of live disk between begin_epoch and capture.
+            epoch = self.journal.begin_epoch_seeded(file_map)
 
         sp = SavePoint(
             id=sp_id,
@@ -174,7 +173,7 @@ class SavePointStore:
         validated = [p for p in self.list() if p.validated]
         if not validated:
             return None
-        return max(validated, key=lambda p: p.ts)
+        return max(validated, key=lambda p: _parse_ts(p.ts))
 
     def restore(self, savepoint_id: str) -> RestoreResult:
         sp = self.get(savepoint_id)
@@ -183,6 +182,7 @@ class SavePointStore:
 
         restored: list[str] = []
         missing: list[str] = []
+        restored_preimages: dict[str, str] = {}
         for rel, digest in sorted(sp.files.items()):
             target = self.repo_root / rel
             try:
@@ -202,17 +202,36 @@ class SavePointStore:
                     except OSError:
                         pass
             restored.append(rel)
+            restored_preimages[rel] = digest
+
+        removed = self._remove_files_absent_from(sp.files)
 
         # Prefer a clean journal epoch after restore so new mutations start fresh.
-        self.journal.begin_epoch()
-        for rel in restored:
-            self.journal.capture(self.repo_root / rel)
+        self.journal.begin_epoch_seeded(restored_preimages)
 
         return RestoreResult(
             savepoint_id=sp.id,
             restored=tuple(restored),
+            removed=tuple(removed),
             missing_blobs=tuple(missing),
         )
+
+    def _remove_files_absent_from(self, wanted: dict[str, str]) -> list[str]:
+        """Delete snapshot-eligible live files that are not in the save point."""
+        removed: list[str] = []
+        for path in iter_snapshot_files(self.repo_root):
+            rel = self.journal.rel_of(path)
+            if rel is None or is_journal_internal(rel):
+                continue
+            if rel in wanted:
+                continue
+            try:
+                path.unlink()
+            except OSError as e:
+                logger.debug("savepoint restore could not remove %s: %s", rel, e)
+                continue
+            removed.append(rel)
+        return sorted(removed)
 
     def _write(self, sp: SavePoint) -> Path:
         path = self.root / f"sp_{sp.id}.json"
@@ -277,3 +296,10 @@ def validate_working_tree(repo_root: Path) -> list[str]:
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def _parse_ts(ts: str) -> datetime:
+    """Parse save-point timestamps (ISO-8601, typically ``...Z``)."""
+    if ts.endswith("Z"):
+        ts = ts[:-1] + "+00:00"
+    return datetime.fromisoformat(ts)

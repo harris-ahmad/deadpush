@@ -21,9 +21,13 @@ def test_create_list_restore_savepoint(temp_repo: Path):
     assert sp.validated is True
 
     src.write_text("destroyed\n", encoding="utf-8")
+    extra = temp_repo / "agent_new.py"
+    extra.write_text("should go away\n", encoding="utf-8")
     result = store.restore(sp.id)
     assert "src/app.py" in result.restored
+    assert "agent_new.py" in result.removed
     assert src.read_text(encoding="utf-8") == "good\n"
+    assert not extra.exists()
     assert store.get(sp.id) is not None
     assert len(store.list()) == 1
 
