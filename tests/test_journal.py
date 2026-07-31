@@ -208,3 +208,45 @@ def test_restore_all_preflight_no_partial_write(temp_repo: Path):
     # Neither file should have been restored (no partial apply).
     assert f1.read_text(encoding="utf-8") == "bad1\n"
     assert f2.read_text(encoding="utf-8") == "bad2\n"
+
+
+def test_list_entries_safe_under_concurrent_capture(temp_repo: Path):
+    import threading
+
+    journal = JournalStore(temp_repo)
+    stop = threading.Event()
+    errors: list[BaseException] = []
+
+    def writer():
+        i = 0
+        while not stop.is_set() and i < 200:
+            p = temp_repo / f"w_{i}.txt"
+            p.write_text(f"{i}\n", encoding="utf-8")
+            try:
+                journal.capture(p)
+            except BaseException as e:  # pragma: no cover
+                errors.append(e)
+                return
+            i += 1
+
+    def reader():
+        while not stop.is_set():
+            try:
+                journal.list_entries()
+                list(journal.iter_entries())
+            except RuntimeError as e:
+                errors.append(e)
+                return
+            except BaseException as e:  # pragma: no cover
+                errors.append(e)
+                return
+
+    threads = [threading.Thread(target=writer), threading.Thread(target=reader)]
+    for t in threads:
+        t.start()
+    writer_done = threads[0]
+    writer_done.join(timeout=5)
+    stop.set()
+    for t in threads:
+        t.join(timeout=2)
+    assert errors == []

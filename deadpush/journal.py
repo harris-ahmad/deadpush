@@ -228,13 +228,17 @@ class JournalStore:
         return out
 
     def get_entry(self, entry_id: str) -> JournalEntry | None:
-        return self._entries_by_id.get(entry_id)
+        with self._lock:
+            return self._entries_by_id.get(entry_id)
 
     def iter_entries(self) -> Iterator[JournalEntry]:
-        # Prefer in-memory index (insertion order matches append order on 3.7+).
-        if self._entries_by_id:
-            return iter(self._entries_by_id.values())
-        return iter(self._read_entries_from_disk())
+        """Iterate a snapshot of entries (safe under concurrent capture)."""
+        with self._lock:
+            if self._entries_by_id:
+                snapshot = list(self._entries_by_id.values())
+            else:
+                snapshot = self._read_entries_from_disk()
+        return iter(snapshot)
 
     def _read_entries_from_disk(self) -> list[JournalEntry]:
         if not self.entries_path.exists():
@@ -255,8 +259,13 @@ class JournalStore:
         return out
 
     def list_entries(self, *, epoch: str | None = None) -> list[JournalEntry]:
-        want = epoch if epoch is not None else self._epoch
-        return [e for e in self.iter_entries() if e.epoch == want]
+        with self._lock:
+            want = epoch if epoch is not None else self._epoch
+            if self._entries_by_id:
+                entries = list(self._entries_by_id.values())
+            else:
+                entries = self._read_entries_from_disk()
+        return [e for e in entries if e.epoch == want]
 
     def restore(self, rel: str, *, entry_id: str | None = None) -> Path:
         """Restore *rel* from its first-wins (or specified) journal entry.
