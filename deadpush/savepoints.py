@@ -202,6 +202,17 @@ class SavePointStore:
                 continue
             prepared.append((rel, target, digest, data))
 
+        # Snapshot had files but every blob failed to load: leave the live tree
+        # and journal epoch alone (do not prune extras or wipe first-wins).
+        # An empty snapshot (sp.files == {}) is intentional and still cleans up.
+        if sp.files and not prepared:
+            return RestoreResult(
+                savepoint_id=sp.id,
+                restored=(),
+                removed=(),
+                missing_blobs=tuple(missing),
+            )
+
         # Phase 2: write prepared files, then prune extras and reseed the journal.
         restored: list[str] = []
         restored_preimages: dict[str, str] = {}

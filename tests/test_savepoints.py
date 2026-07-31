@@ -91,6 +91,27 @@ def test_restore_missing_blob_reported(temp_repo: Path):
     assert "z.txt" in result.missing_blobs
 
 
+def test_restore_all_blobs_missing_skips_cleanup(temp_repo: Path):
+    f = temp_repo / "z.txt"
+    f.write_text("z\n", encoding="utf-8")
+    store = SavePointStore(temp_repo)
+    sp = store.create(paths=[f])
+    epoch_before = store.journal.epoch
+    for digest in sp.files.values():
+        (temp_repo / ".deadpush" / "journal" / "blobs" / digest).unlink()
+    f.write_text("changed\n", encoding="utf-8")
+    extra = temp_repo / "extra.txt"
+    extra.write_text("keep me\n", encoding="utf-8")
+
+    result = store.restore(sp.id)
+    assert result.restored == ()
+    assert result.removed == ()
+    assert "z.txt" in result.missing_blobs
+    assert f.read_text(encoding="utf-8") == "changed\n"
+    assert extra.read_text(encoding="utf-8") == "keep me\n"
+    assert store.journal.epoch == epoch_before
+
+
 def test_restore_preflight_io_error_writes_nothing(temp_repo: Path, monkeypatch: pytest.MonkeyPatch):
     a = temp_repo / "a.txt"
     b = temp_repo / "b.txt"
