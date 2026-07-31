@@ -20,7 +20,13 @@ MAX_PENDING = 500
 
 # Guardian → client types that must survive offline clients until ACK.
 DURABLE_TYPES = frozenset({
-    "INCIDENT", "LOCKDOWN", "INSTRUCTION", "POLICY_UPDATE", "SESSION_PAUSE",
+    "INCIDENT",
+    "LOCKDOWN",
+    "INSTRUCTION",
+    "POLICY_UPDATE",
+    "SESSION_PAUSE",
+    "STAGED_DENY",
+    "SAVEPOINT_CREATED",
 })
 
 

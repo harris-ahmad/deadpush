@@ -31,7 +31,7 @@ GPC/GCP remains a **delivery channel** for staged events, not the primary claim.
 |-------|-------------------|---------------|
 | FS watch + quarantine + feedback | Safety baseline | Yes |
 | Sandbox / hardened install | Confinement / integrity | Yes (partial Linux) |
-| GPC events | Notify agent of blocks | Yes (agents rarely speak it) |
+| GPC events | Notify agent of blocks | Yes + staged recovery events (`STAGED_DENY` / `SAVEPOINT_CREATED`) |
 | **File journal** (pre-mutation originals) | Recoverability | **Yes** (`deadpush/journal.py`) |
 | **Save points** (validated milestones) | How far to roll back | **Yes** (`deadpush/savepoints.py`) |
 | **Staged intercept** of high-risk git cmds | Don’t hard-kill | **Yes** (wrapper path) |
@@ -76,8 +76,8 @@ Primary result for the paper: **B4 ≈ B3 on block rate, ≫ B3 on work preserve
 1. Journal store (changed-file originals + hashes) — **done** (`deadpush/journal.py`)
 2. Save points (create / list / restore; validation stub: “no quarantined secrets in tree”) — **done** (`deadpush/savepoints.py`)
 3. Staged git intercept for `reset --hard` / force-push (wrapper path first) — **done** (`deadpush/staged_git.py` + git wrapper)
-4. Eval harness producing CSV + plots for §6–7 — **in progress on `feat/eval-harness`** (`deadpush/eval/`)
-5. Only then: richer GPC event types for staged recovery
+4. Eval harness producing CSV + plots for §6–7 — **done** (`deadpush/eval/`)
+5. Richer GPC event types for staged recovery — **in progress on `feat/gpc-staged-events`** (`STAGED_DENY` / `SAVEPOINT_CREATED`)
 
 ## 9. Success criteria for “ready to write the paper”
 
