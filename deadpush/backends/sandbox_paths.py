@@ -24,32 +24,43 @@ def collect_writable_sandbox_paths(
     *,
     hardened: bool = False,
     platform: str | None = None,
+    ensure_home_state: bool = True,
 ) -> list[Path]:
-    """Paths where a sandboxed agent may write (repo, state, temp)."""
+    """Paths where a sandboxed agent may write (repo, state, temp).
+
+    Only paths that exist on the host are returned. bubblewrap ``--bind`` fails
+    immediately if the source path is missing (common for ``/dev/shm`` in
+    containers and for a never-created ``~/.deadpush``).
+    """
     import sys
 
     plat = platform or sys.platform
     repo = repo_root.resolve()
-    paths: list[Path] = [repo, Path.home().resolve() / ".deadpush"]
+    if not repo.exists():
+        raise FileNotFoundError(f"sandbox repo root does not exist: {repo}")
+
+    candidates: list[Path] = [repo]
+
+    home_deadpush = Path.home().resolve() / ".deadpush"
+    if ensure_home_state:
+        home_deadpush.mkdir(parents=True, exist_ok=True)
+    candidates.append(home_deadpush)
 
     state_deadpush = Path("/var/db/deadpush")
-    if hardened and state_deadpush.exists():
-        paths.append(state_deadpush)
+    if hardened:
+        candidates.append(state_deadpush)
 
     if plat == "darwin":
-        for tmp_prefix in MACOS_TEMP_PREFIXES:
-            paths.append(Path(tmp_prefix))
+        candidates.extend(Path(p) for p in MACOS_TEMP_PREFIXES)
     elif plat.startswith("linux"):
-        for tmp_prefix in LINUX_TEMP_PREFIXES:
-            paths.append(Path(tmp_prefix))
+        candidates.extend(Path(p) for p in LINUX_TEMP_PREFIXES)
 
     seen: set[str] = set()
     out: list[Path] = []
-    for p in paths:
-        try:
-            resolved = p.resolve()
-        except OSError:
-            resolved = p
+    for p in candidates:
+        if not p.exists():
+            continue
+        resolved = p.resolve()
         key = str(resolved)
         if key not in seen:
             seen.add(key)

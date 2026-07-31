@@ -42,6 +42,7 @@ def build_bwrap_argv(
     # Apply --dev / --proc before writable binds. --dev recreates /dev as a fresh
     # tmpfs and would shadow an earlier --bind /dev/shm; binding writable paths
     # (including /dev/shm) after --dev restores host shared memory.
+    # Only bind paths that still exist — bwrap exits if a --bind source is missing.
     argv: list[str] = [
         bwrap,
         "--ro-bind", "/", "/",
@@ -49,6 +50,9 @@ def build_bwrap_argv(
         "--dev", "/dev",
     ]
     for path in writable:
+        if not path.exists():
+            logger.debug("skipping missing writable bind path: %s", path)
+            continue
         argv.extend(["--bind", str(path), str(path)])
     argv.extend(["--die-with-parent", "--", *cmd])
     return argv
