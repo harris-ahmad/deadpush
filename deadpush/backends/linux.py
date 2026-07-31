@@ -169,6 +169,7 @@ class LinuxEnforcementBackend(EnforcementBackend):
         self._on_deny = on_deny
         self._deny_count = 0
         self._allow_count = 0
+        self._ready = threading.Event()
 
     @property
     def capabilities(self) -> SandboxCapabilities:
@@ -211,10 +212,23 @@ class LinuxEnforcementBackend(EnforcementBackend):
             raise RuntimeError(self._last_error)
         if self._running:
             return
+        self._ready.clear()
         self._running = True
         self._started = True
         self._thread = threading.Thread(target=self._listen_loop, daemon=True, name="fanotify-listener")
         self._thread.start()
+        # Wait until the listener finishes fanotify_init/mark (success or fail).
+        # Without this, is_active races: _fd is only set inside the thread.
+        if not self._ready.wait(timeout=2.0):
+            self._last_error = "fanotify listener failed to become ready"
+            logger.error(self._last_error)
+            self.stop()
+            raise RuntimeError(self._last_error)
+        if not self.is_active:
+            err = self._last_error or "fanotify listener inactive after start"
+            logger.error(err)
+            self.stop()
+            raise RuntimeError(err)
 
     def stop(self) -> None:
         self._running = False
@@ -227,6 +241,7 @@ class LinuxEnforcementBackend(EnforcementBackend):
             self._fd = None
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=2.0)
+        self._ready.clear()
 
     def _write_response(self, notify_fd: int, event_fd: int, allow: bool) -> None:
         resp = FanotifyResponse()
@@ -267,36 +282,42 @@ class LinuxEnforcementBackend(EnforcementBackend):
                 pass
 
     def _listen_loop(self) -> None:
-        if self._libc is None and not self.available():
-            return
-        fd = self._libc.fanotify_init(
-            FAN_CLASS_CONTENT | FAN_CLOEXEC | FAN_NONBLOCK | FAN_EVENT_ON_CHILD,
-            0,
-        )
-        if fd < 0:
-            self._last_error = "fanotify_init failed"
-            logger.error(self._last_error)
-            return
-        self._fd = fd
-        repo = str(self.repo_root).encode()
-        res = self._libc.fanotify_mark(
-            fd,
-            FAN_MARK_ADD | FAN_MARK_ONLYDIR,
-            FAN_OPEN | FAN_MODIFY | FAN_DENY,
-            AT_FDCWD,
-            repo,
-        )
-        if res != 0:
-            err = ctypes.get_errno()
-            self._last_error = f"fanotify_mark failed: errno {err}"
-            logger.error(self._last_error)
-            os.close(fd)
-            self._fd = None
-            return
-        logger.info("fanotify content-deny listener active on %s", self.repo_root)
-        while self._running:
+        try:
+            if self._libc is None and not self.available():
+                self._last_error = "fanotify unavailable in listener thread"
+                return
+            fd = self._libc.fanotify_init(
+                FAN_CLASS_CONTENT | FAN_CLOEXEC | FAN_NONBLOCK | FAN_EVENT_ON_CHILD,
+                0,
+            )
+            if fd < 0:
+                self._last_error = "fanotify_init failed"
+                logger.error(self._last_error)
+                return
+            self._fd = fd
+            repo = str(self.repo_root).encode()
+            res = self._libc.fanotify_mark(
+                fd,
+                FAN_MARK_ADD | FAN_MARK_ONLYDIR,
+                FAN_OPEN | FAN_MODIFY | FAN_DENY,
+                AT_FDCWD,
+                repo,
+            )
+            if res != 0:
+                err = ctypes.get_errno()
+                self._last_error = f"fanotify_mark failed: errno {err}"
+                logger.error(self._last_error)
+                os.close(fd)
+                self._fd = None
+                return
+            logger.info("fanotify content-deny listener active on %s", self.repo_root)
+        finally:
+            # Unblock start() whether init succeeded or failed.
+            self._ready.set()
+
+        while self._running and self._fd is not None:
             try:
-                data = os.read(fd, 4096)
+                data = os.read(self._fd, 4096)
             except BlockingIOError:
                 time.sleep(0.05)
                 continue
@@ -309,7 +330,7 @@ class LinuxEnforcementBackend(EnforcementBackend):
                 meta = FanotifyEventMetadata.from_buffer_copy(data[offset:offset + FAN_EVENT_METADATA_LEN])
                 if meta.event_len < FAN_EVENT_METADATA_LEN:
                     break
-                self._handle_metadata(fd, meta)
+                self._handle_metadata(self._fd, meta)
                 offset += meta.event_len
 
     def describe(self) -> dict:

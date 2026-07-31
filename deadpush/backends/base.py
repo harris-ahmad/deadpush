@@ -135,7 +135,9 @@ def get_backend(repo_root: Path, *, prefer: str | None = None) -> EnforcementBac
     gates-only opt-in). Otherwise raises ``SandboxUnavailableError`` when no
     OS confinement backend is available — never silently falls back to noop.
     """
+    from .bubblewrap import BubblewrapEnforcementBackend
     from .linux import LinuxEnforcementBackend
+    from .linux_sandbox import LinuxSandboxBackend
     from .noop import NoopEnforcementBackend
     from .seatbelt import SeatbeltEnforcementBackend
 
@@ -145,17 +147,26 @@ def get_backend(repo_root: Path, *, prefer: str | None = None) -> EnforcementBac
     candidates: list[EnforcementBackend] = []
     if prefer == "seatbelt":
         candidates = [SeatbeltEnforcementBackend(repo_root)]
-    elif prefer == "linux":
-        candidates = [LinuxEnforcementBackend(repo_root)]
+    elif prefer == "bubblewrap":
+        candidates = [BubblewrapEnforcementBackend(repo_root)]
+    elif prefer in ("linux-sandbox", "linux"):
+        if prefer == "linux-sandbox":
+            candidates = [LinuxSandboxBackend(repo_root)]
+        else:
+            # Explicit fanotify-only (legacy ``--backend linux``).
+            candidates = [LinuxEnforcementBackend(repo_root)]
     elif prefer is not None:
         raise SandboxUnavailableError(
             f"Unknown sandbox backend {prefer!r}. "
-            "Choose seatbelt, linux, or noop."
+            "Choose seatbelt, bubblewrap, linux-sandbox, linux, or noop."
         )
     elif sys.platform == "darwin":
         candidates = [SeatbeltEnforcementBackend(repo_root)]
     elif sys.platform.startswith("linux"):
-        candidates = [LinuxEnforcementBackend(repo_root)]
+        candidates = [
+            LinuxSandboxBackend(repo_root),
+            LinuxEnforcementBackend(repo_root),
+        ]
     else:
         raise SandboxUnavailableError(
             f"No OS sandbox backend for platform {sys.platform!r}. "
@@ -173,6 +184,6 @@ def get_backend(repo_root: Path, *, prefer: str | None = None) -> EnforcementBac
         )
     raise SandboxUnavailableError(
         "No OS sandbox backend available on this host. "
-        "Need Seatbelt (macOS sandbox-exec) or Linux fanotify with CAP_SYS_ADMIN. "
+        "Need Seatbelt (macOS), bubblewrap (Linux), or fanotify with CAP_SYS_ADMIN. "
         "Pass --backend noop for gates-only (not a real sandbox)."
     )
