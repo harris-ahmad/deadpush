@@ -94,7 +94,7 @@ def _safer_alternatives(kind: str) -> list[str]:
     if kind == "force_push":
         return [
             "git push                  (fast-forward only)",
-            "git push --force-with-lease is also denied; ask a human if rewrite is required",
+            "ask a human if a history rewrite is truly required",
         ]
     return []
 
@@ -131,11 +131,13 @@ def _args_after_globals(args: list[str]) -> list[str]:
         ) or arg.startswith("--exec-path="):
             i += 1
             continue
-        if arg in ("--git-dir", "--work-tree", "--namespace", "--exec-path") and i + 1 < n:
-            i += 2
-            continue
+        # --exec-path takes an optional attached value (--exec-path=<path>) only.
+        # Bare --exec-path must not consume the next token (git prints the path).
         if arg == "--exec-path":
             i += 1
+            continue
+        if arg in ("--git-dir", "--work-tree", "--namespace") and i + 1 < n:
+            i += 2
             continue
         if arg in (
             "--bare",

@@ -40,7 +40,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"deadpush: git blocked in sandbox session: {escape}", file=sys.stderr)
         return 1
 
-    if os.environ.get("DEADPUSH_ALLOW_DESTRUCTIVE_GIT") != "1":
+    # Staged deny only in sandbox sessions (same scope as config-escape checks).
+    # Escape hatch for evals/baselines: DEADPUSH_ALLOW_DESTRUCTIVE_GIT=1.
+    if in_sandbox and os.environ.get("DEADPUSH_ALLOW_DESTRUCTIVE_GIT") != "1":
         hit = classify_destructive_git(args)
         if hit is not None:
             return stage_and_deny(repo, hit)
