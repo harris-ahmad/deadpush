@@ -117,3 +117,71 @@ def test_persists_across_instances(temp_repo: Path):
     target.write_text("gone\n", encoding="utf-8")
     JournalStore(temp_repo).restore("p.txt")
     assert target.read_text(encoding="utf-8") == "persist\n"
+
+
+def test_stale_first_wins_recaptures(temp_repo: Path):
+    target = temp_repo / "s.txt"
+    target.write_text("v1\n", encoding="utf-8")
+    journal = JournalStore(temp_repo)
+    first = journal.capture(target)
+    assert first is not None
+    # Simulate truncated log / missing index entry while first-wins still points at id.
+    journal._entries_by_id.pop(first.id, None)
+    target.write_text("v2\n", encoding="utf-8")
+    second = journal.capture(target)
+    assert second is not None
+    assert second.id != first.id
+    assert second.sha256 != first.sha256
+    journal.restore("s.txt")
+    assert target.read_text(encoding="utf-8") == "v2\n"
+
+
+def test_restore_rejects_path_traversal(temp_repo: Path):
+    journal = JournalStore(temp_repo)
+    (temp_repo / "ok.txt").write_text("ok\n", encoding="utf-8")
+    entry = journal.capture(temp_repo / "ok.txt")
+    assert entry is not None
+    # Corrupt the in-memory entry rel to attempt escape.
+    evil = entry.__class__(
+        id=entry.id,
+        ts=entry.ts,
+        rel="../outside.txt",
+        kind=entry.kind,
+        sha256=entry.sha256,
+        size=entry.size,
+        mtime_ns=entry.mtime_ns,
+        epoch=entry.epoch,
+    )
+    journal._entries_by_id[evil.id] = evil
+    journal._first_wins["../outside.txt"] = evil.id
+    try:
+        journal.restore("../outside.txt")
+        raise AssertionError("expected ValueError")
+    except ValueError as e:
+        assert "unsafe" in str(e) or "escape" in str(e)
+
+
+def test_restore_missing_first_wins_raises(temp_repo: Path):
+    target = temp_repo / "m.txt"
+    target.write_text("orig\n", encoding="utf-8")
+    journal = JournalStore(temp_repo)
+    entry = journal.capture(target)
+    assert entry is not None
+    journal._entries_by_id.pop(entry.id, None)
+    target.write_text("mutated\n", encoding="utf-8")
+    try:
+        journal.restore("m.txt")
+        raise AssertionError("expected FileNotFoundError")
+    except FileNotFoundError as e:
+        assert "first-wins" in str(e)
+    # Must not have silently restored a later/mutated state via fallback.
+    assert target.read_text(encoding="utf-8") == "mutated\n"
+
+
+def test_safe_repo_path_rejects_dotdot(temp_repo: Path):
+    journal = JournalStore(temp_repo)
+    try:
+        journal.safe_repo_path("../../etc/passwd")
+        raise AssertionError("expected ValueError")
+    except ValueError:
+        pass

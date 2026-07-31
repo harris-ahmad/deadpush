@@ -77,9 +77,11 @@ class JournalStore:
         self._lock = threading.Lock()
         self._ensure_layout()
         self._epoch = self._load_or_create_epoch()
+        # id -> entry (O(1) lookups; rebuilt from JSONL on init)
+        self._entries_by_id: dict[str, JournalEntry] = {}
         # rel -> entry id of first unrepaired preimage in this epoch
         self._first_wins: dict[str, str] = {}
-        self._load_first_wins_from_log()
+        self._load_index_from_log()
 
     def _ensure_layout(self) -> None:
         self.blobs_dir.mkdir(parents=True, exist_ok=True)
@@ -102,8 +104,11 @@ class JournalStore:
         )
         return epoch
 
-    def _load_first_wins_from_log(self) -> None:
-        for entry in self.iter_entries():
+    def _load_index_from_log(self) -> None:
+        self._entries_by_id.clear()
+        self._first_wins.clear()
+        for entry in self._read_entries_from_disk():
+            self._entries_by_id[entry.id] = entry
             if entry.epoch != self._epoch:
                 continue
             if entry.rel not in self._first_wins:
@@ -130,6 +135,20 @@ class JournalStore:
         except ValueError:
             return None
 
+    def safe_repo_path(self, rel: str) -> Path:
+        """Resolve *rel* under the repo, rejecting absolute paths and ``..`` escapes."""
+        if not rel or rel.startswith("/") or rel.startswith("\\"):
+            raise ValueError(f"unsafe journal rel (absolute): {rel!r}")
+        candidate = Path(rel)
+        if candidate.is_absolute() or ".." in candidate.parts:
+            raise ValueError(f"unsafe journal rel: {rel!r}")
+        target = (self.repo_root / candidate).resolve()
+        try:
+            target.relative_to(self.repo_root)
+        except ValueError as e:
+            raise ValueError(f"journal path escapes repo: {rel!r}") from e
+        return target
+
     def capture(self, path: Path) -> JournalEntry | None:
         """Record preimage for *path* if none exists yet in this epoch.
 
@@ -146,9 +165,22 @@ class JournalStore:
                 return None
             existing_id = self._first_wins.get(rel)
             if existing_id is not None:
-                return self.get_entry(existing_id)
+                entry = self._entries_by_id.get(existing_id)
+                if entry is not None:
+                    return entry
+                # Stale index: entry id remembered but missing from log/index.
+                # Drop the mapping so we can re-capture rather than return None forever.
+                logger.warning(
+                    "stale first-wins id %s for %s; re-capturing preimage",
+                    existing_id,
+                    rel,
+                )
+                del self._first_wins[rel]
 
-            resolved = self.repo_root / rel
+            try:
+                resolved = self.safe_repo_path(rel)
+            except ValueError:
+                return None
             if resolved.exists() and resolved.is_file():
                 try:
                     data = resolved.read_bytes()
@@ -196,30 +228,31 @@ class JournalStore:
         return out
 
     def get_entry(self, entry_id: str) -> JournalEntry | None:
-        for entry in self.iter_entries():
-            if entry.id == entry_id:
-                return entry
-        return None
+        return self._entries_by_id.get(entry_id)
 
     def iter_entries(self) -> Iterator[JournalEntry]:
+        # Prefer in-memory index (insertion order matches append order on 3.7+).
+        if self._entries_by_id:
+            return iter(self._entries_by_id.values())
+        return iter(self._read_entries_from_disk())
+
+    def _read_entries_from_disk(self) -> list[JournalEntry]:
         if not self.entries_path.exists():
-            return iter(())
+            return []
         try:
             lines = self.entries_path.read_text(encoding="utf-8").splitlines()
         except OSError:
-            return iter(())
-
-        def _gen() -> Iterator[JournalEntry]:
-            for line in lines:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    yield JournalEntry.from_dict(json.loads(line))
-                except (json.JSONDecodeError, KeyError, TypeError, ValueError):
-                    continue
-
-        return _gen()
+            return []
+        out: list[JournalEntry] = []
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                out.append(JournalEntry.from_dict(json.loads(line)))
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+                continue
+        return out
 
     def list_entries(self, *, epoch: str | None = None) -> list[JournalEntry]:
         want = epoch if epoch is not None else self._epoch
@@ -230,65 +263,74 @@ class JournalStore:
 
         ``kind=modify`` writes the blob back; ``kind=create`` removes the path
         if present (undo an agent-created file).
+
+        First-wins is strict: a missing indexed entry raises rather than falling
+        back to a later (possibly mutated) preimage.
         """
         with self._lock:
-            entry = None
-            if entry_id is not None:
-                entry = self.get_entry(entry_id)
-            else:
-                eid = self._first_wins.get(rel)
-                if eid:
-                    entry = self.get_entry(eid)
-                if entry is None:
-                    # Fall back to latest matching entry in this epoch.
-                    for e in reversed(list(self.iter_entries())):
-                        if e.epoch == self._epoch and e.rel == rel:
-                            entry = e
-                            break
-            if entry is None:
-                raise FileNotFoundError(f"no journal entry for {rel!r}")
-
-            target = self.repo_root / entry.rel
-            if entry.kind == "create":
-                if target.exists() and target.is_file():
-                    target.unlink()
-                return target
-
-            if not entry.sha256:
-                raise ValueError(f"modify entry {entry.id} missing sha256")
-            blob = self.blobs_dir / entry.sha256
-            if not blob.is_file():
-                raise FileNotFoundError(f"missing journal blob {entry.sha256}")
-            target.parent.mkdir(parents=True, exist_ok=True)
-            data = blob.read_bytes()
-            tmp = target.with_name(target.name + f".deadpush-journal-tmp-{os.getpid()}")
-            try:
-                tmp.write_bytes(data)
-                tmp.replace(target)
-            finally:
-                if tmp.exists():
-                    try:
-                        tmp.unlink()
-                    except OSError:
-                        pass
-            return target
+            entry = self._lookup_restore_entry(rel, entry_id=entry_id)
+            return self._restore_entry_unlocked(entry)
 
     def restore_all(self, *, epoch: str | None = None) -> list[Path]:
         """Restore every first-wins path in the epoch (create entries last)."""
-        entries = self.list_entries(epoch=epoch)
-        # Prefer first-wins order: one restore per rel.
-        by_rel: dict[str, JournalEntry] = {}
-        for e in entries:
-            by_rel.setdefault(e.rel, e)
-        # Restore modifies before creates so we don't delete then overwrite oddly.
-        ordered = sorted(
-            by_rel.values(),
-            key=lambda e: (0 if e.kind == "modify" else 1, e.rel),
-        )
-        restored: list[Path] = []
-        for e in ordered:
-            restored.append(self.restore(e.rel, entry_id=e.id))
-        return restored
+        with self._lock:
+            entries = [e for e in self._entries_by_id.values() if e.epoch == (epoch or self._epoch)]
+            by_rel: dict[str, JournalEntry] = {}
+            for e in entries:
+                by_rel.setdefault(e.rel, e)
+            ordered = sorted(
+                by_rel.values(),
+                key=lambda e: (0 if e.kind == "modify" else 1, e.rel),
+            )
+            restored: list[Path] = []
+            for e in ordered:
+                restored.append(self._restore_entry_unlocked(e))
+            return restored
+
+    def _lookup_restore_entry(self, rel: str, *, entry_id: str | None) -> JournalEntry:
+        if entry_id is not None:
+            entry = self._entries_by_id.get(entry_id)
+            if entry is None:
+                raise FileNotFoundError(f"no journal entry id {entry_id!r}")
+            return entry
+
+        eid = self._first_wins.get(rel)
+        if eid is None:
+            raise FileNotFoundError(f"no journal entry for {rel!r}")
+        entry = self._entries_by_id.get(eid)
+        if entry is None:
+            # Do not fall back to "latest" — that would violate first-wins WAL semantics.
+            raise FileNotFoundError(
+                f"first-wins entry missing for {rel!r} (id={eid}); "
+                "journal may be truncated — refusing to restore a later preimage"
+            )
+        return entry
+
+    def _restore_entry_unlocked(self, entry: JournalEntry) -> Path:
+        target = self.safe_repo_path(entry.rel)
+        if entry.kind == "create":
+            if target.exists() and target.is_file():
+                target.unlink()
+            return target
+
+        if not entry.sha256:
+            raise ValueError(f"modify entry {entry.id} missing sha256")
+        blob = self.blobs_dir / entry.sha256
+        if not blob.is_file():
+            raise FileNotFoundError(f"missing journal blob {entry.sha256}")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        data = blob.read_bytes()
+        tmp = target.with_name(target.name + f".deadpush-journal-tmp-{os.getpid()}")
+        try:
+            tmp.write_bytes(data)
+            tmp.replace(target)
+        finally:
+            if tmp.exists():
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+        return target
 
     def _write_blob(self, digest: str, data: bytes) -> Path:
         dest = self.blobs_dir / digest
@@ -311,6 +353,7 @@ class JournalStore:
         with self.entries_path.open("a", encoding="utf-8") as fh:
             fh.write(line)
             fh.flush()
+        self._entries_by_id[entry.id] = entry
 
 
 def _utc_now() -> str:
