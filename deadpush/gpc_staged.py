@@ -46,7 +46,13 @@ def emit_staged_recovery_events(
         from .config import is_hardened_install
         from .gpc import GpcClient
 
-        client = GpcClient(repo_root, hardened=is_hardened_install(repo_root))
+        # Reporter only — must not auto-ACK re-broadcast durable events or it
+        # would drain the shared outbox before a reconnecting relay can replay.
+        client = GpcClient(
+            repo_root,
+            hardened=is_hardened_install(repo_root),
+            auto_ack=False,
+        )
         client.socket_path = socket_path
         # Persistent connection avoids short-lived connect/send/close races
         # (same pattern as MCP PROXY_BLOCK tests / Linux CI).

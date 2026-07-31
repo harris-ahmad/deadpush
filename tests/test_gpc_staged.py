@@ -149,6 +149,42 @@ def test_emit_staged_recovery_events_via_env_socket(temp_repo: Path, monkeypatch
         server.stop()
 
 
+def test_emit_does_not_ack_drain_outbox(temp_repo: Path, monkeypatch):
+    """Reporter must not ACK durable STAGED_* events (outbox for reconnecting relays)."""
+    from deadpush.gpc_outbox import GpcOutbox
+
+    server = GpcServer(temp_repo, hardened=False)
+    server.start()
+    try:
+        _wait_socket(server)
+        monkeypatch.setenv("DEADPUSH_GPC_SOCKET", str(server.socket_path))
+        ok = emit_staged_recovery_events(
+            temp_repo,
+            kind="reset_hard",
+            reason="blocked",
+            savepoint_id="sp-outbox",
+            label="pre-reset-hard",
+        )
+        assert ok is True
+        # Allow server to process REPORT_STAGED and append durable broadcasts.
+        deadline = time.time() + 2.0
+        pending_types: set[str] = set()
+        while time.time() < deadline:
+            outbox = GpcOutbox(temp_repo)
+            info = outbox.describe()
+            # describe doesn't list types — read pending via private path for assertion
+            with outbox._lock:
+                rows = outbox._read_pending_unlocked()
+            pending_types = {r.get("type", "") for r in rows}
+            if "STAGED_DENY" in pending_types and "SAVEPOINT_CREATED" in pending_types:
+                break
+            time.sleep(0.05)
+        assert "STAGED_DENY" in pending_types
+        assert "SAVEPOINT_CREATED" in pending_types
+    finally:
+        server.stop()
+
+
 def test_stage_and_deny_emits_gpc_when_socket_set(temp_repo: Path, monkeypatch):
     (temp_repo / "f.txt").write_text("x\n", encoding="utf-8")
     server = GpcServer(temp_repo, hardened=False)
