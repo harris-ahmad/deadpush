@@ -25,7 +25,7 @@ import uuid
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Iterator
+from typing import Any, Iterable, Iterator, Mapping
 
 logger = logging.getLogger("deadpush.journal")
 
@@ -121,13 +121,50 @@ class JournalStore:
     def begin_epoch(self) -> str:
         """Start a new journaling epoch (clears first-wins; keeps blobs)."""
         with self._lock:
-            self._epoch = uuid.uuid4().hex[:12]
-            self.epoch_path.write_text(
-                json.dumps({"epoch": self._epoch, "started_at": _utc_now()}, indent=2) + "\n",
-                encoding="utf-8",
-            )
-            self._first_wins.clear()
-            return self._epoch
+            return self._begin_epoch_locked()
+
+    def begin_epoch_seeded(self, preimages: Mapping[str, str]) -> str:
+        """Begin a new epoch and seed first-wins from blob digests under one lock.
+
+        *preimages* maps repo-relative paths to existing sha256 digests. All
+        blobs and path safety checks are validated before the epoch flips, so
+        a concurrent ``capture()`` cannot interleave between epoch reset and
+        seeding (which would otherwise steal first-wins with live disk bytes).
+        """
+        with self._lock:
+            prepared: list[tuple[str, str, int]] = []
+            for rel, digest in sorted(preimages.items()):
+                self.safe_repo_path(rel)
+                blob = self.blobs_dir / digest
+                if not blob.is_file():
+                    raise FileNotFoundError(f"missing journal blob {digest} for {rel}")
+                size = blob.stat().st_size
+                prepared.append((rel, digest, size))
+
+            epoch = self._begin_epoch_locked()
+            for rel, digest, size in prepared:
+                entry = JournalEntry(
+                    id=_new_entry_id(),
+                    ts=_utc_now(),
+                    rel=rel,
+                    kind="modify",
+                    sha256=digest,
+                    size=size,
+                    mtime_ns=None,
+                    epoch=epoch,
+                )
+                self._append_entry(entry)
+                self._first_wins[rel] = entry.id
+            return epoch
+
+    def _begin_epoch_locked(self) -> str:
+        self._epoch = uuid.uuid4().hex[:12]
+        self.epoch_path.write_text(
+            json.dumps({"epoch": self._epoch, "started_at": _utc_now()}, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        self._first_wins.clear()
+        return self._epoch
 
     def rel_of(self, path: Path) -> str | None:
         try:
@@ -161,7 +198,7 @@ class JournalStore:
             rel = self.rel_of(path)
             if rel is None:
                 return None
-            if _is_journal_internal(rel):
+            if is_journal_internal(rel):
                 return None
             existing_id = self._first_wins.get(rel)
             if existing_id is not None:
@@ -386,6 +423,20 @@ class JournalStore:
                     pass
         return target
 
+    def store_bytes(self, data: bytes) -> str:
+        """Write *data* into the content-addressed blob store; return sha256 hex."""
+        digest = hashlib.sha256(data).hexdigest()
+        with self._lock:
+            self._write_blob(digest, data)
+        return digest
+
+    def load_bytes(self, digest: str) -> bytes:
+        """Read a blob by sha256 hex digest."""
+        blob = self.blobs_dir / digest
+        if not blob.is_file():
+            raise FileNotFoundError(f"missing journal blob {digest}")
+        return blob.read_bytes()
+
     def _write_blob(self, digest: str, data: bytes) -> Path:
         dest = self.blobs_dir / digest
         if dest.exists():
@@ -419,7 +470,8 @@ def _new_entry_id() -> str:
     return f"{int(time.time() * 1000):x}-{uuid.uuid4().hex[:8]}"
 
 
-def _is_journal_internal(rel: str) -> bool:
+def is_journal_internal(rel: str) -> bool:
+    """Return True if *rel* is under deadpush / git control dirs (not journaled)."""
     parts = rel.split("/")
     if not parts:
         return True
