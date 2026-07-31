@@ -37,7 +37,15 @@ def gpc_socket_reachable(socket_path: Path, *, timeout: float = 1.0) -> bool:
 
 def _default_relay_handler(msg: GpcMessage) -> None:
     """Surface guardian push events on stderr for wrapped agent processes."""
-    if msg.type not in {"INCIDENT", "LOCKDOWN", "SESSION_PAUSE", "INSTRUCTION", "POLICY_UPDATE"}:
+    if msg.type not in {
+        "INCIDENT",
+        "LOCKDOWN",
+        "SESSION_PAUSE",
+        "INSTRUCTION",
+        "POLICY_UPDATE",
+        "STAGED_DENY",
+        "SAVEPOINT_CREATED",
+    }:
         return
     line = json.dumps(
         {"type": msg.type, "payload": msg.payload, "message_id": msg.message_id},
@@ -122,6 +130,43 @@ class GpcSession:
             tool=str(extra.get("source", "sandbox")),
             description=description,
             file=str(extra.get("file", "")),
+        ):
+            return 1
+        return 0
+
+    def emit_staged_deny(
+        self,
+        *,
+        kind: str,
+        reason: str,
+        savepoint_id: str = "",
+        label: str = "",
+        alternatives: list[str] | None = None,
+        **extra: Any,
+    ) -> int:
+        """Publish staged-recovery events (direct server or REPORT_STAGED to guardian)."""
+        if self.server is not None:
+            n = 0
+            if savepoint_id:
+                n += self.server.emit_savepoint_created(
+                    savepoint_id, label=label, kind=kind, **extra
+                )
+            n += self.server.emit_staged_deny(
+                kind=kind,
+                reason=reason,
+                savepoint_id=savepoint_id,
+                alternatives=alternatives,
+                **extra,
+            )
+            return n
+        reporter = self._reporter_client()
+        if reporter.send_report_staged(
+            kind=kind,
+            reason=reason,
+            savepoint_id=savepoint_id,
+            label=label,
+            alternatives=alternatives,
+            source=str(extra.get("source") or "staged-git"),
         ):
             return 1
         return 0

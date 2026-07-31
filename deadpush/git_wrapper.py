@@ -45,7 +45,7 @@ def main(argv: list[str] | None = None) -> int:
     if in_sandbox and os.environ.get("DEADPUSH_ALLOW_DESTRUCTIVE_GIT") != "1":
         hit = classify_destructive_git(args)
         if hit is not None:
-            return stage_and_deny(repo, hit)
+            return stage_and_deny(repo, hit, argv=args)
 
     subcmd = args[0] if args else ""
     no_verify = "--no-verify" in args or "-n" in args

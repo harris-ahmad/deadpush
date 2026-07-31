@@ -2,7 +2,8 @@
 
 Wrapper-path first: classify ``reset --hard`` / force-push, create a save point,
 then deny the command so the agent process is not killed and work is not lost.
-GPC negotiate / human-in-the-loop comes later.
+GPC publishes STAGED_DENY / SAVEPOINT_CREATED when a session socket is available;
+negotiate / human-in-the-loop remains later.
 """
 
 from __future__ import annotations
@@ -11,6 +12,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+from .gpc_staged import emit_staged_recovery_events
 from .savepoints import SavePointStore
 
 # Flags that make ``git push`` a force-style update.
@@ -58,7 +60,7 @@ def classify_destructive_git(args: list[str]) -> DestructiveGit | None:
     return None
 
 
-def stage_and_deny(repo_root: Path, hit: DestructiveGit) -> int:
+def stage_and_deny(repo_root: Path, hit: DestructiveGit, *, argv: list[str] | None = None) -> int:
     """Checkpoint via save point, print structured deny, return exit code 1.
 
     Fail closed: if the save point cannot be created, still deny the command.
@@ -71,6 +73,7 @@ def stage_and_deny(repo_root: Path, hit: DestructiveGit) -> int:
     except Exception as e:  # noqa: BLE001 — deny path must not raise into wrapper
         sp_error = str(e)
 
+    alts = _safer_alternatives(hit.kind)
     print(f"deadpush: staged deny: {hit.reason}", file=sys.stderr)
     if savepoint_id:
         print(f"deadpush: savepoint created: {savepoint_id} (label={hit.label})", file=sys.stderr)
@@ -79,8 +82,18 @@ def stage_and_deny(repo_root: Path, hit: DestructiveGit) -> int:
             f"deadpush: savepoint create failed (command still denied): {sp_error or 'unknown'}",
             file=sys.stderr,
         )
-    for line in _safer_alternatives(hit.kind):
+    for line in alts:
         print(f"deadpush: safer: {line}", file=sys.stderr)
+
+    emit_staged_recovery_events(
+        repo_root,
+        kind=hit.kind,
+        reason=hit.reason,
+        savepoint_id=savepoint_id,
+        label=hit.label,
+        alternatives=alts,
+        argv=argv or (),
+    )
     return 1
 
 

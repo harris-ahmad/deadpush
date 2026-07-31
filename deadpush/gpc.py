@@ -3,8 +3,9 @@ Guardian Push Channel (GPC) — bidirectional push protocol outside MCP.
 
 Transport: Unix domain socket, newline-delimited JSON.
 
-Guardian → client: INCIDENT, LOCKDOWN, INSTRUCTION, POLICY_UPDATE, SESSION_PAUSE, WELCOME
-Client → guardian: ACK, HEARTBEAT, REQUEST_OVERRIDE, PROXY_BLOCK
+Guardian → client: INCIDENT, LOCKDOWN, INSTRUCTION, POLICY_UPDATE, SESSION_PAUSE,
+                   WELCOME, STAGED_DENY, SAVEPOINT_CREATED
+Client → guardian: ACK, HEARTBEAT, REQUEST_OVERRIDE, PROXY_BLOCK, REPORT_STAGED
 """
 
 from __future__ import annotations
@@ -33,10 +34,28 @@ CLIENT_STALE_SECONDS = 120.0
 RECONNECT_BASE_DELAY = 0.5
 RECONNECT_MAX_DELAY = 30.0
 
+# Light lifecycle tags for future protocol SM (not a full state machine yet).
+GPC_LIFECYCLE_OBSERVED = "observed"
+GPC_LIFECYCLE_ACTION_REQUIRED = "action_required"
+GPC_LIFECYCLE_RESOLVED = "resolved"
+
 GUARDIAN_TO_CLIENT = frozenset({
-    "INCIDENT", "LOCKDOWN", "INSTRUCTION", "POLICY_UPDATE", "SESSION_PAUSE", "WELCOME",
+    "INCIDENT",
+    "LOCKDOWN",
+    "INSTRUCTION",
+    "POLICY_UPDATE",
+    "SESSION_PAUSE",
+    "WELCOME",
+    "STAGED_DENY",
+    "SAVEPOINT_CREATED",
 })
-CLIENT_TO_GUARDIAN = frozenset({"ACK", "HEARTBEAT", "REQUEST_OVERRIDE", "PROXY_BLOCK"})
+CLIENT_TO_GUARDIAN = frozenset({
+    "ACK",
+    "HEARTBEAT",
+    "REQUEST_OVERRIDE",
+    "PROXY_BLOCK",
+    "REPORT_STAGED",
+})
 
 
 def gpc_socket_path(repo_root: Path, *, hardened: bool | None = None) -> Path:
@@ -323,6 +342,48 @@ class GpcServer:
             payload=payload,
         ))
 
+    def emit_savepoint_created(
+        self,
+        savepoint_id: str,
+        *,
+        label: str = "",
+        kind: str = "",
+        **extra: Any,
+    ) -> int:
+        return self.broadcast(GpcMessage(
+            type="SAVEPOINT_CREATED",
+            message_id=_new_message_id("sp"),
+            payload={
+                "savepoint_id": savepoint_id,
+                "label": label,
+                "kind": kind,
+                "lifecycle": GPC_LIFECYCLE_OBSERVED,
+                **extra,
+            },
+        ))
+
+    def emit_staged_deny(
+        self,
+        *,
+        kind: str,
+        reason: str,
+        savepoint_id: str = "",
+        alternatives: list[str] | None = None,
+        **extra: Any,
+    ) -> int:
+        return self.broadcast(GpcMessage(
+            type="STAGED_DENY",
+            message_id=_new_message_id("stg"),
+            payload={
+                "kind": kind,
+                "reason": reason,
+                "savepoint_id": savepoint_id,
+                "alternatives": list(alternatives or ()),
+                "lifecycle": GPC_LIFECYCLE_ACTION_REQUIRED,
+                **extra,
+            },
+        ))
+
     def _accept_loop(self) -> None:
         while self._running and self._server:
             try:
@@ -413,6 +474,29 @@ class GpcServer:
                 file=str(payload.get("file", "")),
                 tool=str(payload.get("tool", "")),
                 source="mcp-proxy",
+            )
+        elif msg.type == "REPORT_STAGED":
+            payload = msg.payload or {}
+            savepoint_id = str(payload.get("savepoint_id") or "")
+            kind = str(payload.get("kind") or "")
+            label = str(payload.get("label") or "")
+            if savepoint_id:
+                self.emit_savepoint_created(
+                    savepoint_id,
+                    label=label,
+                    kind=kind,
+                    source=str(payload.get("source") or "staged-git"),
+                )
+            alts = payload.get("alternatives")
+            if not isinstance(alts, list):
+                alts = []
+            self.emit_staged_deny(
+                kind=kind,
+                reason=str(payload.get("reason") or "staged deny"),
+                savepoint_id=savepoint_id,
+                alternatives=[str(a) for a in alts],
+                source=str(payload.get("source") or "staged-git"),
+                argv=payload.get("argv") if isinstance(payload.get("argv"), list) else [],
             )
 
         if self.on_client_message:
@@ -509,6 +593,33 @@ class GpcClient:
                 "description": description,
                 "file": file,
                 "category": "mcp_proxy",
+            },
+        ))
+
+    def send_report_staged(
+        self,
+        *,
+        kind: str,
+        reason: str,
+        savepoint_id: str = "",
+        label: str = "",
+        alternatives: list[str] | None = None,
+        source: str = "staged-git",
+        argv: list[str] | None = None,
+    ) -> bool:
+        """Report a staged high-risk deny (re-broadcast as SAVEPOINT_CREATED + STAGED_DENY)."""
+        return self._send(GpcMessage(
+            type="REPORT_STAGED",
+            message_id=_new_message_id("rstg"),
+            repo_id=self.rid,
+            payload={
+                "kind": kind,
+                "reason": reason,
+                "savepoint_id": savepoint_id,
+                "label": label,
+                "alternatives": list(alternatives or ()),
+                "source": source,
+                "argv": list(argv or ()),
             },
         ))
 

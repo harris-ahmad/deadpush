@@ -18,11 +18,17 @@ in `deadpush/staged_git.py` via the git wrapper when `DEADPUSH_SANDBOX=1` —
 create a save point, deny the command, print safer alternatives. Escape hatch:
 `DEADPUSH_ALLOW_DESTRUCTIVE_GIT=1`. GPC negotiate / human-in-the-loop still later.
 
-**Phase 4 in progress:** thesis eval harness in `deadpush/eval/` — scenarios ×
+**Phase 4 landed:** thesis eval harness in `deadpush/eval/` — scenarios ×
 baselines (B0–B4 + journal-without-staged-git ablation) → CSV, markdown summary,
 and a stdlib SVG overhead chart. Run: `python -m deadpush.eval --out eval_out`.
 
-Next: richer GPC event types for staged recovery (thesis item 5).
+**Phase 5 in progress:** GPC staged-recovery events — `SAVEPOINT_CREATED` and
+`STAGED_DENY` (durable), reported via `REPORT_STAGED` from the git wrapper when
+`DEADPUSH_GPC_SOCKET` is set. Payloads include a light `lifecycle` tag
+(`observed` / `action_required`) for a future protocol SM; negotiate / human
+escalate is still later.
+
+Next after this slice: optional OS-confined eval runs, or GPC negotiate/escalate.
 
 ---
 
