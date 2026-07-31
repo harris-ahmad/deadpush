@@ -160,6 +160,9 @@ class GpcSession:
             )
             return n
         reporter = self._reporter_client()
+        argv = extra.get("argv")
+        if not isinstance(argv, list):
+            argv = None
         if reporter.send_report_staged(
             kind=kind,
             reason=reason,
@@ -167,6 +170,7 @@ class GpcSession:
             label=label,
             alternatives=alternatives,
             source=str(extra.get("source") or "staged-git"),
+            argv=argv,
         ):
             return 1
         return 0

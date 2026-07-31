@@ -98,6 +98,21 @@ def test_report_staged_rebroadcasts_to_subscriber(temp_repo: Path):
         server.stop()
 
 
+def test_emit_skips_fast_without_socket(temp_repo: Path, monkeypatch):
+    monkeypatch.setenv("DEADPUSH_SANDBOX", "1")
+    monkeypatch.delenv("DEADPUSH_GPC_SOCKET", raising=False)
+    t0 = time.perf_counter()
+    ok = emit_staged_recovery_events(
+        temp_repo,
+        kind="reset_hard",
+        reason="blocked",
+        savepoint_id="sp9",
+    )
+    elapsed = time.perf_counter() - t0
+    assert ok is False
+    assert elapsed < 0.2
+
+
 def test_emit_staged_recovery_events_via_env_socket(temp_repo: Path, monkeypatch):
     server = GpcServer(temp_repo, hardened=False)
     server.start()

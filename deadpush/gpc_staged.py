@@ -29,12 +29,17 @@ def emit_staged_recovery_events(
 
     Returns True if a REPORT_STAGED (or equivalent) was sent. Failures are
     swallowed — staged deny must still work with stderr-only feedback.
+
+    Requires ``DEADPUSH_GPC_SOCKET`` pointing at an existing socket. Sandbox
+    without a socket must not stall the deny path.
     """
     socket_env = os.environ.get("DEADPUSH_GPC_SOCKET", "").strip()
-    if not socket_env and os.environ.get("DEADPUSH_GPC_REQUIRED") != "1":
-        # No sandbox GPC markers — skip quietly (unit tests / bare wrapper).
-        if not os.environ.get("DEADPUSH_SANDBOX"):
-            return False
+    if not socket_env:
+        return False
+    socket_path = Path(socket_env)
+    if not socket_path.exists():
+        logger.debug("GPC staged emit skipped: socket missing %s", socket_path)
+        return False
 
     client = None
     try:
@@ -42,14 +47,10 @@ def emit_staged_recovery_events(
         from .gpc import GpcClient
 
         client = GpcClient(repo_root, hardened=is_hardened_install(repo_root))
-        if socket_env:
-            client.socket_path = Path(socket_env)
+        client.socket_path = socket_path
         # Persistent connection avoids short-lived connect/send/close races
         # (same pattern as MCP PROXY_BLOCK tests / Linux CI).
         client.connect_and_listen()
-        deadline = time.time() + 1.0
-        while time.time() < deadline and not client.socket_path.exists():
-            time.sleep(0.02)
         time.sleep(0.05)
         return client.send_report_staged(
             kind=kind,
