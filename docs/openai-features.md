@@ -13,8 +13,12 @@ not lose them while building Phase 1–4.
 seeds a fresh journal epoch from the snapshot so mutations after a save
 point have a WAL baseline).
 
-Next: staged git intercept for `reset --hard` / force-push (wrapper path),
-calling save-point create before risk and restore on deny.
+**Phase 3 landed (wrapper path):** staged deny for `reset --hard` / force-push
+in `deadpush/staged_git.py` via the git wrapper when `DEADPUSH_SANDBOX=1` —
+create a save point, deny the command, print safer alternatives. Escape hatch:
+`DEADPUSH_ALLOW_DESTRUCTIVE_GIT=1`. GPC negotiate / human-in-the-loop still later.
+
+Next: eval harness (CSV + plots for thesis §6–7).
 
 ---
 
