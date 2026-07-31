@@ -272,7 +272,11 @@ class JournalStore:
             return self._restore_entry_unlocked(entry)
 
     def restore_all(self, *, epoch: str | None = None) -> list[Path]:
-        """Restore every first-wins path in the epoch (create entries last)."""
+        """Restore every first-wins path in the epoch (create entries last).
+
+        Two-phase: validate every entry (safe path + blob present) before writing
+        any file, so a failure does not leave a partially-restored tree.
+        """
         with self._lock:
             entries = [e for e in self._entries_by_id.values() if e.epoch == (epoch or self._epoch)]
             by_rel: dict[str, JournalEntry] = {}
@@ -282,9 +286,50 @@ class JournalStore:
                 by_rel.values(),
                 key=lambda e: (0 if e.kind == "modify" else 1, e.rel),
             )
-            restored: list[Path] = []
+
+            prepared: list[tuple[JournalEntry, Path, bytes | None]] = []
+            errors: list[str] = []
             for e in ordered:
-                restored.append(self._restore_entry_unlocked(e))
+                try:
+                    target = self.safe_repo_path(e.rel)
+                    if e.kind == "create":
+                        prepared.append((e, target, None))
+                        continue
+                    if not e.sha256:
+                        raise ValueError(f"modify entry {e.id} missing sha256")
+                    blob = self.blobs_dir / e.sha256
+                    if not blob.is_file():
+                        raise FileNotFoundError(f"missing journal blob {e.sha256}")
+                    prepared.append((e, target, blob.read_bytes()))
+                except (ValueError, FileNotFoundError, OSError) as err:
+                    errors.append(f"{e.rel}: {err}")
+
+            if errors:
+                raise FileNotFoundError(
+                    "restore_all preflight failed; no files written:\n"
+                    + "\n".join(errors)
+                )
+
+            restored: list[Path] = []
+            for e, target, data in prepared:
+                if e.kind == "create":
+                    if target.exists() and target.is_file():
+                        target.unlink()
+                    restored.append(target)
+                    continue
+                assert data is not None
+                target.parent.mkdir(parents=True, exist_ok=True)
+                tmp = target.with_name(target.name + f".deadpush-journal-tmp-{os.getpid()}")
+                try:
+                    tmp.write_bytes(data)
+                    tmp.replace(target)
+                finally:
+                    if tmp.exists():
+                        try:
+                            tmp.unlink()
+                        except OSError:
+                            pass
+                restored.append(target)
             return restored
 
     def _lookup_restore_entry(self, rel: str, *, entry_id: str | None) -> JournalEntry:

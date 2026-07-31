@@ -185,3 +185,26 @@ def test_safe_repo_path_rejects_dotdot(temp_repo: Path):
         raise AssertionError("expected ValueError")
     except ValueError:
         pass
+
+
+def test_restore_all_preflight_no_partial_write(temp_repo: Path):
+    f1 = temp_repo / "one.txt"
+    f2 = temp_repo / "two.txt"
+    f1.write_text("1\n", encoding="utf-8")
+    f2.write_text("2\n", encoding="utf-8")
+    journal = JournalStore(temp_repo)
+    e1 = journal.capture(f1)
+    e2 = journal.capture(f2)
+    assert e1 is not None and e2 is not None and e2.sha256
+    # Remove blob for the second file so preflight fails after first would have written.
+    (temp_repo / ".deadpush" / "journal" / "blobs" / e2.sha256).unlink()
+    f1.write_text("bad1\n", encoding="utf-8")
+    f2.write_text("bad2\n", encoding="utf-8")
+    try:
+        journal.restore_all()
+        raise AssertionError("expected FileNotFoundError")
+    except FileNotFoundError as e:
+        assert "preflight" in str(e)
+    # Neither file should have been restored (no partial apply).
+    assert f1.read_text(encoding="utf-8") == "bad1\n"
+    assert f2.read_text(encoding="utf-8") == "bad2\n"
