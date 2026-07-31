@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from deadpush.eval.baselines import ALL_BASELINES
@@ -59,3 +60,36 @@ def test_all_scenario_ids_registered():
         "benign_commit",
     }
     assert expected <= set(SCENARIOS)
+
+
+def test_unknown_baseline_raises_helpful_keyerror():
+    import pytest
+
+    with pytest.raises(KeyError, match="unknown baseline"):
+        run_eval_matrix(scenarios=["benign_commit"], baselines=["B99"])
+
+
+def test_b2_run_git_restores_allow_destructive_env(temp_repo: Path, monkeypatch):
+    monkeypatch.setenv("DEADPUSH_ALLOW_DESTRUCTIVE_GIT", "1")
+    b2 = ALL_BASELINES["B2"]
+    b2.setup(temp_repo)
+    code = b2.run_git(temp_repo, ["status", "--porcelain"])
+    assert code == 0
+    assert os.environ.get("DEADPUSH_ALLOW_DESTRUCTIVE_GIT") == "1"
+
+
+def test_seed_useful_raises_when_write_rejected(temp_repo: Path):
+    import pytest
+    from deadpush.eval.scenarios import _seed_useful
+
+    class RejectAll:
+        id = "reject"
+
+        def write_file(self, repo, rel, content):
+            return False
+
+        def run_git(self, repo, args):
+            return 0
+
+    with pytest.raises(RuntimeError, match="seed write rejected"):
+        _seed_useful(RejectAll(), temp_repo, {"x.py": "x = 1\n"})

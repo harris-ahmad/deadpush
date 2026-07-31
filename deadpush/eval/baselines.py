@@ -99,8 +99,11 @@ class B2HooksOnly(B0NoGuardian):
     def run_git(self, repo: Path, args: list[str]) -> int:
         # Use wrapper outside sandbox so staged deny is off, but commit/push
         # guardrails still run.
-        prev = os.environ.get("DEADPUSH_REPO_ROOT")
-        prev_sb = os.environ.get("DEADPUSH_SANDBOX")
+        prev = {k: os.environ.get(k) for k in (
+            "DEADPUSH_REPO_ROOT",
+            "DEADPUSH_SANDBOX",
+            "DEADPUSH_ALLOW_DESTRUCTIVE_GIT",
+        )}
         try:
             os.environ["DEADPUSH_REPO_ROOT"] = str(repo.resolve())
             os.environ.pop("DEADPUSH_SANDBOX", None)
@@ -112,15 +115,11 @@ class B2HooksOnly(B0NoGuardian):
             finally:
                 os.chdir(cwd)
         finally:
-            if prev is None:
-                os.environ.pop("DEADPUSH_REPO_ROOT", None)
-            else:
-                os.environ["DEADPUSH_REPO_ROOT"] = prev
-            if prev_sb is None:
-                os.environ.pop("DEADPUSH_SANDBOX", None)
-            else:
-                os.environ["DEADPUSH_SANDBOX"] = prev_sb
-            os.environ.pop("DEADPUSH_ALLOW_DESTRUCTIVE_GIT", None)
+            for k, v in prev.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
 
 
 @dataclass

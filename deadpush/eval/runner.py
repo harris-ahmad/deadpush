@@ -23,6 +23,10 @@ def _init_repo(path: Path) -> None:
 
 
 def run_one(scenario_id: str, baseline: Baseline) -> ScenarioResult:
+    if scenario_id not in SCENARIOS:
+        raise KeyError(
+            f"unknown scenario {scenario_id!r}; choose from {sorted(SCENARIOS)}"
+        )
     fn = SCENARIOS[scenario_id]
     with tempfile.TemporaryDirectory(prefix=f"deadpush-eval-{scenario_id}-") as td:
         repo = Path(td) / "repo"
@@ -39,6 +43,16 @@ def run_eval_matrix(
 ) -> list[ScenarioResult]:
     scen_ids = scenarios or list(SCENARIOS.keys())
     base_ids = baselines or ["B0", "B1", "B2", "B3", "B4", "B4-ablation"]
+    unknown_s = [s for s in scen_ids if s not in SCENARIOS]
+    if unknown_s:
+        raise KeyError(
+            f"unknown scenario(s) {unknown_s}; choose from {sorted(SCENARIOS)}"
+        )
+    unknown_b = [b for b in base_ids if b not in ALL_BASELINES]
+    if unknown_b:
+        raise KeyError(
+            f"unknown baseline(s) {unknown_b}; choose from {sorted(ALL_BASELINES)}"
+        )
     results: list[ScenarioResult] = []
     for bid in base_ids:
         baseline = ALL_BASELINES[bid]

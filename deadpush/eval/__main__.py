@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 
 from .runner import run_eval_matrix, write_csv, write_overhead_svg, write_summary_md
@@ -30,7 +31,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = p.parse_args(argv)
 
-    results = run_eval_matrix(scenarios=args.scenarios, baselines=args.baselines)
+    try:
+        results = run_eval_matrix(scenarios=args.scenarios, baselines=args.baselines)
+    except KeyError as e:
+        print(f"deadpush.eval: {e}", file=sys.stderr)
+        return 2
     out = args.out
     csv_path = write_csv(results, out / "results.csv")
     md_path = write_summary_md(results, out / "summary.md")
