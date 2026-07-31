@@ -33,6 +33,32 @@ def test_linux_sandbox_capabilities_fanotify_off_after_start(temp_repo: Path):
     assert caps.content_deny is False
 
 
+def test_linux_sandbox_marks_fanotify_active_after_ready(temp_repo: Path):
+    """After start(), fanotify readiness must reflect is_active (not a race)."""
+    backend = LinuxSandboxBackend(temp_repo)
+
+    def fake_start(_repo):
+        backend._fanotify._running = True
+        backend._fanotify._fd = 7  # pretend listener finished fanotify_init
+
+    with patch.object(backend._bwrap, "start"), \
+         patch.object(backend._bwrap, "available", return_value=True), \
+         patch.object(backend._fanotify, "available", return_value=True), \
+         patch.object(backend._fanotify, "start", side_effect=fake_start):
+        backend.start(temp_repo)
+
+    assert backend._fanotify_active is True
+    assert backend.capabilities.content_deny is True
+    env: dict[str, str] = {}
+    with patch.object(
+        backend._bwrap,
+        "wrap_command",
+        return_value=["bwrap", "--", "echo", "hi"],
+    ):
+        backend.wrap_command(["echo", "hi"], repo_root=temp_repo, env=env)
+    assert env.get("DEADPUSH_LINUX_SANDBOX") == "1"
+
+
 def test_linux_sandbox_wrap_delegates_to_bwrap(temp_repo: Path):
     backend = LinuxSandboxBackend(temp_repo)
     env: dict[str, str] = {}

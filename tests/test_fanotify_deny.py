@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -35,6 +36,40 @@ def test_linux_backend_wrap_sets_env(temp_repo: Path):
     cmd = backend.wrap_command(["echo"], repo_root=temp_repo, env=env)
     assert cmd == ["echo"]
     assert env.get("DEADPUSH_LINUX_SANDBOX") == "1"
+
+
+def test_fanotify_start_waits_for_ready_event(temp_repo: Path):
+    """start() must wait for the listener thread to signal readiness."""
+    backend = LinuxEnforcementBackend(temp_repo)
+    order: list[str] = []
+
+    def fake_listen():
+        order.append("listen")
+        backend._fd = 42
+        backend._ready.set()
+
+    with patch.object(backend, "available", return_value=True), \
+         patch.object(backend, "_listen_loop", side_effect=fake_listen):
+        backend.start(temp_repo)
+        order.append("after_start")
+
+    assert order == ["listen", "after_start"]
+    assert backend.is_active is True
+    backend.stop()
+
+
+def test_fanotify_start_raises_when_listener_fails(temp_repo: Path):
+    backend = LinuxEnforcementBackend(temp_repo)
+
+    def fake_listen():
+        backend._last_error = "fanotify_init failed"
+        backend._ready.set()
+
+    with patch.object(backend, "available", return_value=True), \
+         patch.object(backend, "_listen_loop", side_effect=fake_listen):
+        with pytest.raises(RuntimeError, match="fanotify"):
+            backend.start(temp_repo)
+    assert backend.is_active is False
 
 
 def test_decide_fanotify_write_blocks_eval(temp_repo: Path):

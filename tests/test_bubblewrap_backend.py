@@ -30,13 +30,21 @@ def test_build_bwrap_argv_structure(temp_repo: Path):
     )
     assert argv[0] == "/usr/bin/bwrap"
     assert argv[1:4] == ["--ro-bind", "/", "/"]
+    # --dev must precede /dev/shm binds so the fresh /dev tmpfs does not shadow shm.
+    assert argv[4:8] == ["--proc", "/proc", "--dev", "/dev"]
     repo_s = str(temp_repo.resolve())
     assert "--bind" in argv
     assert repo_s in argv
     assert argv[-4:] == ["--", "python", "-c", "print(1)"]
     assert "--die-with-parent" in argv
-    assert "--proc" in argv
-    assert "--dev" in argv
+
+    dev_idx = argv.index("--dev")
+    shm_bind_idxs = [
+        i for i, (a, b) in enumerate(zip(argv, argv[1:]))
+        if a == "--bind" and b.endswith("/dev/shm")
+    ]
+    assert shm_bind_idxs, "expected a --bind for /dev/shm"
+    assert all(i > dev_idx for i in shm_bind_idxs)
 
 
 def test_bubblewrap_capabilities(temp_repo: Path):

@@ -39,16 +39,18 @@ def build_bwrap_argv(
         raise RuntimeError("bubblewrap not found on PATH")
 
     writable = collect_writable_sandbox_paths(repo_root, hardened=hardened, platform="linux")
-    argv: list[str] = [bwrap, "--ro-bind", "/", "/"]
-    for path in writable:
-        argv.extend(["--bind", str(path), str(path)])
-    argv.extend([
+    # Apply --dev / --proc before writable binds. --dev recreates /dev as a fresh
+    # tmpfs and would shadow an earlier --bind /dev/shm; binding writable paths
+    # (including /dev/shm) after --dev restores host shared memory.
+    argv: list[str] = [
+        bwrap,
+        "--ro-bind", "/", "/",
         "--proc", "/proc",
         "--dev", "/dev",
-        "--die-with-parent",
-        "--",
-        *cmd,
-    ])
+    ]
+    for path in writable:
+        argv.extend(["--bind", str(path), str(path)])
+    argv.extend(["--die-with-parent", "--", *cmd])
     return argv
 
 
