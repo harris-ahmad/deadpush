@@ -176,20 +176,36 @@ class SavePointStore:
         return max(validated, key=lambda p: _parse_ts(p.ts))
 
     def restore(self, savepoint_id: str) -> RestoreResult:
+        """Roll the live tree back to *savepoint_id*.
+
+        Two-phase like ``JournalStore.restore_all``: resolve paths and load every
+        available blob before writing anything, so a preflight I/O failure leaves
+        the tree untouched. Missing blobs are soft-reported; other load errors
+        propagate before mutation.
+        """
         sp = self.get(savepoint_id)
         if sp is None:
             raise FileNotFoundError(f"savepoint not found: {savepoint_id}")
 
-        restored: list[str] = []
+        # Phase 1: validate paths + load blobs (no tree mutation yet).
         missing: list[str] = []
-        restored_preimages: dict[str, str] = {}
+        prepared: list[tuple[str, Path, str, bytes]] = []
         for rel, digest in sorted(sp.files.items()):
-            target = self.repo_root / rel
+            try:
+                target = self.journal.safe_repo_path(rel)
+            except ValueError as e:
+                raise ValueError(f"unsafe savepoint path {rel!r}: {e}") from e
             try:
                 data = self.journal.load_bytes(digest)
             except FileNotFoundError:
                 missing.append(rel)
                 continue
+            prepared.append((rel, target, digest, data))
+
+        # Phase 2: write prepared files, then prune extras and reseed the journal.
+        restored: list[str] = []
+        restored_preimages: dict[str, str] = {}
+        for rel, target, digest, data in prepared:
             target.parent.mkdir(parents=True, exist_ok=True)
             tmp = target.with_name(target.name + f".deadpush-sp-tmp-{sp.id}")
             try:

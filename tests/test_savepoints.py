@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from deadpush.journal import JournalStore
 from deadpush.savepoints import SavePointStore, validate_working_tree
 
@@ -87,3 +89,30 @@ def test_restore_missing_blob_reported(temp_repo: Path):
     f.write_text("changed\n", encoding="utf-8")
     result = store.restore(sp.id)
     assert "z.txt" in result.missing_blobs
+
+
+def test_restore_preflight_io_error_writes_nothing(temp_repo: Path, monkeypatch: pytest.MonkeyPatch):
+    a = temp_repo / "a.txt"
+    b = temp_repo / "b.txt"
+    a.write_text("A\n", encoding="utf-8")
+    b.write_text("B\n", encoding="utf-8")
+    store = SavePointStore(temp_repo)
+    sp = store.create()
+    a.write_text("changed-a\n", encoding="utf-8")
+    b.write_text("changed-b\n", encoding="utf-8")
+
+    real_load = store.journal.load_bytes
+    calls = {"n": 0}
+
+    def flaky_load(digest: str) -> bytes:
+        calls["n"] += 1
+        if calls["n"] >= 2:
+            raise OSError("simulated blob read failure")
+        return real_load(digest)
+
+    monkeypatch.setattr(store.journal, "load_bytes", flaky_load)
+    with pytest.raises(OSError, match="simulated blob read failure"):
+        store.restore(sp.id)
+
+    assert a.read_text(encoding="utf-8") == "changed-a\n"
+    assert b.read_text(encoding="utf-8") == "changed-b\n"
