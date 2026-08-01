@@ -212,6 +212,35 @@ class B4JournalNoStagedGit(B4StagedRecovery):
         return _real_git(repo, args, env={"DEADPUSH_ALLOW_DESTRUCTIVE_GIT": "1"})
 
 
+@dataclass
+class B4OS(B4StagedRecovery):
+    """B4 under real OS confinement (Seatbelt or bubblewrap).
+
+    ``run_git`` executes the git wrapper as a child inside the OS jail so
+    staged deny + write allowlist are both exercised. Falls back is not
+    silent — ``setup`` raises if no confining backend is available.
+    """
+
+    id: str = "B4-os"
+    prefer: str | None = None
+
+    def setup(self, repo: Path) -> None:
+        from deadpush.eval.os_sandbox import select_eval_os_backend
+
+        # Fail loud at scenario start if this host cannot confine.
+        select_eval_os_backend(repo, prefer=self.prefer)
+        super().setup(repo)
+
+    def run_git(self, repo: Path, args: list[str]) -> int:
+        import sys
+
+        from deadpush.eval.os_sandbox import run_under_os_sandbox
+
+        cmd = [sys.executable, "-m", "deadpush.git_wrapper", *args]
+        proc = run_under_os_sandbox(repo, cmd, prefer=self.prefer)
+        return int(proc.returncode)
+
+
 ALL_BASELINES: dict[str, Baseline] = {
     "B0": B0NoGuardian(),
     "B1": B1IgnoreOnly(),
@@ -219,4 +248,5 @@ ALL_BASELINES: dict[str, Baseline] = {
     "B3": B3QuarantineOnly(),
     "B4": B4StagedRecovery(),
     "B4-ablation": B4JournalNoStagedGit(),
+    "B4-os": B4OS(),
 }

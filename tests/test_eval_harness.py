@@ -35,6 +35,18 @@ def test_force_push_only_b4_policy_blocks():
     assert b4.blocked is True
 
 
+def test_force_push_b4_os_credited_when_available():
+    from deadpush.eval.baselines import B4OS
+    from deadpush.eval.os_sandbox import os_confinement_status
+
+    if not os_confinement_status(Path.cwd()).get("available"):
+        import pytest
+
+        pytest.skip("no OS confinement")
+    b4os = run_one("force_push", B4OS())
+    assert b4os.blocked is True
+
+
 def test_matrix_subset_writes_csv(tmp_path: Path):
     results = run_eval_matrix(
         scenarios=["destructive_git", "benign_commit"],
@@ -58,6 +70,7 @@ def test_all_scenario_ids_registered():
         "hook_wipe",
         "mass_edit",
         "benign_commit",
+        "outside_repo_write",
     }
     assert expected <= set(SCENARIOS)
 

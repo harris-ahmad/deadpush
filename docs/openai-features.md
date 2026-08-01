@@ -22,13 +22,20 @@ create a save point, deny the command, print safer alternatives. Escape hatch:
 baselines (B0–B4 + journal-without-staged-git ablation) → CSV, markdown summary,
 and a stdlib SVG overhead chart. Run: `python -m deadpush.eval --out eval_out`.
 
-**Phase 5 in progress:** GPC staged-recovery events — `SAVEPOINT_CREATED` and
+**Phase 5 landed:** GPC staged-recovery events — `SAVEPOINT_CREATED` and
 `STAGED_DENY` (durable), reported via `REPORT_STAGED` from the git wrapper when
 `DEADPUSH_GPC_SOCKET` is set. Payloads include a light `lifecycle` tag
 (`observed` / `action_required`) for a future protocol SM; negotiate / human
 escalate is still later.
 
-Next after this slice: optional OS-confined eval runs, or GPC negotiate/escalate.
+**Phase 6 landed:** OS-confined thesis eval — baseline `B4-os` runs the git
+wrapper under Seatbelt (macOS) or bubblewrap / linux-sandbox (Linux). CLI:
+`python -m deadpush.eval --os-confined` (preflight fails loud if no jail);
+`--os-status` / `--backend seatbelt|bubblewrap|linux-sandbox`. Scenario
+`outside_repo_write` checks the write allowlist.
+
+Next after this slice: GPC negotiate / human escalate (tiny state machine),
+then paper write-up.
 
 ---
 
