@@ -80,6 +80,45 @@ def test_probe_outside_write_blocked(require_os_confinement: Path):
     assert probe_outside_write_blocked(require_os_confinement) is True
 
 
+def test_probe_outside_raises_when_jail_never_runs(temp_repo: Path, monkeypatch):
+    """Bwrap/setup failure must not be credited as a write-deny."""
+    from deadpush.eval import os_sandbox
+
+    def fake_run(repo, cmd, *, prefer=None, extra_env=None):
+        return type(
+            "P",
+            (),
+            {
+                "returncode": 1,
+                "stdout": b"",
+                "stderr": b"bwrap: setting up uid map: Operation not permitted",
+            },
+        )()
+
+    monkeypatch.setattr(os_sandbox, "run_under_os_sandbox", fake_run)
+    with pytest.raises(SandboxUnavailableError, match="canary"):
+        probe_outside_write_blocked(temp_repo)
+
+
+def test_probe_outside_false_when_canary_ok_and_probe_lands(temp_repo: Path, monkeypatch):
+    """If the jail runs but still allows the outside write, report unblocked."""
+    import os
+
+    from deadpush.eval import os_sandbox
+
+    def fake_run(repo, cmd, *, prefer=None, extra_env=None):
+        canary = temp_repo / f".deadpush_eval_canary_{os.getpid()}"
+        outside = outside_probe_dir(temp_repo)
+        outside.mkdir(parents=True, exist_ok=True)
+        probe = outside / f".deadpush_eval_probe_{os.getpid()}"
+        canary.write_text("ok", encoding="utf-8")
+        probe.write_text("x", encoding="utf-8")
+        return type("P", (), {"returncode": 0, "stdout": b"", "stderr": b""})()
+
+    monkeypatch.setattr(os_sandbox, "run_under_os_sandbox", fake_run)
+    assert probe_outside_write_blocked(temp_repo) is False
+
+
 def test_os_confined_matrix_preflight(require_os_confinement: Path, tmp_path: Path):
     results = run_eval_matrix(
         scenarios=["outside_repo_write", "benign_commit"],

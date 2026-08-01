@@ -127,29 +127,50 @@ def probe_outside_write_blocked(
     repo_root: Path,
     outside_dir: Path | None = None,
 ) -> bool:
-    """True when OS jail blocks creating a file under *outside_dir*."""
+    """True when OS jail blocks creating a file under *outside_dir*.
+
+    Distinguishes a real write-deny from jail setup failure (e.g. bwrap installed
+    but user namespaces disabled): the child must first create a canary *inside*
+    the repo. If that canary is missing, the probe is inconclusive and we raise
+    rather than silently reporting a block.
+    """
     repo = repo_root.resolve()
     outside = (outside_dir or outside_probe_dir(repo)).resolve()
     outside.mkdir(parents=True, exist_ok=True)
     probe = outside / f".deadpush_eval_probe_{os.getpid()}"
-    if probe.exists():
-        probe.unlink()
-    # Portable: python one-liner under the jail.
+    canary = repo / f".deadpush_eval_canary_{os.getpid()}"
+    for path in (probe, canary):
+        if path.exists():
+            path.unlink()
+    # Canary first (allowed), then outside write (must fail under a real jail).
     script = (
-        "import pathlib,sys;"
+        "import pathlib;"
+        f"c=pathlib.Path({str(canary)!r});"
+        "c.write_text('ok',encoding='utf-8');"
         f"p=pathlib.Path({str(probe)!r});"
         "p.write_text('x',encoding='utf-8')"
     )
     proc = run_under_os_sandbox(repo, [sys.executable, "-c", script])
-    blocked = proc.returncode != 0 or not probe.exists()
-    if probe.exists():
-        try:
-            probe.unlink()
-        except OSError:
-            pass
+    canary_ok = canary.exists()
+    probe_landed = probe.exists()
+    for path in (probe, canary):
+        if path.exists():
+            try:
+                path.unlink()
+            except OSError:
+                pass
     try:
         if outside_dir is None and outside.exists() and not any(outside.iterdir()):
             outside.rmdir()
     except OSError:
         pass
-    return blocked
+
+    if not canary_ok:
+        err = (proc.stderr or b"").decode("utf-8", errors="replace").strip()[:500]
+        raise SandboxUnavailableError(
+            "OS sandbox failed in-repo canary write — cannot credit an outside "
+            f"write block (rc={proc.returncode}"
+            + (f": {err}" if err else "")
+            + "). Check that the jail actually runs (e.g. user namespaces for bwrap)."
+        )
+    return not probe_landed
